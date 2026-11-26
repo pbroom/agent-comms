@@ -1,3 +1,13 @@
+# Gate M8's raw frames on Claude Code 2.1.330, one file per run (36 probe runs, 3 runs through the node: resumed-*).
+# The projection (scratchpad steer3/make_fixtures.py) keeps, in order, every init, result, command_lifecycle,
+# control_response and task_notification/task_started frame, and each assistant/user frame as its type alone; uuids
+# are normalised (N, S, others numbered), the session id fixed, paths and prompts out, replies reduced to the probe
+# words. It DROPS: the init's tools, mcp_servers, model, cwd, apiKeySource, slash_commands, agents, skills, plugins and
+# output_style; the assistant and user frames' contents (tool calls and results), their replay markers (isReplay)
+# and parent_tool_use_id; usage and cost fields; rate_limit_event, stream_event and system status frames. None of
+# them is read by the ownership predicates (ruling F: the echo lists, origin, version, capabilities, the brackets an
+# init or a result opens or ends): model activity (the dropped contents) matters only inside a bracket the CLI
+# opened, and no run's outcome depends on it; tool lists matter only to the access check, not to whose turn it is.
 after_tool-1
 after_tool-2
 after_tool-3

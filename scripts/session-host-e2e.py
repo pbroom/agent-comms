@@ -145,6 +145,12 @@ Z9. A turn the CLI starts itself (a background notification) takes S in: `unconf
 Z7. (only with `--only steering`: it takes 82 s) A partition while S's own turn runs: the hub is stopped past the
     attempt's 75 s contact clock; the node cuts S's turn; once the hub is back, N's native end with `next_turn`, S
     cut (its contact ran out).
+Z12. (review round 2) The node CRASHES (SIGKILL, no shutdown) while N is held with its checkpoint committed: the
+    node started again settles N by the checkpoint (N's own reply), S `unconfirmed`; the session goes on and S is
+    never written again.
+Z11. (only with `--only steering`: it takes 82 s) A partition with NO committed checkpoint: the hub is stopped right
+    after S is written, before N ends, past the attempt's contact clock; the checkpoint is never taken; once the hub
+    is back N settles by the node's own end, S cut.
 Z4. Stop; nothing is left; no steer text in the node's log.
 Last, parent and child sessions (`--only tree` runs nothing else; `--only claude`, `--only codex` and --with-board
 skip it). Everything above ran with child sessions OFF, as shipped. The hub and the node are then started again over
@@ -1480,8 +1486,60 @@ codex = true
             self._z6_restart(model)
             self._z8_bound(model)
             self._z9_cli_turn(model)
+            self._z12_crash(model)
             if self.args.only == "steering":
                 self._z7_partition(model)
+                self._z11_partition_without_checkpoint(model)
+
+    def crash_node(self) -> None:
+        """SIGKILL the node (no shutdown, nothing reported), then start another over the same home and logs."""
+        proc = next(p for n, p in self.procs if n == "node")
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(40)
+        self.procs = [(n, p) for n, p in self.procs if p is not proc]
+        self.node_runs += 1
+        self.spawn("node", self.node_home, "node", "--hub", f"http://127.0.0.1:{self.node_port}", "--name", NODE,
+                   AGENT_COMMS_TOKEN=self.node_token)
+        self.wait_for("the node to connect again",
+                      lambda: self.log_text("node").count("connected to") >= self.node_runs)
+
+    def _z12_crash(self, model: list[str]) -> None:
+        print("\n[Z12] the node crashes (SIGKILL) while N is held with its checkpoint committed")
+        sid = self._claude_root("think 2 z12", model)
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        time.sleep(0.3)
+        text = "sleep 60 steer before the crash z12"
+        self._z_steer(sid, "z12", text)
+        held = self._z_held(sid)
+        self.check(held is not None and held.get("text") == "turn 1: THINK 2 Z12", "N's checkpoint is committed")
+        self.crash_node()
+        m = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 120)
+        st = self.steer_of(sid, 1)
+        print(f"  N {m and m['state']} {m and m.get('detail')!r}; steer {st.get('outcome')} ({st.get('why')})")
+        self.check(m is not None and m["state"] == "done" and self.show(sid)["reply"] == "turn 1: THINK 2 Z12"
+                   and st.get("outcome") == "unconfirmed",
+                   "the restarted node's LOST settles N by its checkpoint (N's own reply); S unconfirmed")
+        out, _, _ = self.board("session", "send", sid, "after the crash", "--wait")
+        self.check("AFTER THE CRASH" in out and len(self._z_framed(text)) == 1,
+                   "the session goes on in a new process, and S was never written again")
+        self._close(sid)
+
+    def _z11_partition_without_checkpoint(self, model: list[str]) -> None:
+        print("\n[Z11] (--only steering) a partition with no committed checkpoint: the hub stopped for 82 s from "
+              "before N's end")
+        sid = self._claude_root("think 4 z11", model)
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        time.sleep(0.3)
+        self._z_steer(sid, "z11", "sleep 150 steer across a partition z11")
+        hub = next(p for n, p in self.procs if n == "hub")
+        hub.send_signal(signal.SIGSTOP)
+        try:
+            time.sleep(82)
+        finally:
+            hub.send_signal(signal.SIGCONT)
+        self._z_cut(sid, "contact", "N's native end from the node's own report; next_turn with S cut: its contact")
+        self.check(self.held_of(sid, 1) is None, "no checkpoint was ever committed")
+        self._close(sid)
 
     def _z10_resumed(self, model: list[str], i: int) -> None:
         real = self.real
@@ -1582,7 +1640,7 @@ codex = true
         kids = []
         for name, steer, ok in (("z5", "plum please z5", True), ("z5b", "fail-own z5b", False)):
             [made] = self.mcp_calls(SPAWN_AGENT, [["board_session_spawn", {
-                "task": f"think 3 {name}", "child_agent": STEER_AGENT, "access": "read-only"}]], rid)
+                "task": f"think 6 {name}", "child_agent": STEER_AGENT, "access": "read-only"}]], rid)
             if made["error"]:
                 raise SystemExit(f"FAIL: the Claude child was refused: {made['text'][:600]}")
             kid = json.loads(made["text"])["child"]["id"]
@@ -1610,7 +1668,7 @@ codex = true
                        + ("succeeded" if ok else "failed"))
             head, _, tail = text.partition("\nYour steer (sent while this turn ran) ran as a turn of its own after "
                                            "it; its reply follows.\n<<<child-output ")
-            self.check(f"THINK 3 {name.upper()}" in head and "<<<end child-output " in head and tail
+            self.check(f"THINK 6 {name.upper()}" in head and "<<<end child-output " in head and tail
                        and ("PLUM PLEASE Z5" in tail if ok else "FAIL-OWN Z5B" in tail),
                        f"{name}: N's reply in its block; the hub's line; S's own reply in a block of its own after it")
             if not ok:

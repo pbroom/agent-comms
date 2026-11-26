@@ -2421,7 +2421,7 @@ M8_SID = "00000000-0000-4000-8000-00000000a8a8"
 
 
 def _m8_runs():
-    names = (M8_DIR / "MANIFEST").read_text().split()
+    names = [x for x in (M8_DIR / "MANIFEST").read_text().split("\n") if x and not x.startswith("#")]
     # S is written into N in every scenario but cli_take and cli_late (there the probe wrote S after N had ended,
     # into a turn the CLI started: no steer can be, since one is written only while N is in flight)
     return [x for x in names if not x.startswith(("cli_take", "cli_late"))]
@@ -2430,7 +2430,7 @@ def _m8_runs():
 def test_m8_the_manifest_is_39_runs_of_fourteen_scenarios():
     """The run accounting (ruling E): 36 probe runs, 3 of each of 10 scenarios and 2 of each race (at 3, 5 and 7 s),
     and 3 runs of S into a RESUMED process through the node (`resumed`, the e2e's Z10 with the real CLI)."""
-    names = (M8_DIR / "MANIFEST").read_text().split()
+    names = [x for x in (M8_DIR / "MANIFEST").read_text().split("\n") if x and not x.startswith("#")]
     scenarios = sorted({x.rsplit("-", 1)[0] for x in names})
     assert len(names) == 39 and len(scenarios) == 14, (len(names), scenarios)
     assert sum(x.startswith("resumed-") for x in names) == 3
