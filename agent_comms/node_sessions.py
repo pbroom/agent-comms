@@ -1764,11 +1764,11 @@ class SessionRunner:
             if back:
                 self._save_handed()
             try:
-                events = self.host.stop_all()
+                self.host.stop_all()
             except Exception:
-                # (Ruling M) what stop_all decided before it raised is in the host's outbox: delivered below
+                # (Ruling M; review round 5, ruling X) what stop_all decided, whether it returned or raised, is in the
+                # host's outbox until the node takes it: delivered below, by `_emit`'s one handoff
                 log.exception("hosted sessions: the shutdown of the session processes failed part way")
-                events = self.host.take_outbox()
         # A flush the loop began before `stopping` may still be on its way: wait for it (a hub call is bounded by the
         # client's timeout) rather than post beside it. If it never returns, nothing is reported from here and the
         # next node process reports the lost turns.
@@ -1777,7 +1777,7 @@ class SessionRunner:
             return
         self.report_lock.release()
         with self.lock:             # the loop is past its last pass: `pending` and `status` are shutdown's now
-            self._emit(events)
+            self._emit([])          # (ruling X: the outbox, the watchdog's lists, in publication order)
             self.status = {sid: (s.state, None, bool(s.resume), self._own_id(s), ()) for sid, s in
                            self.host.sessions.items() if not s.ended and sid not in self.dropped}
             for sid, s in self.host.sessions.items():
