@@ -864,6 +864,13 @@ def test_a_thread_holding_a_host_lock_never_waits(env, monkeypatch):
                 inside = _time.monotonic() - t0
             assert inside < 0.1, inside
             assert _time.monotonic() - t0 >= 0.25, "at depth 0, the bounded wait"
+        with hostlog._cond:
+            hostlog._state["stalled_at"] = None
+        with hostlog.BOUNDARY:      # (the predicate itself, whoever asks it: nobody waits inside a boundary)
+            session_host.log.warning("inside a boundary")
+            t0 = _time.monotonic()
+            assert not hostlog.may_wait() and hostlog._acknowledge() is False
+            assert _time.monotonic() - t0 < 0.1
         blocked.release.set()
 
 
