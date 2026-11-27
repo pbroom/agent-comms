@@ -4610,14 +4610,14 @@ def test_r7_a3_a_deferred_line_carries_the_exception_type_only(env):
             raise Marked("PINEAPPLE-STEER-TEXT")
         except Marked:
             node_sessions.log.exception("hosted sessions: something failed")
-    t, done, ident, err = _on_watchdog(None, fn=logs)
-    assert done.wait(5) and not err, err
     got = []
     h = logging.Handler(logging.DEBUG)
     h.emit = lambda rec: got.append((rec.getMessage(), h.format(rec)))
     lg = logging.getLogger("agent_comms")
-    lg.addHandler(h)
+    lg.addHandler(h)        # (before the line: the writer is already running and may write it at once)
     try:
+        t, done, ident, err = _on_watchdog(None, fn=logs)
+        assert done.wait(5) and not err, err
         assert hostlog.flush(10)
     finally:
         lg.removeHandler(h)

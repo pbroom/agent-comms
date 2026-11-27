@@ -15,7 +15,11 @@ is, through its loggers' own level checks and handlers, under the same logger na
   writer, never at the call. An exception is kept as its type's name and its traceback's (file, line, function)
   triples: no exception text, no source lines, no locals. Nothing is formatted at the call.
 - ONE queue (bounded: the oldest goes first when it is full, the writer says once how many went) and ONE writer: a
-  daemon thread ("hostlog-writer"), started at the first record and started again if it is found dead. It is the
+  daemon thread ("hostlog-writer"). It is started EAGERLY in production (`start_writer`, by `node.run` before
+  recovery, outside every host lock; again at the node's pass boundary if it is not running) and lazily only by a
+  standalone caller at depth 0; a lifecycle thread's enqueue, or any enqueue under a host lock, never starts it. A
+  start is claimed under the queue's lock and made outside it; one that fails is contained (no log call raises an
+  ordinary failure into the host; an interrupt propagates). It is the
   ONLY thread that ever enters a handler, a filter or a formatter (`_write`), in queue order (the enqueue order). It
   holds no lock of the host-side modules, ever. A handler that raises is skipped (per handler); nothing a handler
   raises ends the writer; the record in flight counts as attempted and is never written again.
@@ -30,8 +34,10 @@ is, through its loggers' own level checks and handlers, under the same logger na
   completion sequence it saw; nobody waits again until a LATER completion), and a record the bound evicted is
   resolved as dropped at once.
 - `flush(timeout)`: a bounded wait for the queue to be empty and the writer idle, entering no handler. `node.run` makes
-  ONE final bounded wait after the last signal and report (`final_flush`), and `atexit` uses what is left of it; a
-  node whose writer is still stalled then ends without waiting for the handler (`node.run`).
+  ONE final bounded wait after the last signal and report (`final_flush`), which SEALS the queue in the same critical
+  section as its idle decision: every later record is rejected, so idle-and-sealed is never followed by a handler
+  entry; a node whose writer is still stuck then ends without waiting for the handler (`node.run`). A standalone
+  process's `atexit` makes the same wait and seal.
 """
 from __future__ import annotations
 
@@ -61,9 +67,12 @@ _queue: deque = deque()
 # dropped: how many went since the writer last said so; busy: the record the writer is writing, or None; stalled_at:
 # the completion sequence a timed-out wait saw (the stall latch), or None; gen: the writer's generation (tests only
 # change it, to leave a writer a test blocked for good); exit_deadline: `final_flush`'s bound, shared with `atexit`.
+# sealed: the final wait made (`final_flush`): every later record is rejected (one-way; tests reset it); starting: a
+# start of the writer is claimed and under way (outside `_cond`); start_failed_at: when the last start failed.
 _state: dict = {"seq": 0, "done": 0, "evicted": 0, "dropped": 0, "busy": None, "stalled_at": None, "gen": 0,
-                "exit_deadline": None}
+                "exit_deadline": None, "sealed": False, "starting": False, "start_failed_at": None}
 _writer: list = [None]
+RESTART_SECONDS = 1.0       # a failed start of the writer is tried again at most this often
 _TYPE_NAME = type.__dict__["__name__"]      # a type's own name, read with no code of the object's own
 
 
@@ -337,11 +346,22 @@ def _caller(stacklevel: int) -> tuple[str, int, str]:
 
 
 def _keep(name: str, level: int, msg: Any, args: tuple, exc_info: Any, extra: Any, stacklevel: int) -> None:
-    r = _Record()
-    r.created, r.name, r.level = time.time(), name, level
-    t = threading.current_thread()
-    r.thread, r.thread_name = t.ident, t.name
+    """(One writer, review round 1, R12) The enqueue path as a whole never raises an ordinary failure (`Exception`)
+    into the host; a shutdown interrupt (`KeyboardInterrupt`, `SystemExit`) that arrives in it propagates, leaving no
+    lock held and no start claimed."""
     try:
+        _enqueue(name, level, msg, args, exc_info, extra, stacklevel)
+    except Exception:       # (a record that could not be kept is lost: logging, never the host's operation)
+        pass
+
+
+def _enqueue(name: str, level: int, msg: Any, args: tuple, exc_info: Any, extra: Any, stacklevel: int) -> None:
+    r = _Record()
+    r.name, r.level = name, level
+    try:
+        r.created = time.time()
+        t = threading.current_thread()
+        r.thread, r.thread_name = t.ident, t.name
         r.msg = msg if type(msg) is str else _reduce(msg)
         r.args = _reduce_args(args)
         r.caller = _caller(stacklevel)
@@ -349,9 +369,12 @@ def _keep(name: str, level: int, msg: Any, args: tuple, exc_info: Any, extra: An
         r.extra = ({k: _reduce(v) for k, v in extra.items() if type(k) is str}
                    if type(extra) is dict and extra else None)
     except Exception as e:      # (a snapshot that fails keeps a line saying so, never raises into the host)
+        r.created, r.thread, r.thread_name = getattr(r, "created", 0.0), None, "?"
         r.msg, r.args, r.exc, r.extra = "a log line could not be kept (%s)", (_type_name(e),), None, None
         r.caller = ("(unknown file)", 0, "(unknown function)")
     with _cond:
+        if _state["sealed"]:
+            return      # (R11: after the final wait, rejected: counted nowhere, no writer, no waiter)
         _state["seq"] += 1
         r.seq = _local.last = _state["seq"]
         if len(_queue) >= QUEUE_MAX:
@@ -359,8 +382,9 @@ def _keep(name: str, level: int, msg: Any, args: tuple, exc_info: Any, extra: An
             _state["dropped"] += 1
             _state["evicted"] = max(_state["evicted"], gone.seq)
         _queue.append(r)
-        _ensure_writer()
         _cond.notify_all()
+    # (A4) An enqueue never starts the writer: production starts it eagerly (`start_writer`, from `node.run`); a
+    # standalone caller starts it lazily at its depth-0 exit (`_acknowledge`), never under a host lock.
 
 
 class HostLogger:
@@ -460,13 +484,73 @@ def _write(r: _Record) -> None:
             pass
 
 
-def _ensure_writer() -> None:
-    """(Under `_cond`.) THE writer is running: started if there is none or it is found dead. One at a time."""
+def _writer_alive() -> bool:
     w = _writer[0]
-    if w is None or not w.is_alive():
-        w = threading.Thread(target=_write_loop, args=(_state["gen"],), name=WRITER_NAME, daemon=True)
-        _writer[0] = w
+    return w is not None and w.is_alive()
+
+
+def _claim_start(force: bool) -> bool:
+    """(Under `_cond`.) Claim THE one start of the writer: only if none is running and none is under way, and (unless
+    `force`) not within RESTART_SECONDS of a failed one (no busy retry). True: the caller starts it, outside `_cond`."""
+    if _writer_alive() or _state["starting"]:
+        return False
+    failed = _state["start_failed_at"]
+    if not force and failed is not None and time.monotonic() - failed < RESTART_SECONDS:
+        return False
+    _state["starting"] = True
+    return True
+
+
+def _start_writer() -> None:
+    """The claimed start, OUTSIDE `_cond` (A2): a `Thread.start()` that fails (the OS refuses a thread) is contained:
+    the records stay queued up to the bound and are resolved as dropped by the usual rule; waiters are released (no
+    writer: nobody waits); a later start point tries again. The claim is let go however it ends (an interrupt
+    included, which propagates)."""
+    with _cond:
+        gen = _state["gen"]
+    w = threading.Thread(target=_write_loop, args=(gen,), name=WRITER_NAME, daemon=True)
+    started = False
+    try:
         w.start()
+        started = True
+    except Exception:
+        pass
+    finally:
+        with _cond:
+            _state["starting"] = False
+            if started:
+                _writer[0], _state["start_failed_at"] = w, None
+            else:
+                _state["start_failed_at"] = time.monotonic()
+            _cond.notify_all()
+
+
+def _lazy_start() -> None:
+    """(A standalone caller at depth 0, so never under a host lock, never on a lifecycle thread.) Start the writer if
+    records wait and none is running. The claim is let go however this ends (an interrupt included)."""
+    claimed = attempted = False
+    try:
+        with _cond:
+            claimed = bool(_queue or _state["dropped"]) and _claim_start(force=False)
+        if claimed:
+            attempted = True
+            _start_writer()
+    finally:
+        if claimed and not attempted:
+            with _cond:
+                _state["starting"] = False
+                _cond.notify_all()
+
+
+def start_writer(force: bool = False) -> bool:
+    """Start the writer if it is not running: by `node.run` (eagerly, before recovery, outside every host lock) and at
+    its pass boundary (the retry point after a failed start: on the main thread, at depth 0). True: it runs."""
+    with _cond:
+        claimed = _claim_start(force)
+    if claimed:
+        _start_writer()
+    with _cond:
+        return _writer_alive()
 
 
 def _write_loop(gen: int) -> None:
@@ -511,6 +595,7 @@ def _acknowledge() -> bool:
     once when that record was evicted by the bound. True: it was attempted (or dropped)."""
     if not may_wait():
         return False
+    _lazy_start()
     target = getattr(_local, "last", 0)
     deadline = time.monotonic() + ACK_SECONDS
     with _cond:
@@ -519,6 +604,8 @@ def _acknowledge() -> bool:
                 return True
             if _state["stalled_at"] is not None:
                 return False        # (the latch: nobody waits until the writer has made progress)
+            if _state["starting"] or not _writer_alive():
+                return False        # (R12: never a wait for a writer that is not running)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _state["stalled_at"] = _state["done"]
@@ -526,33 +613,50 @@ def _acknowledge() -> bool:
             _cond.wait(remaining)
 
 
+def _idle() -> bool:
+    """(Under `_cond`.) Nothing taken (`busy`: set when the writer dequeues a record, cleared after its last handler
+    returned), nothing queued, no drop notice owed."""
+    return not _queue and not _state["dropped"] and _state["busy"] is None
+
+
+def _idle_by(deadline: float) -> bool:
+    """(Under `_cond`.) Wait until idle, at most until `deadline`. True: idle."""
+    while not _idle():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        _cond.wait(remaining)
+    return True
+
+
 def flush(timeout: float) -> bool:
     """A bounded wait for the queue to be empty and the writer idle, on any thread; it enters no handler, so the bound
     is real. True: idle."""
     deadline = time.monotonic() + max(0.0, timeout)
     with _cond:
-        while _queue or _state["dropped"] or _state["busy"] is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            _cond.wait(remaining)
-        return True
+        return _idle_by(deadline)
 
 
 def final_flush(budget: float = 2.0) -> bool:
-    """`node.run`'s ONE final bounded wait, after the last signal and report: `atexit` gets what is left of the same
-    bound. True: the writer is idle (the process may exit normally)."""
+    """`node.run`'s ONE final bounded wait, after the last signal and report (and `atexit`'s, when nothing made it):
+    the writer started if it is not running (the last safe start point), then the wait and the SEAL in one critical
+    section (R11): from the moment "idle" is decided no record is accepted, so idle-and-sealed is never followed by a
+    handler entry. True: idle (the process may exit normally); False: the writer is stuck (or cannot start)."""
+    start_writer()
+    deadline = time.monotonic() + budget
     with _cond:
-        _state["exit_deadline"] = time.monotonic() + budget
-    return flush(budget)
+        _state["exit_deadline"] = deadline
+        ok = _idle_by(deadline)
+        _state["sealed"] = True     # (one step with the idle decision)
+    return ok
 
 
 def _at_exit() -> None:
-    """At interpreter exit: what is queued gets the writer's time, at most 2 s (or what is left of `final_flush`'s
-    bound). A handler the writer is stuck in is not waited for beyond that (the writer is a daemon thread)."""
+    """At interpreter exit, when no final wait was made (a standalone process): the same wait and seal, at most 2 s.
+    (A seal cannot rescue a handler already stuck: `logging.shutdown()` then waits for its lock, as on main.)"""
     try:
-        deadline = _state["exit_deadline"]
-        flush(2.0 if deadline is None else min(2.0, deadline - time.monotonic()))
+        if not _state["sealed"]:
+            final_flush(2.0)
     except Exception:
         pass
 
@@ -561,8 +665,9 @@ atexit.register(_at_exit)
 
 
 def _reset(idle_seconds: float = 5.0) -> None:
-    """(Tests) The writer idle (bounded), then an empty queue and clear counters, this thread at depth 0. A writer
-    still busy after the bound (a test left a handler blocked) is left behind: a new generation starts a new one."""
+    """(Tests) The writer idle (bounded), then an empty queue and clear counters (the seal and a failed start
+    included), this thread at depth 0, and a writer running. A writer still busy after the bound (a test left a
+    handler blocked) is left behind: a new generation starts a new one."""
     idle = flush(idle_seconds)
     with _cond:
         _queue.clear()
@@ -570,6 +675,7 @@ def _reset(idle_seconds: float = 5.0) -> None:
             _state["gen"] += 1
             _writer[0] = None
         _state.update(done=_state["seq"], evicted=_state["seq"], dropped=0, busy=None, stalled_at=None,
-                      exit_deadline=None)
+                      exit_deadline=None, sealed=False, starting=False, start_failed_at=None)
         _cond.notify_all()
     _local.depth = _local.last = 0
+    start_writer(force=True)

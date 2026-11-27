@@ -781,8 +781,8 @@ def test_a_handler_that_raises_anything_is_skipped_and_the_writer_goes_on():
 
 
 def test_a_dead_writer_is_restarted_and_there_is_only_ever_one(monkeypatch):
-    """W1 and C6: a writer found dead is replaced at the next record; many threads logging their first lines at once
-    start exactly ONE writer."""
+    """W1 and C6: a writer found dead is replaced at the next standalone record (a lazy start, at depth 0); many
+    standalone threads logging their first lines at once start exactly ONE writer."""
     import threading
     from agent_comms import hostlog, session_host
     dead = threading.Thread(target=lambda: None, name=hostlog.WRITER_NAME)
@@ -798,7 +798,7 @@ def test_a_dead_writer_is_restarted_and_there_is_only_ever_one(monkeypatch):
         gate.wait(5)
         session_host.log.warning("first line")
     with _Records() as rec:
-        threads = [threading.Thread(target=lambda: _on_watch_thread(first)) for _ in range(16)]
+        threads = [threading.Thread(target=first) for _ in range(16)]
         for t in threads:
             t.start()
         for t in threads:
@@ -1006,6 +1006,7 @@ def test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread():
     first = run.body[1] if isinstance(run.body[0], ast.Expr) else run.body[0]
     assert isinstance(first, ast.With) and ast.unparse(first.items[0].context_expr) == "hostlog.enqueue_only()", \
         "node.run registers its thread first"
+    assert ast.unparse(first.body[0]) == "hostlog.start_writer(force=True)", "and starts the writer eagerly (A4)"
 
 
 def test_no_fork_without_exec_in_the_host_side_modules():
@@ -1538,3 +1539,340 @@ def test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock(tmp_
     else:
         assert r.returncode == 0 and lines == ["signals sent", "returned normally", "closed by logging.shutdown"], (
             r.returncode, r.stdout, r.stderr)
+
+
+# ---------------------------------------------------------------- one writer, review round 1: R11 (the seal)
+
+
+_LATE_SCRIPT = r"""
+import logging, sys, threading, time
+from agent_comms import hostlog, node, node_sessions
+late, late_done = threading.Event(), threading.Event()
+
+class Stuck(logging.Handler):
+    def emit(self, record):
+        if "was not taken" in record.getMessage():
+            threading.Event().wait()        # blocks for good, holding the handler's own lock
+
+    def close(self):
+        print("closed by logging.shutdown", flush=True)
+        super().close()
+
+logging.getLogger("agent_comms").addHandler(Stuck())
+logging.getLogger("agent_comms").setLevel(logging.INFO)
+
+def checkpoint_sender():
+    with hostlog.enqueue_only():
+        late.wait(10)
+        node_sessions.log.warning("session %s: the checkpoint of message %s was not taken (%s); it is not sent "
+                                  "again", "s", 1, "ConnectError")
+        late_done.set()
+
+threading.Thread(target=checkpoint_sender, daemon=True).start()
+real = hostlog.final_flush
+
+def final_flush(budget):
+    ok = real(budget)
+    late.set()                      # (the checkpoint POST fails just after the final wait saw the queue idle)
+    late_done.wait(5)
+    time.sleep(0.3)
+    return ok
+hostlog.final_flush = final_flush
+with hostlog.enqueue_only():
+    getattr(hostlog, "start_writer", lambda **k: None)(force=True)
+    node.log.warning("the last report")
+    print("signals sent", flush=True)
+    node._exit_if_stalled(0)
+print("returned normally", flush=True)
+"""
+
+
+def _child(tmp_path, script, *args, timeout=30):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    path = tmp_path / "child.py"
+    path.write_text(script)
+    return subprocess.run([sys.executable, str(path), *args], capture_output=True, text=True, timeout=timeout,
+                          cwd=str(tmp_path), env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])})
+
+
+def test_r11_a_line_queued_after_the_final_wait_is_rejected_and_the_exit_is_normal(tmp_path):
+    """R11 (Sol's sequence): the checkpoint sender's POST fails just AFTER the node's final wait saw the queue idle, and
+    its warning would enter a handler that blocks forever holding its lock: the queue was sealed in the same step as
+    the idle decision, so the warning is rejected, the process takes the normal exit, and `logging.shutdown()` runs
+    (closing the handler) within the bound."""
+    import time as _time
+    t0 = _time.monotonic()
+    r = _child(tmp_path, _LATE_SCRIPT)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr[-2000:])
+    assert r.stdout.splitlines() == ["signals sent", "returned normally", "closed by logging.shutdown"], r.stdout
+    assert _time.monotonic() - t0 < 20
+
+
+def test_r11_an_enqueue_after_the_seal_raises_nothing_starts_nothing_and_blocks_nobody(monkeypatch):
+    """R11: after the final wait (the seal), a log call from a standalone caller at depth 0 returns at once, raises
+    nothing, starts no thread, and its record is counted nowhere; the seal is one-way (only the tests' reset lifts
+    it)."""
+    import threading
+    import time as _time
+    from agent_comms import hostlog, session_host
+    assert hostlog.final_flush(2.0) is True and hostlog._state["sealed"]
+    seq, threads = hostlog._state["seq"], threading.active_count()
+    with hostlog._cond:
+        hostlog._state["gen"] += 1          # (even with no writer running, nothing starts one now)
+        hostlog._writer[0] = None
+        hostlog._cond.notify_all()
+    _time.sleep(0.1)
+    threads = threading.active_count()
+    t0 = _time.monotonic()
+    session_host.log.warning("after the seal")
+    assert _time.monotonic() - t0 < 0.1
+    assert hostlog._state["seq"] == seq and threading.active_count() == threads and hostlog._writer[0] is None
+    assert hostlog.final_flush(0.1) is True, "still idle, still sealed"
+    hostlog._reset()
+    assert not hostlog._state["sealed"] and hostlog._writer[0] is not None
+
+
+def test_r11_the_seal_and_the_idle_decision_are_one_step(monkeypatch):
+    """R11 (the atomicity): a producer that tries to enqueue exactly when the final wait has decided "idle" cannot get
+    in before the seal: its record is rejected and no handler is entered."""
+    import threading
+    import time as _time
+    from agent_comms import hostlog, session_host
+    real, go, done = hostlog._idle_by, threading.Event(), threading.Event()
+
+    def idle_by(deadline):
+        ok = real(deadline)
+        if ok:
+            go.set()
+            _time.sleep(0.3)        # (a producer runs now, while the decision is made)
+        return ok
+    monkeypatch.setattr(hostlog, "_idle_by", idle_by)
+
+    def producer():
+        go.wait(5)
+        session_host.log.warning("between the idle decision and the seal")
+        done.set()
+    with _Records() as rec:
+        threading.Thread(target=lambda: _on_watch_thread(producer), daemon=True).start()
+        assert hostlog.final_flush(2.0) is True
+        assert done.wait(5)
+        _time.sleep(0.3)
+    assert "between the idle decision and the seal" not in rec.messages()
+
+
+# ---------------------------------------------------------------- R12 (a writer that cannot start), A4, A5
+
+
+def _no_writer():
+    """As in a process whose writer is not running (and none starting)."""
+    from agent_comms import hostlog
+    with hostlog._cond:
+        hostlog._state["gen"] += 1
+        hostlog._writer[0] = None
+        hostlog._state.update(starting=False, start_failed_at=None)
+        hostlog._cond.notify_all()
+
+
+def _refuse_the_writer(monkeypatch, error=RuntimeError("can't start new thread")):
+    """`Thread.start` raises for the writer's thread (the OS refuses it); other threads start as ever: the calls."""
+    import threading
+    from agent_comms import hostlog
+    real, calls = threading.Thread.start, []
+
+    def start(self):
+        if self.name == hostlog.WRITER_NAME:
+            calls.append(threading.get_ident())
+            raise error
+        return real(self)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    return calls
+
+
+def test_r12_a_writer_that_cannot_start_never_fails_a_log_call(monkeypatch):
+    """R12: the first record of a standalone caller tries to start the writer and the OS refuses: the log call
+    returns at once and raises nothing; nobody waits for a writer that is not running; a failed start is tried again
+    at most once per RESTART_SECONDS (no busy retry)."""
+    import time as _time
+    from agent_comms import hostlog, session_host
+    monkeypatch.setattr(hostlog, "ACK_SECONDS", 5.0)
+    _no_writer()
+    calls = _refuse_the_writer(monkeypatch)
+    t0 = _time.monotonic()
+    session_host.log.warning("the first line")
+    session_host.log.warning("a second line, within the retry interval")
+    assert _time.monotonic() - t0 < 0.5
+    assert len(calls) == 1, "one start attempt, not one per line"
+    assert hostlog._writer[0] is None and not hostlog._state["starting"]
+
+
+def test_r12_a_stop_and_a_save_complete_when_the_writer_cannot_start(henv, monkeypatch):
+    """R12: with the writer refused by the OS, a cancel of a live steer attempt under the runner lock (which logs)
+    still signals its process, and a shutdown whose SIGKILL step raises (which logs) still saves the state file;
+    nothing raises; once a start succeeds, the writer says once how many lines the bound dropped, then the rest."""
+    from agent_comms import hostlog, session_host
+    from hostlog_guard import runner_lock
+    from test_claude_steering import steered
+    monkeypatch.setattr(hostlog, "ACK_SECONDS", 5.0)
+    monkeypatch.setattr(hostlog, "RESTART_SECONDS", 0.0)
+    s, child, n = steered(henv, monkeypatch)
+    _no_writer()
+    monkeypatch.setattr(hostlog, "QUEUE_MAX", 3)
+    calls = _refuse_the_writer(monkeypatch)
+    lock, inner = runner_lock()
+    with lock:
+        henv.host.cancel(SID, "1", "cancelled")
+    assert child.terminated, "the stop's signal went"
+    child.exits_on_terminate, child.code = False, None      # (still going at shutdown: its SIGKILL is due)
+
+    def bad():
+        raise OSError("kill failed")
+    child.kill = bad
+    henv.host._state_path().unlink(missing_ok=True)
+    henv.host.stop_all()
+    assert henv.host._state_path().exists(), "the save went"
+    for i in range(5):
+        session_host.log.warning("queued while no writer runs %d", i)
+    assert calls, "standalone exits at depth 0 tried to start it"
+    monkeypatch.undo()
+    monkeypatch.setattr(hostlog, "ACK_SECONDS", 5.0)
+    with _Records() as rec:
+        assert hostlog.start_writer(force=True), "the retry point starts it"
+        session_host.log.warning("a start succeeds")
+    said = rec.messages()
+    drops = [m for m in said if m.endswith("deferred log line(s) were dropped: the queue was full")]
+    assert len(drops) == 1 and said[0] == drops[0] and said[-1] == "a start succeeds", said[:4]
+
+
+def test_a4_no_enqueue_under_a_host_lock_or_on_a_lifecycle_thread_starts_the_writer(env, monkeypatch):
+    """A4: with no writer running, a record logged under a host lock (the runner lock, the cutoff lock, the registry
+    lock) or on a lifecycle thread never calls `Thread.start()`; a standalone caller at depth 0 does (the lazy start),
+    and so does `start_writer` (production's eager start and its pass-boundary retry)."""
+    import threading
+    from agent_comms import hostlog, session_host
+    runner = env.node.sessions
+    _no_writer()
+    real, calls = threading.Thread.start, []
+
+    def start(self):
+        if self.name == hostlog.WRITER_NAME:
+            calls.append("start")
+        return real(self)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    monkeypatch.setattr(hostlog, "ACK_SECONDS", 0.2)
+    for lock in (runner.lock, runner.host._steer_stop_lock, runner.host.groups.lock):
+        _no_writer()
+        with lock:
+            session_host.log.warning("under a host lock")
+            assert calls == [], lock    # (no start while the lock is held ...)
+        assert calls == ["start"], lock     # (... the lazy start is the standalone caller's, at depth 0)
+        calls.clear()
+    _no_writer()
+    _on_watch_thread(lambda: session_host.log.warning("on a lifecycle thread"))
+    done, err, _ = _production(lambda: session_host.log.warning("on a lifecycle thread"))
+    assert done.wait(5) and not err and calls == []
+    assert hostlog.start_writer(force=True) and calls == ["start"]
+
+
+def test_a5_an_interrupt_during_an_enqueue_propagates_and_leaves_no_claim(monkeypatch):
+    """A5: "no log call raises into the host" is for ordinary failures: an interrupt arriving inside the enqueue (here
+    inside the writer's start) propagates out of the log call, and leaves the queue's lock free and no start
+    claimed; the next start succeeds."""
+    import pytest as _pytest
+    from agent_comms import hostlog, session_host
+    _no_writer()
+    _refuse_the_writer(monkeypatch, error=KeyboardInterrupt())
+    with _pytest.raises(KeyboardInterrupt):
+        session_host.log.warning("interrupted")
+    assert not hostlog._state["starting"]
+    assert hostlog._cond.acquire(blocking=False)
+    hostlog._cond.release()
+    monkeypatch.undo()
+    assert hostlog.start_writer(force=True)
+
+
+# ---------------------------------------------------------------- R13: the real exit path, a real SIGTERM
+
+
+_NODE_SCRIPT = r"""
+import logging, sys, threading
+from agent_comms import node
+entered = threading.Event()
+
+class Stuck(logging.Handler):
+    def emit(self, record):
+        if "hub unreachable" in record.getMessage():
+            print("entered", flush=True)
+            threading.Event().wait()        # blocks for good, holding the handler's own lock
+
+logging.getLogger("agent_comms").addHandler(Stuck())
+logging.getLogger("agent_comms").setLevel(logging.INFO)
+node.run(sys.argv[1], "a-test-token", poll_seconds=0.1)
+print("run returned", flush=True)
+"""
+
+
+def test_r13_a_real_sigterm_ends_the_node_within_the_bound_with_mains_status(tmp_path):
+    """R13 (and A3): the test's OWN child process runs `node.run` against a local stub hub that answers the hello and
+    fails every assignment fetch (500), so the loop says `hub unreachable` into a handler that blocks forever holding
+    its lock; once that handler is entered the test sends the child a REAL SIGTERM: the child shuts down and ends
+    within the bound with status 0, which is main's status for a SIGTERM'd node (`on_term` raises KeyboardInterrupt,
+    `run` shuts down and returns, `board` exits 0). (On main the same child would never end: its loop is stuck in that
+    handler.)"""
+    import json
+    import os
+    import signal
+    import subprocess
+    import sys
+    import threading
+    import time as _time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from pathlib import Path
+
+    class Hub(BaseHTTPRequestHandler):
+        def _send(self, code, body):
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self._send(200, {"node": "stub", "projects": [], "runners": []})
+
+        def do_GET(self):
+            self._send(500, {"detail": "unavailable"})
+
+        def log_message(self, *a):
+            pass
+    hub = ThreadingHTTPServer(("127.0.0.1", 0), Hub)
+    threading.Thread(target=hub.serve_forever, daemon=True).start()
+    home = tmp_path / "home"
+    home.mkdir()
+    script = tmp_path / "node_child.py"
+    script.write_text(_NODE_SCRIPT)
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1]), "AGENT_COMMS_HOME": str(home)}
+    child = subprocess.Popen([sys.executable, str(script), f"http://127.0.0.1:{hub.server_address[1]}"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=str(tmp_path))
+    try:
+        line = child.stdout.readline()
+        while line and "entered" not in line:
+            line = child.stdout.readline()
+        assert "entered" in line, child.stderr.read()[-2000:]
+        t0 = _time.monotonic()
+        child.send_signal(signal.SIGTERM)       # (the test's own child, and only it)
+        status = child.wait(20)
+        took = _time.monotonic() - t0
+        rest = child.stdout.read()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(5)
+        hub.shutdown()
+    assert status == 0, (status, rest)
+    assert took < 10, took
+    assert "run returned" not in rest, "the stalled exit ends the process at the final wait"
