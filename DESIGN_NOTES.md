@@ -16775,3 +16775,28 @@ two fences (2), the runner's two shutdown steps (2), and four C1 rows re-anchore
 - **Two run rows** were caught only by the slow stand-in e2e test, not by a targeted test.
 - 83d9632 pins all three directly (a HELD session's turn stays unsettled; a HELD run logs no survivor stop; a run's
   refused release with its entry missing still fences), and all three are caught.
+
+#### Runs (C1 review round 1, on 83d9632)
+
+Claude Code 2.1.330 and codex-cli 0.172.0, run the way scripts/session-host-e2e.py runs them. The machine was heavily
+loaded by other agents' suites, with load averages of 6.5 to 9.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- **The full suite, serial:** 5377 passed, 10 skipped and 1 failed, in 27 min 13 s (about 12 min on an idle machine).
+- **The failure** is `test_hosted_sessions.py::test_the_end_to_end_script_passes_with_the_stand_in`, the in-suite
+  stand-in e2e test with its 300-second limit.
+  - Rerun alone: it failed again after 313 s, its limit plus the stop.
+  - The same script with the test's exact arguments (`--max-latency 10 --max-wake 10`), run directly: PASS, 395
+    checks, in 6 min 12 s at a load average of about 8.
+  - So this is the timeout under load, not a defect.
+- **The parallel suite earlier in the round:** 5373 passed and 2 failed. Those two were a test whose `groups.start`
+  wrapper predated the new key argument, and they are fixed.
+- **The `~/.codex/config.toml` hash** was 18fcebe0d94018f8 before, after each real run and at the end.
+- The protected files are unchanged.
