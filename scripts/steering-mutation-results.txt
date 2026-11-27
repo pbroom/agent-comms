@@ -137,3 +137,51 @@ rows: 11
 stale or broken: []
 missed: []
 exit 0
+
+# Host-side logging: one writer (DESIGN_NOTES "Host-side logging: one writer"). The 10 drain and round-2
+# boundary rows are gone with their code; 10 new rows (the writer, its restart and per-handler skip, the
+# acknowledgement's eviction release, latch and clearing, the bounded flush, the bounded exit, the main thread's
+# and the session loop's registration); the two predicate rows renamed. On 8228afa, 32 rows (every hostlog row and
+# every row the writer relies on): 31 caught, "W3 nobody waits inside a boundary" missed (the depth part of the
+# predicate was only reached through a depth-0 exit); a direct pin was added (7a6a5f5) and it is caught there.
+
+commit 8228afa
+CAUGHT  W2 a lifecycle thread never waits (the predicate)  test_r6_n3_no_handler_runs_for_a_provider_logger_on_the_watchdogs_thread
+CAUGHT  R7-2 stop_all is an entry point (successor)  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[s_turn]
+CAUGHT  A3 the exception's type only (successor)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  C1 registry busy: no stop committed (re-anchored)  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  A2 the runner lock is a host lock (successor)  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  A2 the registry lock is a host lock (successor)  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  A2 the host's public methods are entry points (successor)  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+MISSED  W3 nobody waits inside a boundary (the predicate)  
+CAUGHT  L the level is checked at the call  test_a_line_the_logger_would_not_emit_is_not_kept
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's caller is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's time is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  R1 the report lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R1 the ack lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R1 a steer attempt's record lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R2 the checkpoint sender is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R2 the watchdog is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R3 an errno is read with no code of the exception's  test_facts_never_call_a_hostile_exceptions_own_code
+CAUGHT  R7 a CalledProcessError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  R7 an HTTPStatusError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  W1 the writer is a lifecycle thread (a handler that logs never waits)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  W1 a dead writer is replaced  test_a_dead_writer_is_restarted_and_there_is_only_ever_one
+CAUGHT  W1 a handler raising anything is skipped per handler  test_a_handler_that_raises_anything_is_skipped_and_the_writer_goes_on
+CAUGHT  C3 a waiter on an evicted record is released  test_a_waiter_on_a_record_the_bound_evicted_is_released_at_once
+CAUGHT  C3 the stall latch  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  C3 the latch clears on a later completion  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  W5 flush is bounded  test_flush_is_bounded_with_a_blocked_writer
+CAUGHT  C4 a stalled writer does not hold the exit  test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock[stalled]
+CAUGHT  C1 the node's main thread is a lifecycle thread  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  W2 the session loop is a lifecycle thread  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+rows: 32
+stale or broken: []
+missed: ['W3 nobody waits inside a boundary (the predicate)']
+exit 0
+
+commit 7a6a5f5
+CAUGHT  W3 nobody waits inside a boundary (the predicate)  test_a_thread_holding_a_host_lock_never_waits

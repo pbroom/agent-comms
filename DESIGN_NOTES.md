@@ -17160,3 +17160,22 @@ On 567a0b1 (this round's tests copied in, each run alone, bounded):
 - W7.6 fails: the sessions' recovery is not reached.
 - W7.2 and W7.3 fail only on the writer-thread checks.
 - W7.7 passes there.
+
+### Mutation check and runs
+
+- **Mutation rows.** The script stays at 188 rows: the 10 drain and round-2 boundary rows went with their code, and
+  10 new ones came for the writer. On 8228afa, 32 rows ran: 31 CAUGHT, and "W3 nobody waits inside a boundary"
+  MISSED, because the predicate's depth part was reached only through a depth-0 exit. A direct pin was added
+  (7a6a5f5) and that row is CAUGHT there.
+- **Runs** on 8228afa (7a6a5f5 adds one assertion to a test), stand-ins only; the real CLIs were not run:
+
+  | Run | Result |
+  | --- | --- |
+  | full suite, serial | 5482 passed, 10 skipped, 0 failed, 13 min 11 s (load 6 to 8), the end-to-end wrapper included |
+  | full suite, `-n auto` | 5482 passed, 10 skipped, 4 min 10 s (load 6 to 8) |
+  | full stand-in e2e | PASS, 395 checks, 239 s |
+  | `--only steer` | PASS, 27 |
+  | `--only steering` | PASS, 115 |
+  | `--only correlation` | PASS, 24 |
+  | `--only structured` | PASS, 36 |
+  | `--only tree` | PASS, 143 |
