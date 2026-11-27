@@ -15385,3 +15385,170 @@ After the last code commit (32bd521), on 26 November:
 An earlier run of the final set, on e85d73a, failed one test in the full suite, S36 in tests/test_hosted_spawn.py
 (a SIGKILL 67 microseconds ahead of a full grace from its real SIGTERM, with the kills sent first in the
 watchdog's pass). It led to 32bd521 (above); that run's e2e part was stopped and run again whole.
+
+### Review round 6 (on 072b20f: CHANGES, three blockers, all on the kill path; M8 evidence sufficient) and what changed
+
+Backup branch `backup/claude-steering-072b20f`. Sol found three blockers. The plan is the NARROW one, which Sol
+checked: this branch restores main e6b421f's kill step, and two inherited gaps become known limits. Kill records,
+verified exit, a retained reservation, restart identity and kills independent of other watchdog work move to the
+first hardening PR, with Sol's design check before its build. Each of Sol's sequences is a test written first. On an
+export of 072b20f, 10 of round 6's 12 tests fail, among them round 5's lock-free kill test, rewritten as main's
+pin. The 2 that pass there are the known-limit pins, which pin main's behaviour. The test the mutation check called
+for is listed with it.
+
+#### N1. The kill step is main's (the node)
+
+- **The class.** Any SIGKILL decided from session state that the loop can change between the decision and the
+  signal. Sol showed two of these on 072b20f:
+  - the watchdog qualifies A, the loop replaces A's child, and the SIGKILL reaches the replacement;
+  - the loop registers a stop (`stopping_since`), the watchdog SIGKILLs, and only then does the loop's SIGTERM go.
+
+  Both come from round 5's lock-free kill step, which read the session's mutable fields.
+- **Owner: `SessionRunner.enforce_deadlines`.** The self-stop and the due SIGKILLs are one locked section, taken
+  with main's unbounded wait, with main's order, eligibility and dating inside it, exactly as e6b421f. The steer
+  deadlines follow in a section of their own, whose wait stays bounded by one watch interval (round 5). A loop that
+  holds its lock longer delays them, never a kill: the kill step's wait has no timeout, so no pass skips a due kill.
+- **The argument.** Every write to a session's child, `stopping_since` and the SIGTERM (`_stop`, the reap, a
+  replacement start) happens under the runner lock: on the loop's thread, or on the watchdog's inside this same
+  section. The kill step reads them and signals under that lock. So neither interleaving can happen: the loop cannot
+  run between the kill's qualification and its signal, nor between a stop's registration and its SIGTERM.
+- **Kill times.** Main's, unchanged: S36 (tests/test_hosted_spawn.py) and R8-01c (tests/test_codex_steering.py)
+  pass unchanged. Round 5's kills-first order is withdrawn; it was the cause of S36's one failure then.
+- **Tests.**
+  - `test_r6_n1_a_kill_qualified_by_the_watchdog_never_hits_a_replacement` and
+    `test_r6_n1_no_kill_comes_between_a_stop_and_its_sigterm`, Sol's two interleavings, run with real threads.
+    They fail on 072b20f; now the loop's step waits for the lock.
+  - `test_r6_n1_the_kill_step_waits_for_the_loops_lock_as_main` replaces round 5's `..._takes_no_lock`.
+  - `test_r5_w_a_stalled_loop_with_a_partial_write_pending` is rewritten: the SIGKILL waits for the loop's lock
+    (main's), and still no further byte of S is written.
+
+#### N2. Shutdown: no transcript write ahead of a SIGKILL (the host)
+
+- **The class.** Anything in `stop_all` that writes or reads a transcript before a group's SIGKILL, or before a
+  sibling's. On 072b20f the deferred transcript lines a Codex watchdog drain left (`tee_pending`) were flushed
+  first, so a stalled write held up that group's SIGKILL and every later sibling's.
+- **Owner: `SessionHost.stop_all`.** The bulk signal pass comes first: every group still going gets its SIGKILL
+  (each in its own `try`). Only after it, session by session, come the deferred lines, the last read, the close and
+  the fd. This is also stricter than main, which read and wrote a session's transcript before its next sibling's
+  SIGKILL.
+- **Test.** `test_r6_n2_a_stalled_transcript_write_at_shutdown_holds_up_no_kill`: buffered lines and a stalling
+  transcript write; both SIGKILLs are sent. It fails on 072b20f.
+
+#### N3. Nothing on a watchdog thread runs a log handler or formats a traceback (the host)
+
+- **The class.** Any log call made on a watchdog thread by any logger of the package. Round 5 wrapped only two
+  module loggers; the Codex provider's logger, reached from main's watchdog drain (a late answer to a retired
+  request), still ran handlers there. `WatchLog.exception` also formatted a traceback there.
+- **Owner: `session_host._diverting_log`.** It is installed once, as `logging.Logger._log`, keyed on
+  `WATCH_THREADS` and on the logger's name being `agent_comms` or below. So every logger of the package is covered,
+  provider loggers included, without listing call sites. The wrapper class `WatchLog` is deleted; both modules use
+  plain loggers again.
+  - On a watchdog thread nothing becomes a log record. The line is kept in memory, in a bounded queue: the message,
+    its arguments, and an exception's type and text only (no traceback is formatted). It is never formatted and never
+    handed to a handler there.
+  - The loop writes these lines at its next pass (`flush_watch_logs`).
+  - On every other thread, logging is as ever. Still no steer or message text in any line.
+- **Tests.**
+  - `test_r6_n3_no_handler_runs_for_a_provider_logger_on_the_watchdogs_thread`: a late Codex answer in main's
+    drain, with a stalling handler on the package logger; the pass returns, and the loop writes the provider's line.
+  - `test_r6_n3_no_traceback_is_formatted_on_the_watchdogs_thread`: a raising self-stop, with every `traceback`
+    formatter instrumented by thread.
+  - Both fail on 072b20f. Round 5's `test_r5_w_no_log_handler_runs_on_the_watchdogs_thread` still passes.
+
+#### Smaller
+
+- **Y, the literal legacy rung (`SessionRunner._post_report`, with `_rung_two`).** For a report main could have sent,
+  the ladder is exactly main's: as built, then without its steer extensions. So round 5's check that the two differ
+  only by those extensions is implied, and it is deleted (ce186ec). Main's forget of `steer` needs all of these:
+  - the report is one main could have sent, so rung (ii) removes nothing (no Claude pair, no `next_turn`);
+  - it was refused as built with a 422;
+  - it was taken as main's plain retry, the last rung;
+  - under the same listing.
+
+  Sol's sequence: no modes, only a `next_turn` extension, a 422, taken with only `next_turn` stripped. Nothing is
+  forgotten. Test: `test_r6_y_an_extension_only_next_turn_422_forgets_nothing`, which fails on 072b20f.
+  `test_r5_y_main_forgets_steer_only_on_its_own_legacy_path[422]` still forgets.
+- **X, one commit for an accepted event (`SessionRunner._commit`).** An ordinary event and a checkpoint commit the
+  same way, under the runner lock: the queue entry, then the receipt. If the receipt cannot be made, the entry is
+  undone, so a failure leaves neither. Test: `test_r6_x_a_checkpoint_and_its_receipt_commit_together` (a raise after
+  the commit, a flush, the retry: one checkpoint POST). It fails on 072b20f.
+- **X, the final shutdown handoff.** It is tried once more if it raises. Once exhausted, what was not taken stays in
+  the outbox (this process reports no more of it; the next node process reports those turns as lost), the error is
+  logged, and shutdown goes on. Test: `test_r6_x_the_final_shutdown_handoff_is_retried_once[1|2]`, where `[2]` pins
+  the exhausted outcome. Both fail on 072b20f, where the raise escaped shutdown.
+
+#### Round 5's Z: what stays
+
+- Siblings still stop when a step raises.
+- A KILL that raises keeps the group: main's outcome, without main skipping the siblings. Round 5's retention, now
+  keyed on a failed step of that session, the SIGKILL in the bulk pass included.
+- A `parked` survivor gets no invented SIGTERM time, and the bulk stop sends its real SIGTERM.
+- Not built: restart identity.
+
+#### Known limits (inherited from main e6b421f, pinned as shipped)
+
+- **Work ahead of the kill step can delay a due SIGKILL.** On the watchdog's pass the self-stop comes first, under
+  the same runner lock, and it takes the group registry's lock (`groups.stopping`), which a spawn holds across process
+  creation. A loop that holds the runner lock delays the kill step too, with the documented residual, a save stalled
+  in the loop's tick. Pinned: `test_r6_n4_known_limit_a_registry_wait_ahead_of_the_kill_step` (the SIGKILL waits
+  behind the registry lock and goes once it is let go) and `test_r6_n1_the_kill_step_waits_for_the_loops_lock_as_main`.
+- **A SIGKILL that returns while members of the group survive releases ownership.** At shutdown, a no-op or not yet
+  delivered signal: the session lets go of its handle, its group entry (the checkout reservation) and its state
+  record, as main does. Round 5's retention covers a raising step only. Pinned:
+  `test_r6_n4_known_limit_a_kill_that_returns_with_survivors_releases_ownership`.
+
+Both are main e6b421f's behaviour. Sol found no sequence where a held Claude end or S's turn makes either worse. The
+hardening PR follows this one: kill records per concrete process group, verified exit, a retained reservation across
+a restart, restart identity, and kills independent of other watchdog work.
+
+The other known limits stand as documented in round 5, with one narrowed:
+- **A log handler that raises between a claim and its signal on the LOOP thread.** The pinned path recovers (the
+  host-error path sends the stop). If `_end` had already set `ended`, `_host_error` skips its stop path; that case is
+  named here as follow-up.
+
+#### Codex under faults (completed)
+
+With no fault, Codex behaviour is main's. Under a fault:
+- **Kill scheduling.** Main's again (N1). At shutdown, every SIGKILL goes before any transcript work (N2, stricter
+  than main).
+- **The provider logger.** Its lines on the watchdog's thread (main's drain) are kept for the loop: no handler, no
+  traceback there (N3).
+- **Receipts.** A Codex end is taken once by its identity (round 5, X). Its queue entry and receipt commit together
+  (round 6).
+- **Fallback.** A 400 is retried plainly and forgets nothing. A 422 of a step-2 extension is main's retry and main's
+  forget. Another session's fallback never strips a Codex extension.
+- **Shutdown.** A failed step no longer skips siblings. A raising KILL keeps the group.
+- **The partial cut at the latch.** Main's.
+- **Not changed.** A Codex attempt's close, cancel, reap or timeout after the latch (R6-01).
+
+#### Mutation check, review round 6
+
+`scripts/steering-mutation-check.py` adds rows for N1, N2 and N3, the literal rung and X. Rows whose lines this
+round rewrote are re-anchored on the new lines: rung (ii)'s two, the forget's 422, and the failed-step retention. The
+output is in `scripts/steering-mutation-results.txt`.
+- **Run 1** (02e96b1, 123 rows): 116 caught, 7 missed.
+  - The five known equivalences.
+  - "Y main's forget only when only the extensions differ": its check is implied and is deleted, making the row
+    stale (122 rows).
+  - "N1 the steer deadlines' bounded wait": now pinned by `test_r6_n1_only_the_steer_deadlines_wait_is_bounded`.
+    The self-stop and the kills take main's unbounded wait; only the steer section waits at most one watch.
+- **Run 2** (ce186ec): that row and the three rows on the lines that changed. All caught.
+
+117 caught. The 5 not caught are the equivalences of round 5, each agreed with Sol: the echo shape's scalar and its
+strings, the `steer_named` bound, the purge and the incarnation tag.
+
+#### Runs
+
+After the last code commit (ce186ec), on 26 November:
+- `uv run pytest -q -p no:cacheprovider`: 4841 passed, 10 skipped, 0 failed.
+- The stand-in e2e in full: PASS (395 checks).
+- `--only steering` with stand-ins: PASS (115 checks).
+- `--only correlation` with stand-ins: PASS.
+- `--only steering` with the real CLIs (Claude Code 2.1.330; codex-cli 0.172.0): PASS (54 checks).
+- `--only correlation` with the real CLIs: PASS.
+- `~/.codex/config.toml` sha256 18fcebe0d94018f8 before, between and after the real runs (the baseline).
+
+Earlier in the round, while another program kept this machine busy (load average about 7), the suite's own run of
+the stand-in e2e (tests/test_hosted_sessions.py, a 300-second limit) ran out of time. That happened on this branch
+and on 072b20f alike: the e2e took 353 s and 366 s when timed directly, and passed both times. It is not a change of
+this round. The final runs above were made once the machine was quieter.
