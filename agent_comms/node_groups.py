@@ -38,7 +38,9 @@ _LOAD_FAILED_SAID: list = []        # (C1, review round 4, R12/A5) a libproc tha
 # unproved: no wait. A group that cannot be proved gone (a survivor, one HELD long before) spends the whole window.
 # The watch sends no signal and reorders none, but a signal this shutdown sends AFTER it comes up to this long later:
 # the sessions' fallback KILL when their first KILL pass raised. The most it adds to a shutdown is 2 x this (two
-# serial watches, on that fallback route: the node's, then the host's own after its fallback KILL), plus probe and
+# serial polling windows, on either fallback route: when the sessions' first KILL pass raised, the node's watch and
+# then the host's own after its fallback KILL; when stopping the runs itself failed, `Node.stop_all`'s watch and then
+# the host's own, which is handed no deadline there), plus probe and
 # scheduling overhead: far inside launchd's exit timeout for the node's LaunchAgent (60 s,
 # scripts/install-launchagents.py; a shutdown that needs a KILL takes the 10 s kill grace first).
 POST_KILL_SECONDS = 1.0

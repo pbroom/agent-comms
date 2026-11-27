@@ -17367,8 +17367,11 @@ None decides a release by a signal test. The two reap branches can only postpone
 - **The total worst case added to a shutdown: 2 seconds** (2 x POST_KILL_SECONDS), plus probe and scheduling
   overhead. The route that reaches it: the sessions' first KILL pass raises, so the node's watch spends its whole
   window on those still-alive sessions; then, after the runs' reports and the host's own grace (main's), the host's
-  fallback KILL pass sends a KILL and takes a fresh window for a group that still cannot be proved gone. Every other
-  route adds at most 1 second.
+  fallback KILL pass sends a KILL and takes a fresh window for a group that still cannot be proved gone. The second
+  route (Sol's review of this round): stopping the runs itself fails in `shut_down`, so `Node.stop_all()` spends one
+  window on its runs and `sessions.shutdown()`, handed no deadline on that route, can spend another on a session
+  group that cannot be proved gone. So: two polling windows on either fallback route; every other route adds at most
+  1 second. The runner-lock timeout bounds the acquisition only; probes and scheduling add their own overhead.
 
 #### R15 [should], with A3: an interrupt cannot leave a token FENCED
 
