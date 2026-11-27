@@ -16989,3 +16989,22 @@ its second due KILL, instead of clearing the first group's veto in the test.
 
 One row, for the only changed product line (S2's retention line on a failed final read). On f3128ff it is caught by
 `test_s2_...`. S1 and S4 change text only, and S3 changes a test. The script now has 198 rows.
+
+#### Runs (C1 review round 3, on 4fa300a; its code is f3128ff's)
+
+Run 13:36 to 14:06, with load averages of 5.2 to 8.5. Claude Code 2.1.330 and codex-cli 0.172.0, run the way
+scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- **The parallel inner-loop suite:** 5408 passed, 10 skipped, in 4 min 13 s.
+- **The full suite, serial:** 5408 passed, 10 skipped, in 12 min 30 s, the in-suite e2e test included.
+- **The `~/.codex/config.toml` hash** was be07f3845d522521 (the baseline since 12:37) before, after each real run and
+  at the end. There was no further change.
+- The protected files are unchanged.
