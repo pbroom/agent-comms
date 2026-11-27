@@ -54,14 +54,14 @@ def _fields(e) -> dict:
 
 
 def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = False, version=None,
-           claude_steer: bool = False) -> dict:
+           claude_steer: bool | None = None) -> dict:
     """`verified`: the Claude adapter's VERIFIED for this run (set on main's adapter too, which has no use for it).
     `allow`: take the allowance out of the raw stdin and transcripts before anything is normalized (`allowed`).
     `named`: take out what mid-turn steering's step 2 names for a run with no steer (`step2_named`), likewise.
     `version`: the Claude Code version every Claude process's `init` reports (step 3's parity: see the module text);
     None: as before (the sequences report OTHER_VERSION, every other process none).
-    `claude_steer`: Claude steering switched ON for this run (review round 9, ruling F: it ships off, the node's
-    `[dispatch.sessions] claude_steer`); off, as shipped."""
+    `claude_steer`: Claude steering switched ON (True) or OFF (False) for this run, whatever the node's
+    `[dispatch.sessions] claude_steer` says; None: as it says (on by default since the enabling PR)."""
     import logging
     import test_hosted_tree
     from agent_comms.providers import claude
@@ -76,9 +76,9 @@ def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = Fal
     uuid.uuid4 = lambda: uuid.UUID(int=next(counter))
     from agent_comms.session_host import SessionHost
     real_switch, real_on = SessionHost.claude_steer, claude.ClaudeSession.steering_on
-    if claude_steer:
-        SessionHost.claude_steer = lambda self: True
-        claude.ClaudeSession.steering_on = True
+    if claude_steer is not None:
+        SessionHost.claude_steer = (lambda self: True) if claude_steer else (lambda self: False)
+        claude.ClaudeSession.steering_on = bool(claude_steer)
     had, before = hasattr(claude, "VERIFIED"), getattr(claude, "VERIFIED", None)
     if verified is not None:
         claude.VERIFIED = frozenset(verified)

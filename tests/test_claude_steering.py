@@ -16,7 +16,7 @@ from agent_comms.providers.claude import ClaudeSession
 from agent_comms.session_host import STEER_UNATTRIBUTED
 from test_claude_correlation import (NOTIFY, V, emit, foreign, idle_host, nonturn, owned, plain, result, short_host,
                                      uuid_of, vinit)
-from test_session_host import SID, henv, make_host, open_session  # noqa: F401
+from test_session_host import SID, SID2, henv, make_host, open_session  # noqa: F401
 
 from agent_comms.session_host import SessionHost as _SessionHost
 
@@ -25,16 +25,18 @@ _REAL_CLAUDE_STEER = getattr(_SessionHost, "claude_steer", None)
 
 @pytest.fixture(autouse=True)
 def _claude_steering_on(monkeypatch):
-    """(Review round 9, ruling F) Claude steering ships OFF by default (`[dispatch.sessions] claude_steer`); every
-    test here runs with it switched ON, set by this file itself. `_claude_steering_default` undoes it."""
+    """(Review round 9, ruling F; the enabling PR) Claude steering is ON by default (`[dispatch.sessions]
+    claude_steer`); every test here runs with it switched on, set by this file itself (so that a test reads the same
+    on a build where it was off). `_claude_steering_off` gives a test the explicit-off configuration."""
     monkeypatch.setattr(_SessionHost, "claude_steer", lambda self: True, raising=False)
     monkeypatch.setattr(ClaudeSession, "steering_on", True, raising=False)
 
 
-def _claude_steering_default(monkeypatch):
-    """The shipped default for the rest of a test: the host reads its config again (off unless `claude_steer`), and
-    the adapter's own word is off."""
+def _claude_steering_off(monkeypatch, config):
+    """The explicit-off configuration for the rest of a test (`claude_steer = false` in the node's file): the host
+    reads its config again, the config says off, and the adapter's own word is off until the host's."""
     monkeypatch.setattr(_SessionHost, "claude_steer", _REAL_CLAUDE_STEER)
+    monkeypatch.setattr(config.sessions, "claude_steer", False)
     monkeypatch.setattr(ClaudeSession, "steering_on", False)
 
 
@@ -2873,7 +2875,9 @@ def test_r3_n_the_watchdog_publishes_a_due_fence_with_no_loop_tick(henv, monkeyp
 
 
 def test_r3_n_the_sigterm_is_sent_outside_the_cutoff_lock(henv, monkeypatch):
-    """Ruling N: the decision and the fence under the cutoff lock; the group registry and the SIGTERM after it."""
+    """Ruling N, superseded for the reserved stop by the enabling PR's ruling S2 (the name kept for the record): the
+    reservation, then escalation armed FIRST (the SIGTERM) under the cutoff lock, then the decision and the fence;
+    nothing can fail between the reservation and the signal."""
     import threading
     s, child, n = steered(henv, monkeypatch)
     s.steer.cover_until = henv.clock() + 20
@@ -2898,7 +2902,8 @@ def test_r3_n_the_sigterm_is_sent_outside_the_cutoff_lock(henv, monkeypatch):
     child.terminate = term
     henv.clock.advance(21)
     henv.host.steer_deadlines()
-    assert seen == [True]
+    assert seen == [False], "the SIGTERM is sent inside the reserved stop's critical section (S2)"
+    assert s.held is not None and s.held.decided is not None, "and the decision after it"
 
 
 def _old_hub_validator(monkeypatch):
@@ -4698,16 +4703,17 @@ def test_r8_c1_during_the_stall_the_checkout_is_as_for_a_hold_before_its_deadlin
 
 
 def test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order(env):
-    """Ruling C1: after the registry frees: the reservation, the claim, the SIGTERM, the publication, once each, in
-    that order; the SIGKILL never earlier than that SIGTERM plus the grace."""
+    """Ruling C1, with the enabling PR's ruling S2's order: after the registry frees: the reservation, the SIGTERM
+    (escalation armed first), the claim's decision, the publication, once each, in that order; the SIGKILL never
+    earlier than that SIGTERM plus the grace."""
     a, ca, sa, release = _expired_hold_with_the_registry_busy(env)
     runner = env.node.sessions
     host = runner.host
     order = []
     real_try, real_fin, real_pub = host.groups.try_stopping, host._finalize_hold, host._publish_hold
 
-    def try_stopping(token):
-        got = real_try(token)
+    def try_stopping(token, barrier=None):
+        got = real_try(token, barrier)
         if got in (host.groups.RESERVED, host.groups.ALREADY):
             order.append("reserve")
         return got
@@ -4724,7 +4730,7 @@ def test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order(env):
     with runner.lock:
         host.tick()
     term_at = sa.stopping_since
-    assert order == ["reserve", "claim", "TERM"], order
+    assert order == ["reserve", "TERM", "claim"], order
     env.clock.advance(host.kill_grace - 1)
     with runner.lock:
         host.kill_due()
@@ -4732,7 +4738,7 @@ def test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order(env):
     ca.code = -9
     with runner.lock:
         host.tick()
-    assert order == ["reserve", "claim", "TERM", "publish"], order
+    assert order == ["reserve", "TERM", "claim", "publish"], order
     assert term_at is not None
 
 
@@ -4771,8 +4777,10 @@ def _registry_state(host, token):
 
 @pytest.mark.parametrize("before", ["live", "stopping"])
 def test_r9_e1_a_commit_that_fails_early_undoes_only_its_own_reservation(henv, monkeypatch, before):
-    """Ruling E1: the commit raises before the stop has an owner and a clock (the decision itself): the reservation
-    this attempt made is undone (LIVE again); a STOPPING barrier that was there before stays."""
+    """Ruling E1, superseded by the enabling PR's ruling S2 (the name kept for the record; `Groups.unreserve` is
+    gone): the decision raises after the reservation: escalation was armed first, so the group has its owner, its
+    kill clock and its SIGTERM, and the checkout stays STOPPING (nothing is undone) whether the barrier was this
+    attempt's or there before."""
     s, child, n = steered(henv, monkeypatch)
     s.steer.cover_until = henv.clock() + 20
     child.emit(owned(n, text="N"))
@@ -4786,9 +4794,8 @@ def test_r9_e1_a_commit_that_fails_early_undoes_only_its_own_reservation(henv, m
     monkeypatch.setattr(henv.host, "_fail", bad)
     with pytest.raises(RuntimeError):
         henv.host._hold_cut(s, henv.clock(), henv.host._outbox, drain=False)
-    want = henv.host.groups.LIVE if before == "live" else henv.host.groups.STOPPING
-    assert _registry_state(henv.host, s.group_token) == [want]
-    assert s.stopping_since is None and not child.terminated
+    assert _registry_state(henv.host, s.group_token) == [henv.host.groups.STOPPING]
+    assert s.stopping_since is not None and child.terminated == 1
 
 
 def test_r9_d3_try_stopping_says_what_happened():
@@ -4926,19 +4933,29 @@ def test_r9_c3_known_limit_the_stall_runs_on_through_the_held_turns_own_timeout(
 # ---------------------------------------------------------------- review round 9, ruling F: off by default
 
 
-def test_r9_f_claude_steering_is_off_by_default():
-    """Ruling F (the guard): the shipped default is off; the key turns it on."""
+def test_r9_f_claude_steering_is_off_by_default(henv, monkeypatch):
+    """Ruling F, with the enabling PR's ruling S4 and S5(b) (the name kept for the record): the guard of the default
+    and of the explicit-off configuration. The default is on; `claude_steer = false` turns it off: the host reads it
+    from its config, and copies it onto each Claude adapter it opens. (Round 9's last assert could never fail.)"""
     from agent_comms.dispatch import SessionsConfig
-    assert SessionsConfig().claude_steer is False
-    assert SessionsConfig.from_dict({}).claude_steer is False
-    assert SessionsConfig.from_dict({"claude_steer": True}).claude_steer is True
-    assert ClaudeSession.steering_on is False or True     # (this file switches it on for its other tests)
+    assert SessionsConfig().claude_steer is True and SessionsConfig.from_dict({}).claude_steer is True
+    assert SessionsConfig.from_dict({"claude_steer": False}).claude_steer is False
+    monkeypatch.setattr(_SessionHost, "claude_steer", _REAL_CLAUDE_STEER)
+    monkeypatch.setattr(ClaudeSession, "steering_on", False)
+    assert make_host(henv).claude_steer() is True, "a default config: on"
+    assert open_session(henv).provider.steering_on is True, "copied onto the adapter at open"
+    _claude_steering_off(monkeypatch, henv.config)
+    host = make_host(henv)
+    assert host.claude_steer() is False, "the key: off"
+    henv.host = host
+    assert open_session(henv, sid=SID2).provider.steering_on is False, "copied onto the adapter at open"
 
 
 def test_r9_f_with_the_default_no_steer_mode_no_slot_no_hold(henv, monkeypatch):
-    """Ruling F: with the default config a verified 2.1.330 incarnation reports no steer mode (no `steer`, no
-    `held`), an offer makes no slot, and N's native end is published as on main (no hold can be created)."""
-    _claude_steering_default(monkeypatch)
+    """Ruling F (the explicit-off configuration since the enabling PR; the name kept for the record): a verified
+    2.1.330 incarnation reports no steer mode (no `steer`, no `held`), an offer makes no slot, and N's native end is
+    published as on main (no hold can be created)."""
+    _claude_steering_off(monkeypatch, henv.config)
     monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
     henv.host = make_host(henv, timeout_minutes=1)
     henv.host.steer_authority = lambda sess: True
@@ -4968,9 +4985,10 @@ def test_r9_f_the_one_place_a_hold_is_made_is_guarded(henv, monkeypatch):
 
 
 def test_r9_f_with_the_default_a_steer_for_a_claude_turn_is_mains(env, monkeypatch):
-    """Ruling F: with the default config the node reports no Claude steer mode, and a steer for a running Claude
-    turn is refused as on main e6b421f: the hub's `cli` refusal (the session's modes do not name `steer`)."""
-    _claude_steering_default(monkeypatch)
+    """Ruling F (the explicit-off configuration since the enabling PR; the name kept for the record): the node reports
+    no Claude steer mode, and a steer for a running Claude turn is refused as on main e6b421f: the hub's `cli`
+    refusal (the session's modes do not name `steer`)."""
+    _claude_steering_off(monkeypatch, env.node.sessions.host.config)
     sid = start(env, "a long turn")["session_id"]
     tick(env)
     child = proc_of(env, sid)[1]
@@ -5043,30 +5061,19 @@ def test_r8_c3_known_limit_a_registry_stall_past_two_graces(env):
 
 # ---------------------------------------------------------------- review round 10
 
+CAUSES = ("hold_cut", "timeout", "cancel", "steer_bytes", "write")
+
 
 def test_r10_h2_a_claude_attempt_keeps_its_path_after_the_adapter_stops_advertising(henv, monkeypatch):
-    """Ruling H2: the path is chosen by the attempt's recorded Claude identity (`slot.holds`) or the actual hold, not
-    the adapter's advertised `holds`: a Claude attempt whose adapter lost verification (no longer advertising) still
-    gets the Claude path for its cleanup (switch on): its turn timeout with the registry busy commits nothing."""
-    import threading
+    """Ruling H2 (with the enabling PR's predicate of the cause): the path is chosen by the attempt's recorded Claude
+    identity (`slot.holds`) or the actual hold, not the adapter's advertised `holds`: a Claude attempt whose adapter
+    lost verification (no longer advertising) still gets the reserved path for a cut of its steer bytes."""
+    from agent_comms import session_host
     s, child, n = steered(henv, monkeypatch)
     s.provider._verified = False        # (verification lost: the adapter no longer says `holds`)
     assert not s.provider.holds and s.steer is not None and s.steer.holds
-    assert henv.host._reserves(s), "the attempt's own identity decides"
-    release, held = threading.Event(), threading.Event()
-
-    def spawn_holding_the_registry():
-        with henv.host.groups.lock:
-            held.set()
-            release.wait(10)
-    threading.Thread(target=spawn_holding_the_registry, daemon=True).start()
-    assert held.wait(3)
-    try:
-        henv.clock.advance(61)
-        out = henv.host.tick()
-        assert not ends(out) and not child.terminated, "the Claude path: no stop committed while the registry is busy"
-    finally:
-        release.set()
+    assert henv.host._reserves(s, session_host.CAUSE_STEER_BYTES), "the attempt's own identity decides"
+    assert not henv.host._reserves(s, session_host.CAUSE_TIMEOUT), "a live attempt's timeout is main's (S1)"
 
 
 def test_r10_h2_a_codex_slot_never_takes_the_claude_path(henv, monkeypatch):
@@ -5075,7 +5082,8 @@ def test_r10_h2_a_codex_slot_never_takes_the_claude_path(henv, monkeypatch):
     host, s, child, _ = host_n(henv)
     host.steer_offer(SID, "a", "u1", "steer", authorized=True)
     host.tick()
-    assert s.steer is not None and not s.steer.holds and not host._reserves(s)
+    assert s.steer is not None and not s.steer.holds
+    assert not any(host._reserves(s, c) for c in CAUSES)
 
 
 def test_r10_g1_each_term_of_the_predicate_alone_makes_it_false(henv, monkeypatch):
@@ -5086,17 +5094,18 @@ def test_r10_g1_each_term_of_the_predicate_alone_makes_it_false(henv, monkeypatc
     false" does not depend on the adapter."""
     s, child, n = steered(henv, monkeypatch)
     host = henv.host
-    assert host._reserves(s) and s.held is None
+    b = "steer_bytes"
+    assert host._reserves(s, b) and s.held is None
     monkeypatch.setattr(_SessionHost, "claude_steer", lambda self: False)
-    assert not host._reserves(s), "the switch, read on the host, alone"
+    assert not host._reserves(s, b), "the switch, read on the host, alone"
     monkeypatch.setattr(_SessionHost, "claude_steer", lambda self: True)
     monkeypatch.setattr(s.provider, "steering_on", False, raising=False)
-    assert not host._reserves(s), "the adapter's copy, alone"
+    assert not host._reserves(s, b), "the adapter's copy, alone"
     monkeypatch.setattr(s.provider, "steering_on", True, raising=False)
     monkeypatch.setattr(s.steer, "holds", False)
-    assert not host._reserves(s), "the attempt's recorded Claude identity, alone (no hold)"
+    assert not host._reserves(s, b), "the attempt's recorded Claude identity, alone (no hold)"
     monkeypatch.setattr(s.steer, "holds", True)
-    assert host._reserves(s)
+    assert host._reserves(s, b)
 
 
 def test_r10_g3_a_restart_with_the_switch_off_restores_no_steering(henv, monkeypatch):
@@ -5108,7 +5117,7 @@ def test_r10_g3_a_restart_with_the_switch_off_restores_no_steering(henv, monkeyp
     henv.host.tick()
     assert s.held is not None
     henv.host._save_state()
-    _claude_steering_default(monkeypatch)
+    _claude_steering_off(monkeypatch, henv.config)
     host = make_host(henv, timeout_minutes=1)
     host.recover()
     s2 = host.open(SID, agent="claude", runtime="claude-code", project=PROJECT_OF(henv))
@@ -5129,7 +5138,7 @@ def providers_modes(provider):
 def test_r10_g3_a_stale_hub_mode_meets_an_off_node(env, monkeypatch):
     """Ruling G3: the hub still lists a Claude steer mode for a session of an off node (stale): its offer is refused
     at slot creation (no slot, nothing written), and the node's next status drops the mode."""
-    _claude_steering_default(monkeypatch)
+    _claude_steering_off(monkeypatch, env.node.sessions.host.config)
     sid = start(env, "a long turn")["session_id"]
     tick(env)
     child = proc_of(env, sid)[1]
@@ -5151,10 +5160,11 @@ def test_r10_g3_a_stale_hub_mode_meets_an_off_node(env, monkeypatch):
 
 @pytest.mark.parametrize("direction", ["node_to_old_hub", "old_node_to_hub"])
 def test_r10_g3_mixed_versions_write_no_claude_steer(env, monkeypatch, direction):
-    """Ruling G3 (mixed versions): this head's node with the switch off against a hub that behaves as d11ff99 (its
-    listing names no `held`), and a d11ff99-style node report (a Claude session's modes `restart` only) against this
-    head's hub: no Claude steer is written either way."""
-    _claude_steering_default(monkeypatch)
+    """Ruling G3 (mixed versions), as MODELLED SHAPES (enabling PR, ruling S4: no old binary runs here): this head's
+    node with the switch off against a listing shaped as d11ff99's (it names no `held`), and a report shaped as a
+    d11ff99 node's (a Claude session's modes `restart` only) against this head's hub: no Claude steer is written
+    either way."""
+    _claude_steering_off(monkeypatch, env.node.sessions.host.config)
     sid = start(env, "a long turn")["session_id"]
     tick(env)
     child = proc_of(env, sid)[1]
@@ -5633,20 +5643,26 @@ def test_r4_t_stop_all_saves_even_when_its_traversal_raises(henv, monkeypatch):
 
 
 def test_r4_t_a_stop_claimed_before_the_latch_may_signal_after_it(henv, monkeypatch):
-    """Ruling T+ (the ordering limit): a stop claimed before the latch signals after it: the same SIGTERM shutdown
-    sends, once; the bulk stop recognises the claim (N's end decided once, by the claim)."""
+    """Ruling T+ (the ordering limit), with the enabling PR's ruling S2: the reserved stop's SIGTERM and its decision
+    are one critical section of the cutoff lock, so a latch that comes during the signal waits for both; the bulk
+    stop then recognises the claim (N's end decided once, by the claim)."""
+    import threading
     s, child, n = steered(henv, monkeypatch)
     s.steer.cover_until = henv.clock() + 20
     child.emit(owned(n, text="N"))
     henv.host.tick()
     real_stop = henv.host._stop
+    latched = threading.Event()
 
     def stop(sess, now, at_signal=False, **kw):
-        henv.host.steer_stopping()          # the latch lands between the claim and the signal
+        t = threading.Thread(target=lambda: (henv.host.steer_stopping(), latched.set()), daemon=True)
+        t.start()           # the latch comes during the signal ...
+        assert not latched.wait(0.2), "... and waits for the reserved stop's critical section"
         return real_stop(sess, now, at_signal=at_signal, **kw)
     henv.host._stop = stop
     henv.clock.advance(21)
     henv.host.steer_deadlines()
+    assert latched.wait(3)
     assert child.terminated == 1 and s.held is not None and s.held.decided is not None
     decided = dict(s.held.decided)
     henv.host._stop = real_stop

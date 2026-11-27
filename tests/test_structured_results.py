@@ -824,11 +824,12 @@ def test_with_the_enabled_version_and_no_steer_every_value_mains_has_is_byte_ide
 
 
 def test_with_claude_steering_off_as_shipped_the_330_run_names_no_claude_mode(tmp_path):
-    """(Review round 9, ruling F) As shipped, Claude steering is off: the 2.1.330 run's Claude sessions report main's
+    """(Review round 9, ruling F; the enabling PR: the name kept for the record) With Claude steering switched off
+    (`claude_steer = false`; on by default since the enabling PR): the 2.1.330 run's Claude sessions report main's
     modes (`restart` only, no `steer`, no `held`), in their records and their reports; only the hub's `held` feature
     is step 3's there."""
     import golden_schema_free as g
-    raw = json.loads(json.dumps(g.record(tmp_path, version="2.1.330"), sort_keys=True))
+    raw = json.loads(json.dumps(g.record(tmp_path, version="2.1.330", claude_steer=False), sort_keys=True))
     claude_recs = [r for k, r in raw["seq_records"].items()
                    if k.startswith("host.session.") and r.get("runtime") == "claude-code"]
     assert claude_recs and all(r["modes"] == ["restart"] for r in claude_recs), [r["modes"] for r in claude_recs]

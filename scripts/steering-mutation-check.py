@@ -1,7 +1,7 @@
 """The mutation check of Claude steering (step 3): one change per row, applied alone to an EXPORT of the branch
 (never a working tree), the steering tests run first and, only if they did not catch it, the wider tests; the file
 restored after each. The rows are review rounds 2 to 10's (DESIGN_NOTES "Mid-turn steering, step 3", each round's
-"Mutation check"): each is (file, name, the exact text, what replaces it); a row whose text is no longer there once
+"Mutation check") and the enabling PR's ("Enabling Claude steering"): each is (file, name, the exact text, what replaces it); a row whose text is no longer there once
 is reported STALE.
 
     git archive HEAD | tar -x -C /tmp/export
@@ -88,6 +88,7 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('NS', 'R the checkpoint gate asks the pair', '        if not (self._pair(self.hub_features) and self.features_known):\n            # (Review round 1, ruling C)', '        if not ("held" in self.hub_features and self.features_known):\n            # (Review round 1, ruling C)'),
     ('H', "S a self-stop's own events kept on a fault", '                self._outbox.extend(mine.current())\n', '                pass\n'),
     ('H', "T a Claude steering session is the bulk stop's after the latch", '        return s.held is not None or (s.steer is not None and s.steer.outcome is None and s.steer.holds)', '        return False'),
+    ('H', 'T the claim checks the latch', '            if self.steer_stopped or (s.steer is not None and s.steer.stopping):\n                return False\n            self._defer_logs', '            self._defer_logs'),
     ('H', 'T nothing logged under the cutoff lock', '        if self._defer_logs is not None and self._claimer == threading.get_ident():\n            self._defer_logs.append((level, msg, args))', '        if False:\n            self._defer_logs.append((level, msg, args))'),
     ('H', 'T nothing saved under the cutoff lock', '            if self._defer_logs is not None and self._claimer == threading.get_ident():\n                self._save_due = True', '            if False:\n                self._save_due = True'),
     ('H', 'T a host error decides nothing new after the latch', '        if held.decided is None and self.steer_stopped and not self._at_once:', '        if False:'),
@@ -139,23 +140,35 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('H', 'R7-3 the dropped lines counted', '            if len(_WATCH_LINES) == _WATCH_LINES.maxlen:\n                _WATCH_DROPPED[0] += 1', '            if False:\n                _WATCH_DROPPED[0] += 1'),
     ('H', "T stop_all's final save in a finally (re-anchored)", '        finally:\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)\n            self._save_state()\n        return self._take_outbox()', '        finally:\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)\n        self._save_state()\n        return self._take_outbox()'),
     ('H', 'R7-2 the final save made with logging restored', '        finally:\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)\n            self._save_state()', '        finally:\n            self._save_state()\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)'),
-    ('H', 'T the claim checks the latch (re-anchored)', '            if self.steer_stopped or (s.steer is not None and s.steer.stopping):\n                return False\n            if reserve:', '            if reserve:'),
     ('H', "D1 a raising SIGTERM keeps main's clock", '                s.child.terminate()\n\n    def _release_steer', '                try:\n                    s.child.terminate()\n                except BaseException:\n                    s.stopping_since = None\n                    raise\n\n    def _release_steer'),
     ('H', 'E2 a registry miss is not a refusal', '                if got == self.groups.BUSY:\n', '                if got in (self.groups.BUSY, self.groups.MISSING):\n'),
-    ('H', "E1 only the attempt's own reservation undone", '                if got == self.groups.RESERVED:\n', '                if got in (self.groups.RESERVED, self.groups.ALREADY):\n'),
-    ('H', "E1 the attempt's reservation undone", '                    self.groups.unreserve(s.group_token)\n', '                    pass\n'),
     ('G', 'D3 a barrier there before is ALREADY', '                    if groups[token][0] == self.STOPPING:\n                        return self.ALREADY\n', ''),
     ('A', 'F the adapter steers only with the switch on', '        return (obj.steering_on and obj.verified', '        return (obj.verified'),
     ('H', 'F the host sets the switch on each adapter', '            s.provider.steering_on = self.claude_steer()', '            s.provider.steering_on = True'),
     ('H', 'F the one place a hold is made asks the switch', '            if steer is HOLD and not self.claude_steer():', '            if False:'),
-    ('D', 'F off by default', '    claude_steer: bool = False', '    claude_steer: bool = True'),
-    ('H', 'C1 the checkout reserved before the claim (re-anchored)', '                got = self.groups.try_stopping(s.group_token)\n                if got == self.groups.BUSY:\n                    return False', '                got = None'),
     ('H', 'C1 registry busy: no stop committed (re-anchored)', '                if got == self.groups.BUSY:\n                    return False', '                if got == self.groups.BUSY:\n                    pass'),
-    ('H', "G1 the predicate-false path is main's", '        if not self._reserves(s):\n            self._fail(s, why, out)\n            self._stop_from(s, now, live)\n            return True', '        if False:\n            self._fail(s, why, out)\n            self._stop_from(s, now, live)\n            return True'),
-    ('H', 'G1 the predicate asks the switch', '        return (self.claude_steer() and getattr(s.provider, "steering_on", False) is True', '        return (getattr(s.provider, "steering_on", False) is True'),
-    ('H', 'G1 the predicate asks for a Claude attempt or a hold', '                and (s.held is not None or (s.steer is not None and s.steer.holds)))', '                and (s.held is not None or s.steer is not None))'),
-    ('H', 'H2 the predicate reads the attempt, not the advertised holds', '        return (self.claude_steer() and getattr(s.provider, "steering_on", False) is True', '        return (self.claude_steer() and getattr(s.provider, "holds", False) is True')]
-FIRST = ["tests/test_claude_steering.py"]
+    ('H', 'S1 the switch', '        if not (self.claude_steer() and getattr(s.provider, "steering_on", False) is True):\n            return False\n        if cause in', '        if not (getattr(s.provider, "steering_on", False) is True):\n            return False\n        if cause in'),
+    ('H', "S1 the hold's causes reserve only with a held end", '        if cause in (CAUSE_HOLD_CUT, CAUSE_TIMEOUT, CAUSE_CANCEL):\n            return s.held is not None', '        if cause in (CAUSE_HOLD_CUT, CAUSE_TIMEOUT, CAUSE_CANCEL):\n            return True'),
+    ('H', 'S1 steer bytes reserve only for a Claude attempt', '        if cause == CAUSE_STEER_BYTES:\n            return s.steer is not None and s.steer.holds', '        if cause == CAUSE_STEER_BYTES:\n            return s.steer is not None'),
+    ('H', "S1 any other cause is main's", '            return s.steer is not None and s.steer.holds\n        return False', '            return s.steer is not None and s.steer.holds\n        return True'),
+    ('H', 'S1 a held cancel reserves', '            if self._reserves(s, CAUSE_CANCEL):', '            if False:'),
+    ('H', "S1 a steer frame's broken pipe reserves", '            if steered is not None and self._reserves(s, CAUSE_STEER_BYTES):', '            if False:'),
+    ('H', "S1 a partial frame's cut reserves", "        if self._reserves(s, CAUSE_STEER_BYTES):\n            # (Enabling PR, rulings S1 and S2) A Claude attempt's frame", "        if False:\n            # (Enabling PR, rulings S1 and S2) A Claude attempt's frame"),
+    ('H', "S1 the held timeout's cause", '            self._cutoff_stop(s, detail, now, out, live=live, cause=CAUSE_TIMEOUT)', '            self._cutoff_stop(s, detail, now, out, live=live, cause=CAUSE_WRITE)'),
+    ('H', "S1 the hold cut's cause", 'cause=CAUSE_HOLD_CUT)', 'cause=CAUSE_WRITE)'),
+    ('H', "S1 main's route of a steering session is claimed", '        if self._steering(s):\n            if not self._claim(s, lambda: self._fail(s, why, out)):\n                return False\n        else:\n            self._fail(s, why, out)', '        self._fail(s, why, out)'),
+    ('H', 'S2 busy commits nothing', '                if got == self.groups.BUSY:\n                    return False\n                if fresh', '                if fresh'),
+    ('H', 'S2 escalation armed before the commit', '                try:\n                    self._stop(s, now, at_signal=True, reserved=True)\n                finally:\n                    self._defer_logs, self._claimer = logs, threading.get_ident()\n                    try:\n                        commit()\n                    finally:\n                        self._defer_logs, self._claimer = None, None', '                self._defer_logs, self._claimer = logs, threading.get_ident()\n                try:\n                    commit()\n                finally:\n                    self._defer_logs, self._claimer = None, None\n                self._stop(s, now, at_signal=True, reserved=True)'),
+    ('H', 'S2 the partial cut clears the buffer only after the reservation', '            if self.steer_stopped:\n                return\n            now = self._drain_before_stop(s, now, out)\n\n            def commit() -> None:', '            if self.steer_stopped:\n                return\n            s.outbuf.clear()\n            now = self._drain_before_stop(s, now, out)\n\n            def commit() -> None:'),
+    ('H', 'S2 the steer pipe clears the buffer only after the reservation', '                if self.live_attempt(s):\n                    now = self._drain_before_stop(s, now, out)\n                self._reserved_stop(', '                s.outbuf.clear()\n                if self.live_attempt(s):\n                    now = self._drain_before_stop(s, now, out)\n                self._reserved_stop('),
+    ('H', 'S3 a live miss gets a barrier', '        barrier = (node_groups.key(s.cwd), s.cwd) if alive else None', '        barrier = None'),
+    ('H', 'S3 a verified exit needs no entry', '        barrier = (node_groups.key(s.cwd), s.cwd) if alive else None', '        barrier = (node_groups.key(s.cwd), s.cwd)'),
+    ('H', 'S3 a live child with no token gets one', '                if fresh and got == self.groups.RESERVED:\n                    s.group_token = token', '                if False:\n                    s.group_token = token'),
+    ('G', 'S3 the registry inserts the barrier on a miss', '            if barrier is not None:\n                k, cwd = barrier', '            if False:\n                k, cwd = barrier'),
+    ('D', 'S4 on by default', '    claude_steer: bool = True', '    claude_steer: bool = False'),
+    ('NS', "S5c the watchdog's lane waits during reconciliation", '        self._deliver(late=not self.reconciling)', '        self._deliver(late=True)'),
+    ('NS', 'S5c the phase is marked', '        self.reconciling = True\n        try:\n            self._reconcile_listing', '        self.reconciling = False\n        try:\n            self._reconcile_listing')]
+FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",
         "tests/test_session_restart_hub.py", "tests/test_structured_results.py", "tests/test_hosted_sessions.py",
         "tests/test_session_host.py"]

@@ -647,7 +647,10 @@ refused before anything is sent. `board session list` marks a session with a ste
 about what the model did with it: `in_turn` is evidence that the agent admitted it into that turn. On Claude a steer
 can also miss the turn and run as Claude's next turn (`next_turn`): the turn's result then waits for that one (at most
 another turn timeout), the session's reply stays the turn's own, and `--wait` prints the steer's own reply after it
-(DESIGN_NOTES "Mid-turn steering, step 3: Claude steering, as built").
+(DESIGN_NOTES "Mid-turn steering, step 3: Claude steering, as built"). Claude steering is on by default on a node;
+`claude_steer = false` under `[dispatch.sessions]` in the node's board.local.toml (or board.toml) turns it off. It is
+read when the node starts, so restart the node after changing it. Off, a steer for a running Claude turn is refused
+as for a CLI that cannot steer, and Codex steering is unaffected.
 
 **Before installing an older hub over one with mid-turn steering**, in this order:
 

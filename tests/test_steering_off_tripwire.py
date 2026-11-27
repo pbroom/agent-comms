@@ -1,7 +1,10 @@
-"""Claude steering ships OFF (DESIGN_NOTES "Mid-turn steering, step 3", review rounds 9 and 10, rulings F, G1 and G2).
+"""Claude steering switched OFF (`[dispatch.sessions] claude_steer = false`; DESIGN_NOTES "Mid-turn steering, step
+3", review rounds 9 and 10, rulings F, G1 and G2; "Enabling Claude steering", ruling S4).
 
-With the shipped configuration (`[dispatch.sessions] claude_steer` absent: off) every steering-only entry point is a
-tripwire here: called at all, it raises. Run under them:
+Claude steering is on by default since the enabling PR; this module sets the switch explicitly to false on every
+configuration made here (before any node or adapter starts: each `SessionsConfig` is made with `claude_steer = false`,
+as a file with that line would make it), and every steering-only entry point is a tripwire: called at all, it raises.
+Run under them:
 - every Codex steering scenario of tests/test_codex_steering.py (imported below, not edited: they run here a second
   time, under the tripwires);
 - the Codex turn timeout with a live steer and bytes still in the output buffer (Sol's round-10 sequence), with the
@@ -13,17 +16,20 @@ import threading
 
 import pytest
 
-from agent_comms import hosted_steer, node_groups, node_sessions, session_host
+from agent_comms import dispatch, hosted_steer, node_groups, node_sessions, session_host
 from agent_comms.providers import claude
 
 TRIPWIRES = [
     (node_groups.Groups, "try_stopping"),       # the reservation without waiting
-    (node_groups.Groups, "unreserve"),          # its undo
-    (session_host.SessionHost, "_reserved_cutoff"),     # the reservation branch of the stop
+    (session_host.SessionHost, "_reserved_stop"),       # the reserved stop (enabling PR, S2)
     (session_host.SessionHost, "_hold"),        # a hold's creation
     (session_host.SessionHost, "_publish_hold"),    # the fence's publication (and every other of a held end)
     (session_host.SessionHost, "_hold_cut"),    # the hold deadline enforcers' cut
+    (session_host.SessionHost, "_steer_adjudicate"),    # the adjudicator of a Claude steer's evidence (S4)
+    (session_host.SessionHost, "_retire_hold"),     # a held end's retirement (S4)
     (claude.ClaudeSession, "steer_named"),      # a Claude steer frame's construction
+    (claude.ClaudeSession, "steer_facts"),      # the adapter's attempt facts (S4)
+    (claude.ClaudeSession, "steer_done"),       # ... and the attempt's retirement in the adapter (S4)
     (node_sessions.SessionRunner, "_checkpoint"),       # a checkpoint's enqueue
     (node_sessions.SessionRunner, "_post_checkpoints"),     # ... and its send
 ]
@@ -31,15 +37,24 @@ TRIPWIRES = [
 
 @pytest.fixture(autouse=True)
 def tripwires(monkeypatch):
-    """Every steering-only entry point raises if called (with the switch off, as shipped), and is recorded: a host
-    error path that swallowed the raise cannot hide it (the test fails at its end)."""
-    assert node_groups and claude.ClaudeSession.steering_on is False, "the shipped default"
+    """The switch set explicitly to false on every configuration made from here on (before any node or adapter
+    starts), and every steering-only entry point raises if called and is recorded: a host error path that swallowed
+    the raise cannot hide it (the test fails at its end)."""
+    assert dispatch.SessionsConfig().claude_steer is True, "on by default (S4)"
+    real_init = dispatch.SessionsConfig.__init__
+
+    def off(self, *a, **k):
+        real_init(self, *a, **k)
+        self.claude_steer = False       # (as `claude_steer = false` in the node's file)
+    monkeypatch.setattr(dispatch.SessionsConfig, "__init__", off)
+    assert dispatch.SessionsConfig.from_dict({}).claude_steer is False
+    assert node_groups and claude.ClaudeSession.steering_on is False, "the adapter's own word, until the host's"
     fired = []
     for cls, name in TRIPWIRES:
         def trip(*a, _n=f"{cls.__name__}.{name}", **k):
             fired.append(_n)
             raise AssertionError(f"tripwire: {_n} ran with Claude steering off")
-        monkeypatch.setattr(cls, name, trip, raising=False)
+        monkeypatch.setattr(cls, name, trip)
     yield
     assert not fired, f"tripwires fired: {fired}"
 
