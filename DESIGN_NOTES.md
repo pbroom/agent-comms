@@ -16912,3 +16912,26 @@ round-1 rows re-anchored on lines this round rewrote.
     could not be seen there, and main's survivor branch differs only in the registry state.
 - **8d9ea81** pins each of those five directly, and all five are caught by those pins.
 - The script now has 197 rows. The results are in scripts/steering-mutation-results.txt.
+
+#### Runs (C1 review round 2, on 9959df9; its code is 8d9ea81's)
+
+Run 12:56 to 13:25, with load averages of 5.6 to 8. Claude Code 2.1.330 and codex-cli 0.172.0, run the way
+scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- **The full suite, serial:** 5405 passed, 10 skipped, in 12 min 21 s, the in-suite e2e test included.
+- **The parallel suite earlier in the round** (load averages of 14 to 22): 3 failed.
+  - `test_r5_w_...` needed its own reset to clear the veto; that is fixed.
+  - `test_the_worst_case_verdict_is_fast` passed when rerun alone.
+  - The in-suite e2e test timed out, then passed in the serial run.
+- **The `~/.codex/config.toml` hash.** The file changed at 12:36:32, while no run of this branch was active (the
+  coordinator's note: the Codex desktop app's own write). The new baseline is be07f3845d522521, which held before,
+  after each real run and at the end.
+- The protected files are unchanged.
