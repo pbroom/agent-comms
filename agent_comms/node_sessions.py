@@ -1783,18 +1783,30 @@ class SessionRunner:
         with self.lock:
             return any(self._going(s) for s in self.host.sessions.values())
 
-    def kill(self) -> None:
+    def kill(self) -> list[str]:
         """After `signal()` and the grace period: SIGKILL for every session process group that is still there. No
-        reporting; `shutdown()` then finds them gone. (C1, review round 3, S1) The veto set here may fall on a token
-        still LIVE in the registry (`signal()` sends its TERM without marking it STOPPING). That leaves no admission
+        reporting; `shutdown()` then finds them gone. Returns the sessions whose KILL was attempted here, for the
+        node's one post-KILL watch (`unproved`; node.py `shut_down`, review round 4, R9 and A2). (C1, review round 3,
+        S1) The veto set here may fall on a token still LIVE in the registry (`signal()` sends its TERM without marking it STOPPING). That leaves no admission
         bypass, by this precondition: from `stopping` (set by `signal()`) on, nothing starts a group. The loop's pass
         and the watchdog return on `stopping` before touching the host, and dispatched runs are admitted only by
         `Node.tick`, on the thread that is running this shutdown (node.py `run`, then `shut_down`)."""
+        killed = []
         with self.lock:
             for s in self.host.sessions.values():
                 if self._going(s) and self.host.groups.may_signal(s.group_token):     # (C1: never a HELD one)
+                    killed.append(s.session_id)
                     self.host.groups.veto(s.group_token)     # (C1, R5: from this attempt on, proof-only)
                     s.child.kill()
+        return killed
+
+    def unproved(self, session_ids: list[str]) -> bool:
+        """(C1, review round 4, R9 and A2) Is any of these sessions' killed groups not yet proved gone (its leader's
+        exit seen by its own handle and no member listed, `SessionHost._proved_gone`)? An observation only: nothing
+        is signalled or released here."""
+        with self.lock:
+            return any(s is not None and s.child is not None and not self.host._proved_gone(s.child)
+                       for s in (self.host.sessions.get(sid) for sid in session_ids))
 
     def shutdown(self) -> None:
         """Stop the loop and every session process; turns in flight are reported failed. The loop may be waiting at

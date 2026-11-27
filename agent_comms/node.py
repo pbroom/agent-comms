@@ -32,7 +32,7 @@ from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_co
                        browser_output_path, make_browser_output,
                        signed_in_browser_overrides, signed_in_profile, spawn_piped, spawn_process, stop_verified,
                        with_headless_browser, with_managed_env, with_writable_roots)
-from .node_groups import key
+from .node_groups import POST_KILL_SECONDS, POST_KILL_STEP, key
 from .node_sessions import SessionRunner
 from .session_host import STATE_FILE as SESSION_STATE_FILE, SessionHost
 
@@ -444,7 +444,10 @@ class Node:
 
     def _stop(self, local: _Local, how: str) -> None:
         if not self.groups.may_signal(("run", local.run_id)):
-            return      # (C1, R2) HELD: proof-only; no signal and no signal clock
+            # (C1, R2) HELD (or vetoed): proof-only; no signal and no signal clock. Returning before `stopping` is
+            # harmless (review round 4, nit): a HELD entry already fences its checkout, and a vetoed one was marked
+            # STOPPING by the stop that sent its KILL (just below).
+            return
         # Before EITHER signal (a hub's kill can come without its terminate): nothing starts in its checkout until its
         # whole group is gone (node_groups).
         self.groups.stopping(("run", local.run_id))
@@ -489,12 +492,13 @@ class Node:
                 self._stop(local, "kill")
 
     def stop_all(self) -> None:
-        """Shutdown: terminate every run, wait the grace period, kill what remains, report each ended."""
+        """Shutdown: terminate every run, wait the grace period, kill what remains, watch the kills finish (bounded,
+        `await_kills`), report each ended."""
         self.signal_runs()
         deadline = self.clock() + self.config.kill_grace_seconds
         while self.runs_alive() and self.clock() < deadline:
             self.sleep(0.2)
-        self.kill_runs()
+        self.await_kills(self.kill_runs())
         self.report_stopped()
 
     # stop_all's steps, so that shut_down can stop hosted sessions within the same grace period and before any report.
@@ -506,30 +510,62 @@ class Node:
     def runs_alive(self) -> bool:
         return any(l.child.poll() is None for l in self.running.values())
 
-    def kill_runs(self) -> None:
-        for local in self.running.values():
+    def kill_runs(self) -> list[str]:
+        """SIGKILL for every run whose leader is still there; the runs whose KILL has been attempted (now, or by an
+        earlier pass) and whose leader's exit is not seen yet: what `await_kills` watches."""
+        killed = []
+        for rid, local in self.running.items():
             if local.child.poll() is None:
                 self._stop(local, "kill")
+                if local.killed:
+                    killed.append(rid)
+        return killed
 
-    def _release(self, rid: str, local: _Local) -> bool:
+    def _proved_gone(self, local: _Local) -> bool:
+        """The proof the release rule asks for (`_release`), as an observation only: the leader's exit seen by its
+        own handle AND a complete listing of its group with no member (`group_absent`). Nothing is signalled."""
+        try:
+            return local.child.poll() is not None and self.group_absent(local.child.pid) is True
+        except Exception:
+            return False
+
+    def await_kills(self, rids: list[str], others: Callable[[], bool] | None = None) -> None:
+        """(C1, review round 4, R9 and A2) After a shutdown's SIGKILLs are SENT (no signal is delayed by this), and
+        before the runs' releases: watch, with no signal, until each killed run is proved gone (`_proved_gone`) and
+        `others()` (the hosted sessions' killed groups) says nothing is left to see, or ONE shared deadline,
+        POST_KILL_SECONDS from now, is reached. A shutdown that killed nothing returns at once. Bounded by the clock
+        and by a count of looks, so a clock that does not move with the sleep cannot hold it."""
+        if not rids and others is None:
+            return
+        deadline = self.clock() + POST_KILL_SECONDS
+        for _ in range(int(POST_KILL_SECONDS / POST_KILL_STEP) + 1):
+            waiting = [rid for rid in rids if rid in self.running and not self._proved_gone(self.running[rid])]
+            if not waiting and not (others is not None and others()):
+                return
+            left = deadline - self.clock()
+            if left <= 0:
+                return
+            self.sleep(min(POST_KILL_STEP, left))
+
+    def _release(self, rid: str, local: _Local, final: bool = False) -> bool:
         """(Ownership until verified exit, C1) The dispatched run's side of THE release rule (`Groups.release`), for
         its reap and the shutdown's `report_stopped`: the leader's exit observed by its own handle AND a complete,
         successful membership observation of its group with no member. Proved: the run leaves `running` (and so
-        its state entry, at the next save) with its registry entry. Not proved: everything is kept."""
+        its state entry, at the next save) with its registry entry. Not proved: everything is kept, HELD at once;
+        (review round 4, R11 and A4) its retention line waits until it has stayed unproved for the run's kill grace,
+        or the shutdown keeps it (`final`), and is written once (`Groups.unproved_line`)."""
         token = ("run", rid)
-        was = self.groups.state(token) == self.groups.HELD
         fence = (getattr(local, "key", None) or key(local.cwd), local.cwd)
-        released = self.groups.release(token,
-                                       lambda: local.child.poll() is not None and self.group_absent(local.child.pid),
-                                       lambda: self.running.pop(rid, None), fence)
-        if not released and not was:
+        released = self.groups.release(token, lambda: self._proved_gone(local), lambda: self.running.pop(rid, None),
+                                       fence)
+        if not released and self.groups.unproved_line(token, self.clock(), local.grace, final):
             log.warning("run %s: its process group could not be proved gone: its checkout stays held (no signal is "
                         "sent to it again)", rid)
         return released
 
     def report_stopped(self) -> None:
         for rid, local in list(self.running.items()):
-            if not self._release(rid, local):
+            if not self._release(rid, local, final=True):
                 # (C1) its group is not proved gone at shutdown (a member survived its SIGKILL): the run keeps its
                 # registry entry (HELD), its handle and its state entry (saved below), and is not reported ended
                 # here: the next node process finds it on record (`recover`). That recovery signals only a leader it
@@ -559,6 +595,8 @@ def shut_down(node: Node) -> None:
             return default
 
     stopped = False
+    killed: list = []
+    sessions_killed: list = []
     try:
         node.signal_runs()
         deadline = node.clock() + node.config.kill_grace_seconds
@@ -567,13 +605,20 @@ def shut_down(node: Node) -> None:
         while (node.runs_alive() or (sessions is not None and quietly(sessions.alive, False))) \
                 and node.clock() < deadline:
             node.sleep(0.2)
-        node.kill_runs()
+        killed = node.kill_runs()
         if sessions is not None:
-            quietly(sessions.kill)
+            sessions_killed = quietly(sessions.kill, []) or []
         stopped = True
     finally:
         try:
             if stopped:
+                # (C1, review round 4, R9 and A2) both KILL passes are sent: one shared, bounded watch of what they
+                # killed, the runs' and the sessions', before the runs' releases and reports (in their order)
+                others = None
+                if sessions_killed:
+                    def others() -> bool:
+                        return quietly(lambda: sessions.unproved(sessions_killed), False)
+                quietly(lambda: node.await_kills(killed, others))
                 node.report_stopped()
             else:
                 node.stop_all()

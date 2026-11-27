@@ -31,8 +31,20 @@ class FakeChild:
         self.terminated = 0
         self.killed = 0
         self.left_members = False   # it exited and left members of its process group (only a test sets this)
+        # (C1, review round 4, R9) As a real process: SIGKILL is delivered at once, but the kernel finishes the exit
+        # asynchronously, so `poll()` right after `kill()` still answers None (40 of 40 in the review's probe). This
+        # many polls after a kill answer None before the exit is seen; a test that wants the exit seen at once sets
+        # `kill_exits_at_once`.
+        self.kill_exits_at_once = False
+        self.polls_after_kill = 1
+        self.dying = None
 
     def poll(self):
+        if self.code is None and self.dying is not None:
+            if self.dying > 0:
+                self.dying -= 1
+                return None
+            self.code, self.dying = -9, None
         return self.code
 
     def terminate(self):
@@ -42,6 +54,9 @@ class FakeChild:
 
     def kill(self):
         self.killed += 1
+        if self.code is None and not self.kill_exits_at_once:
+            self.dying = self.polls_after_kill
+            return
         self.code = -9
 
 
@@ -624,6 +639,7 @@ def test_timeout_terminates_then_kills(denv):
     allow(denv, agents=["codex"])
     human_post(denv, ["codex"])
     stubborn = FakeChild(77, exits_on_terminate=False)
+    stubborn.kill_exits_at_once = True      # (the hub's own runs: its exit is seen on the next pass)
     denv.d.spawner = lambda argv, **kw: stubborn
     denv.d.tick()
     denv.clock.advance(29 * 60)

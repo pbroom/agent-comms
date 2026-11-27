@@ -16586,6 +16586,8 @@ per-group supervisor (shim), which C3 builds. C1 does not depend on it.
     one is tried, three sizes in all, and otherwise there is no proof.
   - **An error, or no libproc,** means no proof.
   - **Any member at all is not proof,** a zombie included.
+  - **macOS only** (review round 4, R12 and A5). Off macOS the membership half is main's own liveness answer, `not
+    group_alive(pgid)`: a stated compatibility limit. On macOS a libproc that will not load is no proof, said once.
   - **Checked on this Mac** (scratch, on this script's own children): a zombie leader IS listed; a missing group
     gives 0 bytes; a buffer of one slot for a group of two returns exactly the buffer's size.
 - **Why not `killpg(pgid, 0)`.** Its ESRCH also answers for a group whose only members are zombies. Its EPERM answers
@@ -17008,3 +17010,245 @@ scripts/session-host-e2e.py runs them.
 - **The `~/.codex/config.toml` hash** was be07f3845d522521 (the baseline since 12:37) before, after each real run and
   at the end. There was no further change.
 - The protected files are unchanged.
+
+### C1: review round 4 (the PR's reviews)
+
+Two reviews of e500549: the automated PR review (R8) and the independent pre-merge review (R9 to R12, and two nits).
+The coordinator's rulings, then an amendment after Sol's pre-check (A1 to A6), were built as one round. Sol had
+approved 2cdc14f, and neither Sol nor the tests caught these, each time because a fake hid the real behaviour: a fake
+child that exits at once on `kill()`, and a failure modelled as -1. So every reproduction uses the real behaviour (a
+real child of the test where it can), and each fails on e500549.
+
+#### R8 [blocker], with A1: a failed listing is no empty group
+
+**The defect.** `group_members` took a FAILED listing for an EMPTY group.
+- Apple's libproc `proc_listpids` wrapper returns 0, not -1, when its underlying `__proc_info` syscall fails, and
+  leaves the cause in errno.
+- So the `need < 0` and `got < 0` checks never fired, and a failed call gave `()`.
+- `group_absent` then said True, and `Groups.release` let go of a group that may still have had members: the one
+  thing this PR exists to prevent.
+
+**The measurement** (the coordinator's, on this machine, with ctypes `use_errno=True` and errno cleared before each
+call):
+
+| Call | Result | errno |
+| --- | --- | --- |
+| This process's own group | 8 bytes | 0 |
+| A group that does not exist | 0 | 0 |
+| A forced failure (an invalid buffer address) | 0 | 14 (EFAULT) |
+
+**The fix (784f695).**
+- `_listpids` makes each `proc_listpids` call, the size estimate and the listing alike. errno is cleared before it
+  (`ctypes.set_errno(0)`) and read right after it (`ctypes.get_errno()`, ctypes' copy: the library is loaded with
+  `use_errno`).
+- A result of 0 or less with errno set is a failure: None, not proof. So is any negative result.
+- **What it relies on, as its docstring says:** a failed syscall always sets errno, through the syscall stub, and the
+  wrapper returns 0 for it (also 0 with EINVAL for a type it does not take). No signal is used to probe anything.
+
+**A1 (this round): "no member" is exactly one answer.** It is a successful BUFFERED call that answered 0 bytes with
+errno 0. The size estimate never answers membership. Anything malformed is no proof (None):
+- a byte count that is not a whole number of pids;
+- a count larger than the buffer;
+- a slot inside the count that holds no pid (e500549 dropped zero slots, so 8 bytes of zeros read as empty).
+
+A short listing with a member is that member, and the group is retained. Sol confirmed from XNU that a successful
+buffered listing is complete: the kernel walks the live and zombie lists under the process-list lock.
+
+**The nit on the fill check, verified.** The reviewer said the kernel caps the listing, so `got < sizeof(buf)` could
+never see a truncation. Measured on this Mac:
+- A buffer of one slot for a group of two answers 4 bytes, and two slots answer 8: a buffer the group fills answers
+  exactly its size. So the check does see a cut listing.
+- With a buffer far larger than the group (1314, 1378 and 21024 slots), it answers the group's 8 bytes.
+- Listing every process into a buffer four times the estimate answered 1295 slots: the actual count, not the buffer.
+
+So the docstring now says exactly this. With the buffer sized from the kernel's own estimate (every process, plus 20,
+at the time of the estimate) plus `_LISTING_ROOM`, only a group about the size of the whole process table, or one that
+grew past it between the two calls, can fill it. The larger retries cover that, and a group that still fills the
+largest is no proof.
+
+**The rest of the PR.** `proc_listpids` is the only foreign call. `_libproc` handles a failure to load, and every
+other system call goes through Python's `os` module, which raises on error. No other error convention is assumed.
+
+#### R9 [blocker], with A2 and A6: a run killed at shutdown is reported when nothing survives
+
+**The sequence** (node.py `shut_down` and `report_stopped`).
+1. The node shuts down while a run's leader ignores SIGTERM past the grace.
+2. `kill_runs()` sends the SIGKILL, and `report_stopped()` ran straight after it, with no wait.
+3. `poll()` is still None that soon after a SIGKILL (40 of 40 in the reviewer's probe), so the release was refused.
+4. The run went HELD, stayed in the state file, and no "ended" report was sent. Main reports "ended" ("node shut
+   down") here. On e500549 the hub showed the run as running until the next node process reported it, or forever.
+
+**The fix.** `node_groups.POST_KILL_SECONDS = 1.0` and `POST_KILL_STEP = 0.05`.
+- **After both initial KILL passes are SENT** (the runs' `kill_runs()` and the sessions' `kill()`), and before the
+  runs' releases, `shut_down` makes ONE shared, bounded watch, `Node.await_kills`. It looks, with no signal, at:
+  - each run whose KILL was attempted and whose leader's exit is not seen yet (`kill_runs` now returns them);
+  - each session the sessions' `kill()` attempted (it now returns them; `SessionRunner.unproved`).
+
+  It ends as soon as each is proved gone (`_proved_gone`: the leader's exit seen by its own handle AND `group_absent`),
+  or at the deadline. The watch is bounded by the clock and by a count of looks, so a clock that does not move with
+  the sleep cannot hold it.
+- **Then everything is as before:** `report_stopped()` applies the release rule. A run proved gone is released and
+  reported "ended" at shutdown exactly as on main, with the same message, in the same order. A run not proved gone
+  stays retained and HELD, as designed, and only then is its retention line written.
+- **`Node.stop_all`** (the fallback when the shutdown's own steps failed) watches its KILLs the same way.
+- **The host's own KILL pass** (`SessionHost._stop_all`) has the same window right after its pass, before its reads
+  and releases, when that pass attempted a KILL. A2: the host's grace wait comes BEFORE its KILL, and its final reads
+  (a few milliseconds) could hide the same immediate-`poll()` problem. Through the node's shutdown, the sessions'
+  KILLs are watched in the node's shared window, and the host's pass then has nothing left to kill.
+- **The sessions' fallback when their initial KILL raised** (A2): the node's watch then covers only its killed runs,
+  so it delays the host's fallback (its own grace, KILL pass and window) by at most the one window. Pinned.
+
+**Why one second.** SIGKILL is delivered at once, but the kernel finishes the exit asynchronously, and launchd reaps a
+killed group's orphaned members a moment later. One second covers that by a wide margin.
+
+**What it adds, checked against launchd.** At most one second to a shutdown that needed a KILL, and nothing to one
+that did not. The host's own window adds at most one more second, and only on the fallback path, where the sessions'
+initial KILL failed.
+- scripts/install-launchagents.py installs the node's LaunchAgent with `ExitTimeOut` 60 (read, not touched).
+- A shutdown that needs a KILL takes the 10 s kill grace, then at most this second, then the reports: far inside 60 s.
+- `node_sessions.shutdown_bound` (the hub's bound for a node's signals) is unchanged: the watch comes after the KILL.
+
+**No signal, no signal order and no stop decision changed.** The watch only observes, and the release rule decides as
+before.
+
+**The fake child (tests/test_dispatch.py).** `kill()` no longer makes `poll()` answer at once. `polls_after_kill`
+polls (one, by default) answer None before the exit is seen, as with a real process. A test that wants the exit seen
+at once says so with `kill_exits_at_once`. Six tests ask for it. They pin main's grace and admission timing, where the
+exit of a kill is seen on the next pass, not the exit's asynchrony:
+- in test_session_host.py, `test_a_process_that_ignores_sigterm_is_killed_after_the_grace_period_before_anything_restarts`
+  and `test_a_session_confirmed_while_its_process_is_being_stopped_resumes`;
+- in test_dispatch.py, `test_timeout_terminates_then_kills` (the hub's own runs);
+- in test_hosted_spawn.py, `test_r6_rule1_...`, `test_r8_s32_...` and `test_r9_s33_...`.
+
+With only the fake changed, these 6 failed on 784f695 and nothing else in the suite did.
+
+#### R10 [should], with A3: the fence revokes admission only
+
+**The sequence** (session_host.py `_reap`).
+1. A Codex process writes `start_failed` and exits between the pass's `_read` and the poll in `_reap`.
+2. `release` made the token HELD before the final reads (`last_reads`). The final read fails message 1 and calls
+   `_stop`, which returned early because the token was HELD, so `stopping_since` stayed unset.
+3. `stopped` was therefore False, so `_went_by_itself` ran. Message 2 met "waits_for_ready and not was_ready", and
+   `_fail_start` failed it too.
+4. On main, message 2 stayed queued and started a new process. A turn's outcome changed.
+
+**The carrier (A3): a temporary admission fence, `Groups.FENCED`, distinct from HELD.**
+- `release` installs it under the registry lock, before the final reads and the proof, but only from LIVE or a missing
+  entry (then under the known key). A STOPPING or HELD entry is kept as it is.
+- It refuses admission as HELD does: `start`, `blocked` and `stopping_dirs` count it.
+- For everything else it is the LIVE entry it was:
+  - it is not in the HELD index, so `may_signal` is unchanged by it;
+  - `stopping()` moves it to STOPPING;
+  - `try_stopping()` reserves it as it would a LIVE entry (RESERVED, not ALREADY).
+- It never clears a veto, and makes none.
+- A refused proof, or final reads that raise, turn it into HELD. A True proof removes it with the entry.
+
+So the final reads run main's code exactly, `_stop`'s bookkeeping included. Unsafe numeric signals are suppressed
+independently: by the veto (a group a KILL was attempted on), and by main's own rule for a reaped leader (`_stop`
+signals only if `poll() is None or group_alive`).
+
+**The audit: what runs inside `last_reads`** (`_read`, then `_drain_before_stop`, both through `_take_lines` and
+`_on_event`, then `_correct_start_mode`), and what each now does.
+
+| Path | Registry question | Now |
+| --- | --- | --- |
+| `start_failed` (line 1719): `_fail_start`, then `_stop` | `may_signal`, `stopping` | main's: `stopping_since` set, entry STOPPING, no TERM to a gone group; the reap treats the exit as a stop (pinned) |
+| `fatal` (1709), Codex sandbox rejection on `ready` (1621), `sealed` false (1650), the kill switch in `_check_access` (1731): `_end`, which claims (`_claim`, the steer cutoff lock only) and then `_stop_from`, then `_stop` | `may_signal`, `stopping` | main's bookkeeping. `_end` marks the session ended, so `_went_by_itself` returns on both; with `stopping_since` set as on main, the later lines of that same read are dropped as on main (`_take_lines`) |
+| The held-end settlement (in `_reap`, after the proof: `s.held` with `fenced_at` or `stopping_since`) | none | `_end`'s `_fail` reaches `_finalize_hold`, which stamps `fenced_at` while the process is still held, so the settlement runs either way; `stopping_since` is now also set as on main |
+| `turn_ended` to `_hold`, `_steer_adjudicate`, `_steer_end` | none (the steer cutoff lock) | unchanged |
+| `_correct_start_mode` | none | unchanged |
+| `_reserved_stop` / `try_stopping` | not reachable from the reads | (a FENCED entry would be reserved as LIVE) |
+
+The node's release (`Node._release`) has no final reads. Its reap and its `_stop` are unchanged by the fence.
+
+**A second outcome-sensitive path, found in this audit: the shutdown's final reads.**
+- `SessionHost._stop_all` reads each session after its KILL pass.
+- Through the node's shutdown, the sessions' `kill()` vetoes each group first. So `_stop_all`'s own `_stop` of that
+  session returned early, where main ran it in full. `stopping_since` stayed unset, and the shutdown's reads processed
+  the process's late events, which main drops for a stopping process.
+- Reproduced: a line naming another session (Claude's `fatal`), written before the process went, ENDED the session at
+  shutdown on e500549. Main leaves it to be resumed.
+- The fix: `_stop(..., shutdown=True)`, passed only by `_stop_all`. A group vetoed but not HELD keeps main's
+  bookkeeping (the stop's clock and the STOPPING mark) with no signal. A HELD one gets nothing, as round 1's R2 pins.
+
+**Why the separate state is the smaller choice.** The other option was to have `_stop` keep main's bookkeeping for any
+token that may not be signalled. That would give HELD records a signal clock, and the HELD pins (R2) forbid that. The
+fence state touches only the registry, and the final reads need no change at all.
+
+#### R11 [should], with A4: a group that is merely still exiting logs nothing
+
+- **The defect.** With the leader reaped and only zombie members left for an instant, the first release was refused
+  and wrote a permanent-sounding WARNING ("could not be proved gone… stays held"), and the next pass released it.
+  Main logs nothing at a normal end.
+- **The fix.** Only the LINE waits; HELD and the fence stay immediate.
+  - `Groups.unproved_line(token, now, after, final)` keeps, per token, the owner's monotonic time of its first refusal.
+  - The line is written once: when the group has stayed unproved for the kill grace (the run's own, or the host's), or
+    at shutdown (`final`), when the group is retained past the R9 watch.
+- **Why the kill grace.** It is how long the node already gives a group to go after a signal before it treats it as
+  not going (it SIGKILLs then). A zombie instant lasts milliseconds, and a later pass within that bound releases it in
+  silence.
+- Round 3's S2 pin (a failed final read still says the hold once) now lets the bound pass. It still sees exactly one
+  line.
+
+#### R12 [should], with A5: off macOS, main's rule, stated
+
+- **The defect.** With no libproc, `group_absent` was always False, so off macOS no group was ever released: every
+  run would stay running, never be reported, and block its checkout.
+- **The ruling changed in A5.** Off macOS (`sys.platform` is not darwin), the membership half of the proof is main's
+  own liveness answer, `not session_host.group_alive(pgid)` (`killpg(pgid, 0)`, the probe main's reap asked at this
+  release point).
+- **This is an explicit compatibility limit, with main's weakness.** A zombie-only group, or one this user may not
+  signal, counts as gone. The verified-exit proof is macOS-only, and the PR says so. Where main released with no probe
+  at all (`report_stopped`, and `_stop_all` when no step failed), the fallback is this probe, after the R9 watch.
+- **On macOS** a libproc that will not load is NOT proof: the group is retained, and it is said once in the log. A
+  listing that failed is never downgraded to the weaker probe.
+- No `/proc` scan is built in this PR.
+
+#### The nits
+
+- **node_groups.py, the truncation docstring:** verified and corrected (R8's section above).
+- **node.py `_stop`'s early return for a HELD run:** a comment now says why returning before `groups.stopping` is
+  harmless. A HELD entry already fences its checkout, and a vetoed one was marked STOPPING by the stop that sent its
+  KILL.
+
+#### Tests (tests/test_ownership_c1.py)
+
+Each test below fails on e500549, with this round's test files laid over its export, except the pins listed last. That
+run selected 34 tests: 24 failed, and the 10 that passed are those six pins and four earlier rounds' tests the
+selection also matched.
+- **R8:** `test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof[estimate|listing|both]`, and
+  `test_r4_a_real_failed_listing_is_no_proof` (a REAL EFAULT failure: the real libproc is given an invalid buffer
+  address, inside this process only).
+- **A1:** `test_a1_a_malformed_byte_count_is_no_proof[not-whole-pids|zero-slots|a-zero-slot]`,
+  `test_a1_only_the_buffered_call_answers_no_member`, and
+  `test_a1_a_stale_errno_is_not_the_listings_own_against_the_real_libproc`. That last one uses the REAL libproc: a
+  stale errno does not fail a clean answer, while the listing's own EFAULT does.
+- **R9, with REAL children of the test** (a leader that ignores SIGTERM, in a process group of its own in the test's
+  session):
+  - `test_r9_a_run_killed_at_shutdown_is_reported_ended_when_nothing_survives`: reported "ended" ("node shut down"),
+    gone from the state file, no line;
+  - `test_r9_a_run_whose_group_keeps_a_member_is_retained_past_the_bounded_wait`: the member is the test's own child,
+    ended through its own handle and not reaped, so a zombie. The watch is one window long (asserted), the run is
+    HELD, it is in the SAVED state file, the HUB still shows it running, and one line is written (A6);
+  - `test_r9_a_hosted_session_killed_at_shutdown_is_released_when_nothing_survives`: a real process as a hosted
+    session's, killed by the host's own KILL pass (A2).
+- **R9, with fakes:**
+  - `test_r9_one_shared_post_kill_deadline_for_every_killed_run`: three unproved runs cost the window once;
+  - `test_r9_the_stop_all_fallback_waits_for_its_kill_too`;
+  - `test_r9_the_sessions_fallback_after_their_kill_raised_still_releases_them` (A2).
+- **R10:**
+  - `test_r10_a_start_failed_read_at_the_reap_fails_only_its_own_message` (the review's two-message sequence);
+  - `test_r10_the_release_fence_refuses_admission_and_nothing_else`;
+  - `test_r10_the_fence_keeps_a_stopping_entry_and_fences_a_miss`;
+  - `test_r10_a_session_killed_by_the_nodes_shutdown_reads_its_last_lines_as_main_does` (the shutdown's final reads).
+- **R11:** `test_r11_a_runs_zombie_instant_logs_nothing`, `test_r11_a_run_held_past_the_bound_logs_once`, and
+  `test_r11_a_sessions_zombie_instant_logs_nothing_and_past_the_bound_once`.
+- **R12:** `test_r12_off_macos_the_membership_half_is_mains_liveness_probe` (with the platform patched, a REAL
+  child), and `test_r12_on_macos_a_libproc_load_failure_retains_and_says_so_once`.
+- **Pins that hold on e500549 too:** `test_a1_a_malformed_byte_count_is_no_proof[beyond-the-buffer]`,
+  `test_a1_a_short_listing_with_a_member_retains`, `test_r9_a_shutdown_that_needed_no_kill_does_not_wait`,
+  `test_r10_final_reads_that_raise_leave_the_token_held`, `test_r4_zero_with_errno_clear_is_an_empty_group`, and
+  `test_r4_an_errno_left_by_an_earlier_call_does_not_fail_a_clean_answer`.
+- **Two older pins changed by the rulings:**
+  - `test_c1_shutdown_keeps_a_group_that_survived_its_sigkill`: its bound is now the kill grace plus the one window;
+  - `test_s2_a_failed_final_read_still_says_the_hold_once`: the line now waits for the bound (R11).

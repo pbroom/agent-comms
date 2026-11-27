@@ -27,6 +27,18 @@ from typing import Any, Callable, Hashable
 PROC_PGRP_ONLY = 2      # libproc's `proc_listpids` type: the processes of one process group (sys/proc_info.h)
 _LISTING_ROOM = (64, 1024, 16384)   # slots added to the kernel's estimate, tried in turn until a listing is complete
 _LIBPROC: list = []
+_LOAD_FAILED_SAID: list = []        # (C1, review round 4, R12/A5) a libproc that would not load is said once
+
+# (C1, review round 4, R9/A2) After a shutdown's SIGKILLs are SENT, how long the owner watches, with no signal, for
+# each killed group's proof (its leader's exit observed by its own handle AND `group_absent`) before it applies the
+# release rule. SIGKILL is delivered at once, but the kernel finishes the exit asynchronously: `poll()` right after
+# `killpg(SIGKILL)` answered None 40 times of 40 in the review's probe, and a killed group's members are reaped by
+# launchd a moment later. One second covers that by a wide margin, ONE shared deadline for all of a shutdown's killed
+# groups (not one per group), and keeps a shutdown that needed a KILL far inside launchd's exit timeout for the node's
+# LaunchAgent (60 s, scripts/install-launchagents.py: the 10 s kill grace, then at most this second, then the reports).
+# A shutdown that sent no KILL does not wait at all.
+POST_KILL_SECONDS = 1.0
+POST_KILL_STEP = 0.05               # between two looks within that window
 
 
 def _libproc():
@@ -63,23 +75,37 @@ def _listpids(lib, pgid: int, buf, size: int) -> int | None:
 def group_members(pgid: int) -> tuple[int, ...] | None:
     """(Ownership until verified exit, C1) A COMPLETE listing of the processes in process group `pgid`, zombies
     included: macOS libproc's `proc_listpids(PROC_PGRP_ONLY)`, one call that the kernel answers from its process lists
-    under their lock, so a coherent snapshot. None when no complete listing could be made: no libproc, a failed call
-    (review round 4: 0 with errno set, `_listpids`), or a buffer the listing filled (it may have been truncated: a
-    larger one is tried, a few times)."""
+    (live and zombie) under the process-list lock, so a coherent snapshot. None when no complete listing could be
+    made: no libproc, a failed call (review round 4: 0 with errno set, `_listpids`), a malformed answer (A1: a byte
+    count that is not a whole number of pids or exceeds the buffer, or a slot within it that is no pid), or a buffer
+    the listing filled.
+
+    "No member" (`()`) is only a successful BUFFERED call that answered 0 bytes with errno 0; the size estimate
+    (`buf` None) never answers membership. The fill check, exactly (review round 4, nit): the kernel writes a pid
+    for each member it finds and stops at the end of the buffer, so a count equal to the buffer's size may be a cut
+    listing (measured: one slot for a group of two answers 4 bytes) and is no proof. With the buffer sized from the
+    kernel's own estimate (every process on the machine, plus 20, at the time of the estimate) plus `_LISTING_ROOM`,
+    it can be filled only by a group about as large as the whole process table, or one that grew past it between
+    the two calls; the larger retries cover that, and a group still filling the largest is no proof."""
     lib = _libproc()
     if lib is None or isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1:
         return None
+    size_of = ctypes.sizeof(ctypes.c_int)
     for extra in _LISTING_ROOM:
         need = _listpids(lib, pgid, None, 0)        # (an estimate, in bytes: every process's room)
         if need is None:
             return None
-        n = need // ctypes.sizeof(ctypes.c_int) + extra
+        n = need // size_of + extra
         buf = (ctypes.c_int * n)()
-        got = _listpids(lib, pgid, buf, ctypes.sizeof(buf))
-        if got is None:
-            return None
-        if got < ctypes.sizeof(buf):        # (room was left: the listing is complete)
-            return tuple(p for p in buf[:got // ctypes.sizeof(ctypes.c_int)] if p)
+        size = ctypes.sizeof(buf)
+        got = _listpids(lib, pgid, buf, size)
+        if got is None or got % size_of or got > size:
+            return None         # (A1: failed, or not a whole number of pids within the buffer: malformed)
+        if got < size:          # (room was left: the kernel listed every member it found)
+            members = tuple(buf[:got // size_of])
+            if any(p <= 0 for p in members):
+                return None     # (A1: a slot inside the count that holds no pid: malformed, never "no member")
+            return members
     return None
 
 
@@ -88,7 +114,25 @@ def group_absent(pgid: int) -> bool:
     no member at all (`group_members`). A member of any kind (a zombie included), an error, or a listing that may be
     truncated is NOT proof: False, and whoever asks retains. Not `killpg(pgid, 0)`: its ESRCH also answers for a
     group whose only members are zombies, and its EPERM for a group whose members this user may not signal (and, on
-    macOS, briefly for one that is exiting), so its errno is a permission answer, not a membership observation."""
+    macOS, briefly for one that is exiting), so its errno is a permission answer, not a membership observation.
+
+    (Review round 4, R12 and A5) The verified-exit proof is macOS-only. OFF macOS (`sys.platform` is not darwin)
+    there is no complete listing here, and the membership half is main's own liveness answer, `not group_alive(pgid)`
+    (session_host: `killpg(pgid, 0)`, the probe main's reap asked at this release point): an explicit compatibility
+    limit, with main's weakness (a zombie-only group, or one this user may not signal, counts as gone). ON macOS a
+    libproc that will not load is NOT proof (False: the group is retained), said once in the log; and a listing that
+    failed is never downgraded to that weaker probe."""
+    if sys.platform != "darwin":
+        from .session_host import group_alive       # (lazily: session_host imports this module)
+        return not group_alive(pgid)
+    if _libproc() is None:
+        if not _LOAD_FAILED_SAID:
+            _LOAD_FAILED_SAID.append(True)
+            import logging
+            logging.getLogger(__name__).warning(
+                "macOS libproc could not be loaded: no process group can be proved gone, so every group this node "
+                "stops is kept and its checkout stays held")
+        return False
     members = group_members(pgid)
     return members is not None and not members
 
@@ -108,7 +152,13 @@ class Groups:
     # is ever sent to it again (`may_signal`), and it leaves only through `release` with a True proof. It never goes
     # back to LIVE or STOPPING.
     LIVE, STOPPING, HELD = "live", "stopping", "held"
-    _FENCE = ("stopping", "held")       # the states that admit nothing beside them
+    # (Review round 4, R10 and A3) FENCED: the release rule's TEMPORARY admission fence, for the length of the
+    # owner's final reads and the proof only (`release`). It refuses admission as HELD does, and for everything else
+    # it is the LIVE entry it was: it is not proof-only (it is not in `held`, so `may_signal` is unchanged by it), a
+    # stop's bookkeeping moves it to STOPPING as it would a LIVE one, and it never clears a veto. The proof turns it
+    # into HELD when refused, or removes it with the entry when True.
+    FENCED = "fenced"
+    _FENCE = ("stopping", "held", "fenced")     # the states that admit nothing beside them
 
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -117,6 +167,9 @@ class Groups:
         # transition and at the release, and read WITHOUT it by `may_signal`, so no signal site and no pass of the loop
         # waits on the registry (a spawn holds it across process creation: round 8, ruling C1)
         self.held: set = set()
+        # (Review round 4, R11 and A4) token -> [when its release was first refused (the owner's monotonic clock),
+        # whether its retention line was written]: the line waits; HELD and the fence do not (`unproved_line`)
+        self.refused: dict[Hashable, list] = {}
 
     def start(self, cwd: Any, token: Hashable, spawn: Callable[[], Any], k: Hashable | None = None) -> tuple[bool, Any]:
         """Start a process group in `cwd` unless one being stopped is there: (False, None) and nothing is spawned;
@@ -158,8 +211,8 @@ class Groups:
         try:
             for groups in self.entries.values():
                 if token in groups:
-                    if groups[token][0] in self._FENCE:     # (C1: a HELD one too, unchanged)
-                        return self.ALREADY
+                    if groups[token][0] in (self.STOPPING, self.HELD):     # (C1: a HELD one too, unchanged)
+                        return self.ALREADY     # (R10/A3: a FENCED one is the LIVE one it was: reserved below)
                     groups[token][0] = self.STOPPING
                     return self.RESERVED
             if barrier is not None:
@@ -179,6 +232,20 @@ class Groups:
         at the release rule, where the registry is taken anyway."""
         self.held.add(token)
 
+    def _admit_fence(self, token: Hashable, fence: tuple[Hashable, Any] | None) -> None:
+        """(The registry's lock held; review round 4, R10 and A3) The release rule's temporary admission fence: a
+        LIVE entry becomes FENCED; a STOPPING or HELD one is kept as it is; with no entry, a FENCED one under `fence`.
+        The HELD index is not touched: an existing veto stays, and no new one is made."""
+        found = False
+        for groups in self.entries.values():
+            if token in groups:
+                found = True
+                if groups[token][0] == self.LIVE:
+                    groups[token][0] = self.FENCED
+        if not found and fence is not None:
+            k, cwd = fence
+            self.entries.setdefault(k, {})[token] = [self.FENCED, cwd]
+
     def _fence(self, token: Hashable, fence: tuple[Hashable, Any] | None) -> None:
         """(The registry's lock held.) The token's entry made HELD (with no entry, one under `fence`: A3), and the
         HELD index with it."""
@@ -195,12 +262,14 @@ class Groups:
 
     def release(self, token: Hashable, proof: Callable[[], bool], forget: Callable[[], None],
                 fence: tuple[Hashable, Any] | None = None, prepare: Callable[[], None] | None = None) -> bool:
-        """(Ownership until verified exit, C1; review rounds 2 and 3, R6, A3 and S4) THE one release rule. FIRST,
-        under the registry's lock, the exact token is fenced (HELD, or a HELD entry under `fence` if it has none):
-        admission is fenced when the release path installs the fence under the registry lock, before the final reads
-        and the membership proof. Then `prepare()` (the caller's final reads), then the proof, outside the lock. A
-        True proof removes the entry and the fence in one step (`_gone`); anything else leaves the token HELD (also
-        when `prepare()` raises: the fence stays). Work admitted while the token was LIVE can coexist with a survivor
+        """(Ownership until verified exit, C1; review rounds 2 to 4, R6, A3, S4 and R10) THE one release rule. FIRST,
+        under the registry's lock, the exact token's admission is fenced (FENCED, the temporary admission fence, or a
+        FENCED entry under `fence` if it has none; a STOPPING or HELD entry stays as it is): admission is fenced when
+        the release path installs the fence under the registry lock, before the final reads and the membership proof.
+        The temporary fence revokes ADMISSION only (round 4, R10 and A3): the final reads (`prepare()`) run exactly
+        as on main, `_stop`'s bookkeeping included, and only a veto (or main's own rule for a reaped leader) keeps a
+        numeric signal from them. Then the proof, outside the lock. A True proof removes the entry and the fence in
+        one step (`_gone`); anything else makes the token HELD (also when `prepare()` raises). Work admitted while the token was LIVE can coexist with a survivor
         discovered afterwards: a LIVE entry never fenced admission on main, and C1 does not change that (excluding it
         would need a LIVE entry to fence, which would stop runs sharing an idle session's checkout). The only way a group's registry entry, and its
         owner's tracking record (whose durable entry is that record's projection), go. `proof()` answers whether the
@@ -216,16 +285,26 @@ class Groups:
         fails removes its provisional registration in `start`, and a start never made or a claim lost has no group to
         release."""
         with self.lock:
-            self._fence(token, fence)
-        if prepare is not None:
-            prepare()
+            self._admit_fence(token, fence)
+        proved = False
         try:
-            proved = proof() is True
-        except Exception:
+            if prepare is not None:
+                prepare()
+            try:
+                proved = proof() is True
+            except Exception:
+                proved = False
+            if proved:
+                forget()
+        except BaseException:
             proved = False
+            raise
+        finally:
+            if not proved:
+                with self.lock:
+                    self._fence(token, fence)       # (refused, or the final reads raised: HELD from here on)
         if not proved:
             return False
-        forget()
         self._gone(token)
         return True
 
@@ -235,6 +314,21 @@ class Groups:
             for k in list(self.entries):
                 self._drop(k, token)
             self.held.discard(token)
+            self.refused.pop(token, None)
+
+    def unproved_line(self, token: Hashable, now: float, after: float, final: bool = False) -> bool:
+        """(Review round 4, R11 and A4) Asked by an owner after `release` refused `token`: whether to write its
+        retention line NOW. True exactly once per token: when it has stayed unproved for `after` seconds since its
+        first refusal (`now` and that first time are the owner's monotonic clock), or at `final` (a shutdown that
+        keeps it past the post-KILL wait). A group that is merely still exiting (its leader reaped, zombie members for
+        an instant) is released by a later pass within that time and says nothing, as on main. HELD and the fence are
+        not delayed by this: only the line is."""
+        with self.lock:
+            rec = self.refused.setdefault(token, [now, False])
+            if rec[1] or not (final or now - rec[0] >= after):
+                return False
+            rec[1] = True
+            return True
 
     def _drop(self, k: Hashable, token: Hashable) -> None:
         groups = self.entries.get(k)
@@ -244,7 +338,7 @@ class Groups:
                 del self.entries[k]
 
     def state(self, token: Hashable) -> str | None:
-        """The token's registry state (LIVE, STOPPING, HELD), or None."""
+        """The token's registry state (LIVE, STOPPING, HELD, FENCED), or None."""
         with self.lock:
             for groups in self.entries.values():
                 if token in groups:
@@ -260,11 +354,11 @@ class Groups:
         return token not in self.held
 
     def blocked(self, cwd: Any) -> bool:
-        """A group being stopped, or HELD, is in this directory."""
+        """A group being stopped, HELD, or FENCED (a release under way) is in this directory."""
         with self.lock:
             return any(state in self._FENCE for state, _ in self.entries.get(key(cwd), {}).values())
 
     def stopping_dirs(self) -> set[str]:
-        """The directories (as recorded) that hold a group being stopped, or HELD."""
+        """The directories (as recorded) that hold a group being stopped, HELD, or FENCED."""
         with self.lock:
             return {cwd for groups in self.entries.values() for state, cwd in groups.values() if state in self._FENCE}
