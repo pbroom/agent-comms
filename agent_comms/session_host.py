@@ -98,7 +98,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import providers, runner_preflight, session_access
+from . import node_groups, providers, runner_preflight, session_access
 from .dispatch import (DispatchConfig, _signal_group, _within, child_env, probe_process, process_start,
                        render_argv, spawn_piped, stop_verified, with_writable_roots)
 from .providers import Event, ProviderSession, validate_model, validate_session_id
@@ -135,9 +135,7 @@ def _diverting_log(self, level, msg, args, exc_info=None, extra=None, stack_info
                     exc_info[1] if isinstance(exc_info, tuple) else sys.exc_info()[1])
                 if ex is not None:
                     msg = f"{msg} ({type(ex).__name__})"
-            if len(_WATCH_LINES) == _WATCH_LINES.maxlen:
-                _WATCH_DROPPED[0] += 1
-            _WATCH_LINES.append((self.name, level, msg, args))
+            _keep_line(self.name, level, msg, args)
         except Exception:       # (never raises on the watchdog's thread)
             pass
         return
@@ -147,6 +145,16 @@ def _diverting_log(self, level, msg, args, exc_info=None, extra=None, stack_info
 
 _diverting_log._real = _real_log
 logging.Logger._log = _diverting_log
+
+
+def _keep_line(name: str, level: int, msg: str, args: tuple) -> None:
+    """A line put into THE deferred queue (bounded: the oldest goes first, and the replay says how many went), for the
+    loop's next flush (`flush_watch_logs`) to write: a watchdog thread's line (`_diverting_log`), and (enabling PR,
+    review round 1, A2) a claim's or a reserved stop's deferred lines, so no log handler runs inside a stop of a
+    steering session. Known limit: such a line is written with the flush's time and caller."""
+    if len(_WATCH_LINES) == _WATCH_LINES.maxlen:
+        _WATCH_DROPPED[0] += 1
+    _WATCH_LINES.append((name, level, msg, args))
 
 
 def flush_watch_logs() -> None:
@@ -185,6 +193,13 @@ MESSAGE_ID_MAX = 200
 INTERRUPTED = "interrupted by a restart: message {n} replaced it"
 STEER_PARTIAL_SECONDS = 5.0         # the most a steer frame the pipe took in part is given to be completed (part D)
 STEER_CUT = "the session's process was stopped: a steer to it could not be written whole"
+# (Enabling PR, ruling S1) The causes of a single-session stop that may take the reserved path (`SessionHost._reserves`
+# decides from the cause and the session's recorded steering state; callers only name the cause).
+CAUSE_HOLD_CUT = "hold_cut"         # a held end's deadline cut (its contact ran out, its authority went, or `lost`)
+CAUSE_TIMEOUT = "timeout"           # the turn timeout (and the interrupted branch of it)
+CAUSE_CANCEL = "cancel"             # a cancel of the turn by the session that started it
+CAUSE_STEER_BYTES = "steer_bytes"   # a broken pipe or a partial write while writing the steer frame's bytes
+CAUSE_WRITE = "write"               # a broken pipe while writing an ordinary reply
 # Before a single-session stop that would discard it (and in the cut), what a steering session's process wrote is read
 # while its reads make progress (lines, or bytes taken into a line not yet complete), for at most this long on the
 # host's clock IN ALL for one host pass, however many sessions it drains (R2-05; the shutdown simplification) ...
@@ -477,6 +492,9 @@ class Session:
     proc_bind: str | None = None
     linger_logged: float = float("-inf")     # when a group that outlived its SIGKILL was last said in the log
     group_token: Any = None                  # its live process's entry in the node's registry (node_groups)
+    # (Enabling PR, review round 1, A3) The registry key (its checkout's identity) that entry was made under, computed
+    # once by `_spawn` and given to `Groups.start`; set and cleared with the live process, as `group_token` is
+    group_key: Any = None
     # Restart (the module text). `restart_by`: the message the caller asked to interrupt the turn `restart_into` for.
     # `restart_mark`: where the interrupt's bytes sit in `outbuf` (start, length) until all of them reached the
     # process (`restart_written`).
@@ -983,8 +1001,9 @@ class SessionHost:
                     seal=seal, bind=bind)
         s.gen = next(self._gens)
         if hasattr(s.provider, "steering_on"):
-            # (Review round 9, ruling F) Claude steering only with `[dispatch.sessions] claude_steer = true`: off, the
-            # adapter says it steers nothing, so no Claude steer mode is reported and no offer is taken
+            # (Review round 9, ruling F; the enabling PR) Claude steering as `[dispatch.sessions] claude_steer` says
+            # (on by default): off, the adapter says it steers nothing, so no Claude steer mode is reported and no
+            # offer is taken
             s.provider.steering_on = self.claude_steer()
         runs_in = getattr(s.provider, "runs_in", None)
         if runs_in is not None:
@@ -1343,9 +1362,9 @@ class SessionHost:
         return s is not None and getattr(s.provider, "steer_named", None) is not None
 
     def claude_steer(self) -> bool:
-        """(Review round 9, ruling F) `[dispatch.sessions] claude_steer`, read on the node: Claude steering, off by
-        default in this PR (the machinery ships dark; Codex steering is unaffected)."""
-        return bool(getattr(getattr(self.config, "sessions", None), "claude_steer", False))
+        """(Review round 9, ruling F; the enabling PR) `[dispatch.sessions] claude_steer`, read on the node: Claude
+        steering, on by default; `claude_steer = false` turns it off (Codex steering is unaffected either way)."""
+        return bool(getattr(getattr(self.config, "sessions", None), "claude_steer", True))
 
     def modes(self, session_id: str) -> tuple[str, ...]:
         """What this session's LIVE process can do with a turn in flight (providers.MODES), as its adapter says now
@@ -1394,7 +1413,11 @@ class SessionHost:
         try:
             if not self._recovered:
                 self.recover()
-            flush_watch_logs()      # (ruling W) what the watchdog's thread logged, written here
+            if not self.keep_outbox:
+                # (ruling W) what the watchdog's thread (and a claim: A2) left in the deferred queue, written here by
+                # a host no node drives; a node's host's lines are written by the node's pass BEFORE it takes the
+                # runner lock (node_sessions `pass_once`), never under it (enabling PR, review round 1, A2)
+                flush_watch_logs()
             for s in list(self.sessions.values()):
                 self._flush_tee(s)
             if self._save_due:      # (ruling T) what the watchdog's path published is persisted here, by the loop
@@ -1745,16 +1768,19 @@ class SessionHost:
                 now = self._drain_before_stop(s, now, out)      # a live steer attempt: all it wrote first (R3-05)
                 if not s.ready:
                     self._correct_start_mode(s)
+                def stop():
+                    # main's stop of a leader that went leaving members, by identity (main's own line first)
+                    log.warning("session %s: its process exited (code %s) and left members of its group: stopping "
+                                "them", s.session_id, code)
+                    self._stop_from(s, now, live)
                 if self._steering(s):
-                    if not self._claim(s, lambda: self._went_by_itself(s, code, s.ready, s.checking, out)):
+                    if not self._claim(s, lambda: self._went_by_itself(s, code, s.ready, s.checking, out), stop):
                         s.parked = True     # (the latch came meanwhile: registered only, as above)
                         self.groups.stopping(s.group_token)
                         return
                 else:
                     self._went_by_itself(s, code, s.ready, s.checking, out)
-                log.warning("session %s: its process exited (code %s) and left members of its group: stopping them",
-                            s.session_id, code)
-                self._stop_from(s, now, live)
+                    stop()
             return      # its leader is gone, but not its group: nothing starts beside that, nothing is reported reaped
         self._read(s, now, out)     # what it wrote on its way out (a result that just made it still counts)
         self._drain_before_stop(s, now, out)      # a live steer attempt: all it wrote, across reads (R3-05)
@@ -1765,7 +1791,7 @@ class SessionHost:
         if s.held is not None and s.held.fenced_at is not None:
             self._publish_hold(s, out, s.held.decided)     # its group is gone: published before any cleanup (B)
         self.groups.gone(s.group_token)      # the whole group is gone
-        s.group_token = None
+        s.group_token = s.group_key = None
         s.sealed_by = s.confirmed_by = None     # what that process said went with it
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
         s.parked = False
@@ -1873,8 +1899,8 @@ class SessionHost:
                     if s.in_flight is None and s.writing is None:
                         return
                 if self._steering(s):
-                    # (ruling T; rounds 9 and 10, rulings D2 and G1: `_cutoff_stop` decides the path)
-                    self._cutoff_stop(s, self._timeout_detail(), now, out, live=live)
+                    # (ruling T; enabling PR, ruling S1: the cause and the session's state decide the path)
+                    self._cutoff_stop(s, self._timeout_detail(), now, out, live=live, cause=CAUSE_TIMEOUT)
                     return
                 self._fail(s, self._timeout_detail(), out)
                 self._stop_from(s, now, live)
@@ -1914,9 +1940,10 @@ class SessionHost:
         else:
             detail = self._timeout_detail()
         if live or s.held is not None:
-            # (ruling N: the held timeout too. Rounds 9 and 10, rulings D2 and G1: a Claude attempt's or held end's,
-            # with steering on, reserves without waiting; every other, a Codex attempt's included, is main's)
-            self._cutoff_stop(s, detail, now, out, live=live)
+            # (ruling N: the held timeout too. Enabling PR, ruling S1: a held end's own timeout, with steering on,
+            # reserves without waiting; a live attempt's timeout before N's native end, as every other (a Codex
+            # attempt's included), is main's)
+            self._cutoff_stop(s, detail, now, out, live=live, cause=CAUSE_TIMEOUT)
             return
         self._fail(s, detail, out)
         self._stop_from(s, now, live)
@@ -2181,24 +2208,26 @@ class SessionHost:
         def decide():
             s.ended, s.error, s.waiting = True, detail[:300], False
             self._fail(s, f"session ended: {detail}"[:300], out)
+        def stop():
+            # main's stop of a session's end, by identity
+            undelivered = tuple(m.id for m in s.inbox)
+            s.inbox.clear()
+            try:
+                self._stop_from(s, now, at_signal)
+            finally:
+                # (Review round 3, ruling M) the decided `ended` is transferred whatever the stop did (it may raise)
+                ended = HostEvent(s.session_id, "ended", detail=s.error, undelivered=undelivered)
+                if s.held is not None and s.held.fenced_at is not None:
+                    s.held.after.append(ended)      # N's held end comes first, once the bounded stop is over (part D)
+                else:
+                    out.append(ended)
         if self._steering(s):
-            # (ruling T) a close, a fatal frame or a host error of a steering session: claimed under the cutoff lock;
-            # after the latch, nothing (the bulk stop owns it)
-            if not self._claim(s, decide):
-                return
+            # (ruling T; R1) a close, a fatal frame or a host error of a steering session: claimed under the cutoff
+            # lock, then main's stop, then the claim's lines; after the latch, nothing (the bulk stop owns it)
+            self._claim(s, decide, stop)
         else:
             decide()
-        undelivered = tuple(m.id for m in s.inbox)
-        s.inbox.clear()
-        try:
-            self._stop_from(s, now, at_signal)
-        finally:
-            # (Review round 3, ruling M) the decided `ended` is transferred whatever the stop did (it may raise)
-            ended = HostEvent(s.session_id, "ended", detail=s.error, undelivered=undelivered)
-            if s.held is not None and s.held.fenced_at is not None:
-                s.held.after.append(ended)      # N's held end comes first, once the bounded stop is over (part D)
-            else:
-                out.append(ended)
+            stop()
 
     # ------------------------------------------------------------ starting and writing
 
@@ -2239,15 +2268,24 @@ class SessionHost:
             return self._take_outbox()
         if (s.in_flight is not None and s.in_flight.id == message_id) or (
                 s.writing is not None and s.writing.id == message_id):
+            if self._reserves(s, CAUSE_CANCEL):
+                # (Enabling PR, ruling S1.4) A cancel of held N after its native end (main would already have settled
+                # N: it has no cancel-and-signal there): the reserved stop. Busy: nothing committed and N stays
+                # unsettled; the intent is kept by the hub, which lists the cancel again on each listing until the
+                # node reports N, and that listing retries without waiting. Further steering is fenced meanwhile by
+                # the one slot the held end keeps (any other steer is "not the held attempt"). Once committed, N is
+                # published when the group is verified gone (or at the bounded deadline from the SIGTERM).
+                self._reserved_stop(s, now, lambda: self._fail(s, detail, out))
+                return self._take_outbox()
             if self._steering(s):
-                # (ruling T) a steering session: the claim under the cutoff lock; after the latch, nothing
-                if not self._claim(s, lambda: (s.outbuf.clear() if s.writing is not None else None,
-                                               self._fail(s, detail, out))):
-                    return self._take_outbox()
-            else:
-                if s.writing is not None:
-                    s.outbuf = bytearray()
-                self._fail(s, detail, out)
+                # (ruling T; R1) a steering session: the claim under the cutoff lock, then main's stop, then the
+                # claim's lines; after the latch, nothing
+                self._claim(s, lambda: (s.outbuf.clear() if s.writing is not None else None,
+                                        self._fail(s, detail, out)), lambda: self._stop_from(s, now, drained))
+                return self._take_outbox()
+            if s.writing is not None:
+                s.outbuf = bytearray()
+            self._fail(s, detail, out)
             self._stop_from(s, now, drained)
             return self._take_outbox()
         for box in (s.inbox,):
@@ -2467,6 +2505,27 @@ class SessionHost:
         hook = self.steer_cut_hook
         if hook is not None:
             hook(s)
+        if self._reserves(s, CAUSE_STEER_BYTES):
+            # (Enabling PR, rulings S1 and S2) A Claude attempt's frame taken in part (steering on): the reserved stop.
+            # Nothing is cleared, logged or decided before it owns the checkout; what the process wrote is read first
+            # (N's own end may be there); busy, the frame stays as it is and the next pass cuts again.
+            if self.steer_stopped:
+                return
+            now = self._drain_before_stop(s, now, out)
+
+            def commit() -> None:
+                s.outbuf.clear()
+                self._say(logging.WARNING, "session %s: a steer to its process could not be written whole: the "
+                          "process is stopped", s.session_id)
+                if s.in_flight is not None and s.in_flight.id == slot.into:
+                    self._fail(s, STEER_CUT, out)
+                s.steer = None
+            if self._reserved_stop(s, now, commit):
+                if self._defer_save:
+                    self._save_due = True
+                else:
+                    self._save_state()
+            return
         with self._steer_stop_lock:
             # (R6-01) The cut takes ownership under the stop latch's lock: it cannot begin once the node began to stop
             # (the stop of every turn decides N then, nothing else is done here), and the latch is never set in the
@@ -2477,13 +2536,19 @@ class SessionHost:
         log.warning("session %s: a steer to its process could not be written whole: the process is stopped",
                     s.session_id)       # (R7-04: outside the latch's lock)
         now = self._drain_before_stop(s, now, out)    # across reads while they make progress (R2-05); never raises
-        if s.in_flight is not None and slot is not None and s.in_flight.id == slot.into:
-            if not self._steering(s):
-                self._fail(s, STEER_CUT, out)       # (a Codex attempt: main's step 2, R6-01, unchanged)
-            elif not self._claim(s, lambda: self._fail(s, STEER_CUT, out)):
+
+        def stop():
+            s.steer = None
+            self._stop(s, now, at_signal=True)      # (R8-01) the cut's own stop, with or without a drain
+        if s.in_flight is not None and slot is not None and s.in_flight.id == slot.into and self._steering(s):
+            # (ruling T; R1) claimed, then the cut's stop, then the claim's lines (unreachable with Claude steering
+            # on, which takes the reserved branch above; kept for a steering session the predicate does not reserve)
+            if not self._claim(s, lambda: self._fail(s, STEER_CUT, out), stop):
                 return      # (ruling T) the latch came during the drain: the bulk stop owns it now
-        s.steer = None
-        self._stop(s, now, at_signal=True)      # (R8-01) the cut's own stop, with or without a drain
+        else:
+            if s.in_flight is not None and slot is not None and s.in_flight.id == slot.into:
+                self._fail(s, STEER_CUT, out)       # (a Codex attempt: main's step 2, R6-01, unchanged)
+            stop()
         if self._defer_save:
             self._save_due = True       # (ruling T) the watchdog's boundary persists nothing: the loop's next tick does
         else:
@@ -2699,7 +2764,7 @@ class SessionHost:
         if drain:       # (ruling W: never on the watchdog's thread; S is then decided from what was read so far)
             now = self._drain_before_stop(s, now, out)
         if s.held is held:
-            self._cutoff_stop(s, why, now, out, live=True)   # (round 8, ruling C1: reserve first, commit second)
+            self._cutoff_stop(s, why, now, out, live=True, cause=CAUSE_HOLD_CUT)     # (S1: never waits)
 
     def _steering(self, s: Session) -> bool:
         """The session holds a Claude steer whose outcome is open, or a held end: from the latch on the bulk stop
@@ -2707,45 +2772,41 @@ class SessionHost:
         what was read before it), pinned by tests/test_codex_steering.py, which this round leaves unchanged."""
         return s.held is not None or (s.steer is not None and s.steer.outcome is None and s.steer.holds)
 
-    def _claim(self, s: Session, decide: Callable[[], None], reserve: bool = False) -> bool:
-        """(Review round 4, ruling T) THE claim of a single-session stop of a steering session: under the cutoff
-        lock, the latch checked and the decision made (`decide`: N failed, S decided, the fence stamped), frozen;
-        nothing logged or persisted there (`_defer_logs`). After the latch it claims nothing and decides nothing: the
-        bulk stop owns the session. The caller signals after it returns True (a stop claimed before the latch may
-        signal after it: the same SIGTERM shutdown sends; its grace from that SIGTERM)."""
+    def _claim(self, s: Session, decide: Callable[[], None], stop: Callable[[], None]) -> bool:
+        """(Review round 4, ruling T; enabling PR, review round 1, R1, A1 and A2) THE claim of a single-session stop
+        of a steering session on one of main's routes, and the order of that whole stop, in this one place:
+        (a) under the cutoff lock: the latch checked and the decision made (`decide`: N failed, S decided, the fence
+            stamped), memory only, its log lines deferred (`_defer_logs`); after the latch it claims nothing, decides
+            nothing and stops nothing (False): the bulk stop owns the session;
+        (b) the cutoff lock let go (the runner lock, when the caller holds it, stays held), the route's OWN main stop,
+            passed in by the caller and run by identity (`_stop_from`, or what that route runs on main, with main's
+            registry wait) whatever `decide` raised;
+        (c) only then the deferred lines, handed to the deferred queue the loop writes (`_keep_line`): no log handler
+            is called here at all.
+        The exception that propagates is the first: `decide`'s if it raised, else the stop's; the lines never
+        replace it. A steering-only stop never comes here: `_reserved_stop`."""
+        lines: list = []
+        first: BaseException | None = None
         with self._steer_stop_lock:
             if self.steer_stopped or (s.steer is not None and s.steer.stopping):
                 return False
-            if reserve:
-                # (Review round 8, ruling C1) An expired hold's cut, on the watchdog's thread or in the loop's tick
-                # alike: the claim is confirmed available (above), then the checkout is reserved in the group
-                # registry WITHOUT waiting (a spawn may hold it across process creation). Busy: nothing changes, no
-                # claim, no fence, no publication, no SIGTERM, no kill clock: the hold stays as a hold before its
-                # deadline, and the next pass or tick tries again. Lock order: this cutoff lock, then the registry's
-                # non-blocking attempt; nothing that holds the registry waits for this lock, so no deadlock.
-                # (Round 9, ruling E2) MISSING, a registry miss, is not a verified exit: as main's `_stop` when
-                # `groups.stopping` finds no token, the stop goes on and `_stop` probes the concrete group (the gone
-                # path only when the probe confirms exit). ALREADY: a barrier that was there before (not ours).
-                if s.child is None or s.group_token is None:
-                    return False
-                got = self.groups.try_stopping(s.group_token)
-                if got == self.groups.BUSY:
-                    return False
-            else:
-                got = None
-            self._defer_logs, self._claimer = [], threading.get_ident()
+            self._defer_logs, self._claimer = lines, threading.get_ident()
             try:
                 decide()
-            except BaseException:
-                # (Round 9, ruling E1) the commit failed before the stop had an owner and a kill clock: only the
-                # reservation THIS attempt made is undone; a STOPPING barrier that was there before stays
-                if got == self.groups.RESERVED:
-                    self.groups.unreserve(s.group_token)
-                raise
+            except BaseException as e:      # (A1: the claim is made; its stop still runs)
+                first = e
             finally:
-                logs, self._defer_logs, self._claimer = self._defer_logs, None, None
-        for level, msg, args in logs:
-            log.log(level, msg, *args)      # (ruling W2.3: kept in memory on a watchdog's thread)
+                self._defer_logs, self._claimer = None, None
+        try:
+            stop()
+        except BaseException:
+            if first is None:
+                raise
+        finally:
+            for level, msg, args in lines:
+                _keep_line(log.name, level, msg, args)
+        if first is not None:
+            raise first
         return True
 
     def _say(self, level: int, msg: str, *args) -> None:
@@ -2755,35 +2816,102 @@ class SessionHost:
         else:
             log.log(level, msg, *args)
 
-    def _reserves(self, s: Session) -> bool:
-        """(Review round 10, ruling G1) THE one predicate of the reserved stop: Claude steering is switched on for
-        this node, the session's adapter is a Claude one it was copied onto (`steering_on`: no Codex adapter has it),
-        and the stop is for a Claude attempt (`slot.holds`) or a held end. With the switch off it is false for every
-        session; for a Codex slot it is false with the switch on too."""
-        return (self.claude_steer() and getattr(s.provider, "steering_on", False) is True
-                and (s.held is not None or (s.steer is not None and s.steer.holds)))
-
-    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent], live: bool) -> bool:
-        """THE single-session stop of a session holding a live steer attempt or a held end (review round 3, ruling N;
-        callers: `_hold_cut`, the turn timeout `_hold_to_timeout` (both its branches), and a broken pipe). Review round
-        10, ruling G1: the callers do not choose: `_reserves` does. False: main e6b421f's path, unchanged: the turn is
-        failed and stopped (`_fail`, `_stop_from`). True: the reserved stop (`_reserved_cutoff`). False return: it did
-        nothing."""
-        if not self._reserves(s):
-            self._fail(s, why, out)
-            self._stop_from(s, now, live)
-            return True
-        return self._reserved_cutoff(s, why, now, out)
-
-    def _reserved_cutoff(self, s: Session, why: str, now: float, out: list[HostEvent]) -> bool:
-        """(Rounds 8 to 10) A Claude attempt's or held end's stop with Claude steering on: the decision and the fence
-        under the cutoff lock, after the checkout was reserved there without waiting (`_claim(reserve=True)`);
-        registry busy, or after the global latch, nothing (the next pass or tick tries again; the stop of every turn
-        is the one that acts). The SIGTERM after the lock is let go, dated at the signal (R8-01), main's `_stop` but
-        for the registry call (D1)."""
-        if not self._claim(s, lambda: self._fail(s, why, out), reserve=True):
+    def _reserves(self, s: Session, cause: str) -> bool:
+        """(Enabling PR, ruling S1; review round 10, rulings G1 and H2) THE one predicate of the stop's path, from the
+        stop's CAUSE and the session's recorded steering state; callers pass the cause, none chooses the path. True
+        (the reserved stop, `_reserved_stop`: never waits on the registry) only for a stop main e6b421f would NOT
+        perform in that state, with Claude steering switched on for this node and the session's adapter a Claude one
+        it was copied onto (`steering_on`: no Codex adapter has it):
+        - CAUSE_HOLD_CUT, CAUSE_TIMEOUT, CAUSE_CANCEL with a held end (`s.held`): N's native end came and is held
+          (main would already have settled N: no cut, no timeout, no cancel-and-signal of it there);
+        - CAUSE_STEER_BYTES for a Claude attempt (`slot.holds`, recorded at the offer): the steer frame's own write
+          failed or was cut in part.
+        False for every other cause and state (an explicit close, a fatal error, a host error, a reap with survivors,
+        parking, a cancel or timeout before N's native end, a broken pipe while writing an ordinary reply): main's
+        path, unchanged, with main's registry wait. With the switch off it is false for every session; for a Codex
+        session it is false with the switch on too."""
+        if not (self.claude_steer() and getattr(s.provider, "steering_on", False) is True):
             return False
-        self._stop(s, now, at_signal=True, reserved=True)
+        if s.group_key is None:
+            # (Review round 1, A3) a live process without its cached registry key: an invariant violation, never
+            # reached in production (`_spawn` caches it with every process); main's path (claimed, owned, main's
+            # registry call), never a filesystem lookup on the reserved path
+            return False
+        if cause in (CAUSE_HOLD_CUT, CAUSE_TIMEOUT, CAUSE_CANCEL):
+            return s.held is not None
+        if cause == CAUSE_STEER_BYTES:
+            return s.steer is not None and s.steer.holds
+        return False
+
+    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent], live: bool, cause: str) -> bool:
+        """THE single-session stop that fails N and stops its process (review round 3, ruling N; callers: `_hold_cut`,
+        the turn timeout `_hold_to_timeout` (both its branches), and a broken pipe while writing an ordinary reply).
+        The path is `_reserves`'s, from `cause`: true, the reserved stop; false, main e6b421f's path: the turn is failed
+        and stopped (`_fail`, `_stop_from`, main's registry wait in `_stop`), for a steering session claimed first
+        under the cutoff lock as on every other of main's routes (ruling T: after the latch the bulk stop owns it; the
+        decision's log lines deferred), for any other session exactly main's two calls. False return: it did nothing
+        (the registry was busy, or the claim was lost to the latch)."""
+        if self._reserves(s, cause):
+            return self._reserved_stop(s, now, lambda: self._fail(s, why, out))
+        if self._steering(s):
+            return self._claim(s, lambda: self._fail(s, why, out), lambda: self._stop_from(s, now, live))
+        self._fail(s, why, out)
+        self._stop_from(s, now, live)
+        return True
+
+    def _reserved_stop(self, s: Session, now: float, commit: Callable[[], None]) -> bool:
+        """(Enabling PR, rulings S2 and S3; rounds 8 to 10; review round 1, R2, R3 and A3) THE stop of a steering-only
+        cause (`_reserves`). Before the cutoff lock: the group's probe (a token made if the live child has none). No
+        filesystem call anywhere on this path: the checkout's registry key is the one `_spawn` cached with the process
+        (`group_key`). Then, under the cutoff lock, in this order:
+        (a) the claim confirmed available (the latch); nothing is changed by preparing: the buffer, the slot, the hold
+            and the adapter are as they were;
+        (b) the checkout reserved in the registry WITHOUT waiting (`try_stopping`); a live group the registry does not
+            know gets the normal STOPPING entry under the checkout's key, bound to this child (its token attached
+            to the session, so the verified reap's `gone` removes exactly that entry); a verified exit needs none;
+        (c) BUSY: False; no stop is committed and the buffer, the slot, the hold and the adapter are as they were;
+            the next pass, tick or listing retries. (BUSY does not mean nothing happened: a drain the caller made
+            before this may already have processed native evidence, and a token made for a child without one has
+            advanced the counter);
+        (d) escalation armed FIRST, main's `_stop` body (the kill clock and the SIGTERM, dated at the signal: R8-01; a
+            raising SIGTERM keeps main's clock, D1), THEN `commit`: the decision, the adapter's callbacks, the
+            buffer, publication and any diagnostic (its log lines handed to the deferred queue the loop writes: no
+            log handler runs here). Whatever `commit` raises, the kill scan escalates the group to SIGKILL after the
+            grace.
+        Lock order: this cutoff lock, then the registry's non-blocking attempt: nothing that holds the registry waits
+        for this lock, so no deadlock. Nothing is undone: there is no rollback of a reservation."""
+        child = s.child
+        if child is None:
+            return False
+        token, fresh = s.group_token, s.group_token is None
+        if fresh:
+            token = ("session", s.session_id, next(self._group_seq))
+        try:
+            alive = child.poll() is None or self.group_alive(child.pid)
+        except Exception:
+            alive = True        # (a probe that fails is taken as "still going", as at shutdown)
+        barrier = (s.group_key, s.cwd) if alive else None
+        logs: list = []
+        try:
+            with self._steer_stop_lock:
+                if self.steer_stopped or (s.steer is not None and s.steer.stopping):
+                    return False
+                got = self.groups.try_stopping(token, barrier)
+                if got == self.groups.BUSY:
+                    return False
+                if fresh and got == self.groups.RESERVED:
+                    s.group_token = token
+                try:
+                    self._stop(s, now, at_signal=True, reserved=True)
+                finally:
+                    self._defer_logs, self._claimer = logs, threading.get_ident()
+                    try:
+                        commit()
+                    finally:
+                        self._defer_logs, self._claimer = None, None
+        finally:
+            for level, msg, args in logs:
+                _keep_line(log.name, level, msg, args)
         return True
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
@@ -2803,13 +2931,14 @@ class SessionHost:
             except OSError:
                 s.stderr_from = 0
             token = ("session", s.session_id, next(self._group_seq))
+            k = node_groups.key(s.cwd)      # (A3: once, here; the very key the entry is made under)
             started, child = self.groups.start(s.cwd, token, lambda: self.spawner(
-                argv, cwd=s.cwd, env=self._env(s), log_path=self.sessions_dir / f"{s.session_id}.stderr.log"))
+                argv, cwd=s.cwd, env=self._env(s), log_path=self.sessions_dir / f"{s.session_id}.stderr.log"), k=k)
             if not started:
                 # A process group of this node is being stopped in that directory (a session's, or a dispatched
                 # run's): nothing starts beside it. The message waits in the inbox.
                 return
-            s.group_token = token
+            s.group_token, s.group_key = token, k
         except Exception as e:
             log.warning("could not start session %s: %s", s.session_id, e)
             self._end(s, f"could not start: {type(e).__name__}: {e}", now, out)
@@ -2946,19 +3075,27 @@ class SessionHost:
             except OSError as e:
                 n = e
         if isinstance(n, OSError):
+            detail = f"could not write to the process: {type(n).__name__}"
+            if steered is not None and self._reserves(s, CAUSE_STEER_BYTES):
+                # (Enabling PR, rulings S1 and S2) The steer frame's own write failed (a Claude attempt, steering on):
+                # the reserved stop. Its preparation changes nothing: the buffer is read across (a native end behind
+                # it is N's own) and cleared only once escalation is armed; busy, the next pass retries.
+                if self.live_attempt(s):
+                    now = self._drain_before_stop(s, now, out)
+                self._reserved_stop(s, now, lambda: (s.outbuf.clear(), self._fail(s, detail, out)))
+                return
             # The process no longer reads. A message that was not fully written never reached it; a turn in
             # flight (an answer to the process could not be written) is lost with the process. During a
             # handshake the message that made the process start is still in the inbox: it fails here too.
             s.outbuf.clear()
-            detail = f"could not write to the process: {type(n).__name__}"
             live = self.live_attempt(s)
             if live:
                 now = self._drain_before_stop(s, now, out)      # a native end behind buffered output is N's own
             if (s.provider.waits_for_ready and not s.ready) or s.checking:
                 self._fail_start(s, detail, out)
             elif self._steering(s):
-                # (ruling T; round 10, ruling G1: `_cutoff_stop` decides the path, as for every other caller)
-                self._cutoff_stop(s, detail, now, out, live=live)
+                # (ruling T; enabling PR, ruling S1: an ordinary reply's broken pipe is main's path)
+                self._cutoff_stop(s, detail, now, out, live=live, cause=CAUSE_WRITE)
                 return
             else:
                 self._fail(s, detail, out)
@@ -3149,7 +3286,7 @@ class SessionHost:
                     self.groups.gone(s.group_token)
                 except Exception:
                     log.exception("session %s: its group's record could not be cleared", s.session_id)
-                s.group_token = None
+                s.group_token = s.group_key = None
                 s.outbuf.clear()
                 self._release_steer(s)
             for s in self.sessions.values():

@@ -306,6 +306,9 @@ class SessionRunner:
         self.lock = threading.Lock()                  # the host, between the loop, the watchdog and shutdown()
         self.watched: list[HostEvent] = []            # what the watchdog's self-stop reported, for the loop to post
         self.watched_steer: list[HostEvent] = []      # ... of a steer attempt's session: posted before LOST detection
+        # (Enabling PR, ruling S5(c)) True while a listing is being reconciled: the watchdog's own lane (`watched`) is
+        # handed off only after it, as on main, whichever host call returned events meanwhile (`_emit`)
+        self.reconciling = False
         # When the node was last seen past its self-stop deadline, or None: from then on nothing starts until a
         # listing from a fetch SENT after that moment has been applied (`_may_start`, `pass_once`).
         self.latched_at: float | None = None
@@ -488,8 +491,12 @@ class SessionRunner:
     def _emit(self, events: list[HostEvent]) -> None:
         """Everything published and not yet taken, in publication order, across the host's outbox and the
         watchdog's lists (`_deliver`), then any event given here that no outbox published (no source to remove it
-        from). An event a host call returned is in the host's outbox: it is taken from there, once."""
-        self._deliver(late=True)
+        from). An event a host call returned is in the host's outbox: it is taken from there, once. (Enabling PR,
+        ruling S5(c)) The lanes follow the reconciliation's PHASE, not the host call that returned the events: while
+        a listing is reconciled (a close or a cancel inside it, returning the whole outbox after an earlier failed
+        handoff) the watchdog's own lane waits, so no watched terminal goes ahead of a LOST the reconciliation
+        reports; after it, every lane, as on main."""
+        self._deliver(late=not self.reconciling)
         for e in events:
             if e.ident is None:
                 self._put(e)
@@ -965,6 +972,14 @@ class SessionRunner:
         return {int(i) for i in ids if i.isdigit()}
 
     def _reconcile(self, data: dict, fetch_sent: float | None = None) -> None:
+        """A listing applied (its phase marked for `_emit`'s lanes: ruling S5(c))."""
+        self.reconciling = True
+        try:
+            self._reconcile_listing(data, fetch_sent)
+        finally:
+            self.reconciling = False
+
+    def _reconcile_listing(self, data: dict, fetch_sent: float | None = None) -> None:
         if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
             log.warning("the hub's session list is not one; ignoring it")     # never read as "no sessions"
             return

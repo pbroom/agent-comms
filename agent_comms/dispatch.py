@@ -1164,11 +1164,12 @@ class SessionsConfig:
     # Mid-turn steering (hosted_steer.py); read on the hub. Off (for a drain before installing an older hub): every new
     # steer is refused; one already accepted is offered and settled as ever.
     steer: bool = True
-    # (Claude steering, step 3, review round 9, ruling F) Steering a running Claude turn; read on the node when it
-    # starts, and copied onto each Claude adapter when its session opens: editing the file changes no running node or
-    # adapter; a change needs a node restart (round 10, G3). Off by default in this PR: no Claude steer mode is
-    # reported, no steer reaches a Claude turn, no end is held. Codex steering does not read it.
-    claude_steer: bool = False
+    # (Claude steering, step 3; the enabling PR) Steering a running Claude turn; read on the node when it starts, and
+    # copied onto each Claude adapter when its session opens: editing the file changes no running node or adapter; a
+    # change needs a node restart. On by default; `claude_steer = false` turns it off: then no Claude steer mode is
+    # reported, no steer reaches a Claude turn and no end is held (a steer for a running Claude turn is refused as
+    # for a CLI that cannot steer). Codex steering does not read it.
+    claude_steer: bool = True
     # Waking a session for board posts addressed to its agent (hosted_wake.py). These four apply on the hub.
     wake_min_interval_seconds: float = 30.0   # at most one wake per session in this many seconds
     max_wakes_per_hour: int = 12              # per session
