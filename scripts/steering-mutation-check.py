@@ -105,7 +105,6 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('H', 'T a reap with survivors claimed', '                if self._steering(s):\n                    if not self._claim(s, lambda: self._went_by_itself', '                if False:\n                    if not self._claim(s, lambda: self._went_by_itself'),
     ('H', "T no save on the watchdog's cut", "        if self._defer_save:\n            self._save_due = True       # (ruling T) the watchdog's boundary persists nothing", "        if False:\n            self._save_due = True       # (ruling T) the watchdog's boundary persists nothing"),
     ('A', "Q7 any init clears rule 10's marker first", '            self._s_init_last = False\n        named = _named(ev)', '            pass\n        named = _named(ev)'),
-    ('NS', "Y main's forget only when only the extensions differ", '                        and {**refused[0], "events": [{f: v for f, v in x.items() if f != "steer"}\n                                                      for x in refused[0]["events"]]} == payload):', '                        and True):'),
     ('NS', "Y the acknowledged modes are the accepted rung's", '                    self.acked_modes[sid] = list(taken["modes"])    # (ruling Y) what the hub acknowledged', '                    self.acked_modes[sid] = list(body["modes"])    # (ruling Y) what the hub acknowledged'),
     ('NS', 'Y an explicit report corrects modes acknowledged with less', '                    set(self.acked_modes[sid]) < set(self._modes_for(st[4], features))):', '                    False):'),
     ('NS', "Y rung (iii) is main's plain retry of rung (ii)", '        three = {k: v for k, v in two.items() if k != "events"} | {', '        three = {k: v for k, v in two.items() if k not in ("events", "modes")} | {"modes": [m for m in two.get("modes", []) if m != "steer"]} | {'),
@@ -136,7 +135,7 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('NS', 'X the final handoff tried once more', '            for attempt in (1, 2):\n', '            for attempt in (2,):\n'),
     ('NS', 'R rung (ii) keeps a Codex extension', '                                                              and v.get("outcome") == "next_turn")}', '                                                              )}'),
     ('NS', 'R rung (ii) removes the Claude pair', '            out["modes"] = [m for m in body["modes"] if not (m == "held" or (claude and m == "steer"))]', '            out["modes"] = list(body["modes"])'),
-    ('NS', "Y main's forget only after a 422", 'and refused[1] == 422 and gen == self.features_gen and (', 'and gen == self.features_gen and ('),
+    ('NS', "Y main's forget only after a 422", 'refused is not None and refused[1] == 422 and gen == self.features_gen:', 'refused is not None and gen == self.features_gen:'),
     ('H', 'Z a failed step keeps a live group owned', '                if failed_here and going(s):', '                if False:')]
 FIRST = ["tests/test_claude_steering.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_session_restart.py",

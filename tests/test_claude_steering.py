@@ -3966,6 +3966,36 @@ def test_r6_n1_no_kill_comes_between_a_stop_and_its_sigterm(env):
     assert "KILL" not in order or order.index("KILL") > order.index("TERM"), order
 
 
+def test_r6_n1_only_the_steer_deadlines_wait_is_bounded(env):
+    """Ruling N1 (a mutation row): the self-stop and the kills take the runner lock with main's unbounded wait; the
+    steer deadlines' own section waits at most one watch interval (a loop that keeps its lock delays them, never a
+    kill)."""
+    runner = env.node.sessions
+    real = runner.lock
+    waits = []
+
+    class Recording:
+        def __enter__(self):
+            waits.append("unbounded")
+            return real.__enter__()
+
+        def __exit__(self, *a):
+            return real.__exit__(*a)
+
+        def acquire(self, *a, **k):
+            waits.append(k.get("timeout", a[1] if len(a) > 1 else "unbounded"))
+            return real.acquire(*a, **k)
+
+        def release(self):
+            return real.release()
+    runner.lock = Recording()
+    try:
+        runner.enforce_deadlines()
+    finally:
+        runner.lock = real
+    assert waits == ["unbounded", runner.watch_seconds], waits
+
+
 def test_r6_n2_a_stalled_transcript_write_at_shutdown_holds_up_no_kill(henv, monkeypatch, tmp_path):
     """Ruling N2 (the one regression Sol found in round 6): lines a watchdog drain left buffered for s1's
     transcript, and a transcript write that stalls at shutdown: every group's SIGKILL is still sent before any

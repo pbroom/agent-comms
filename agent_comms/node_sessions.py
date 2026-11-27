@@ -693,13 +693,11 @@ class SessionRunner:
                 continue
             if k:
                 self.last_sync = float("-inf")      # (ruling R) a fresh listing says what the hub takes now
-                if mains and last and refused is not None and refused[1] == 422 and gen == self.features_gen and (
-                        any("steer" in x for x in refused[0]["events"])
-                        and {**refused[0], "events": [{f: v for f, v in x.items() if f != "steer"}
-                                                      for x in refused[0]["events"]]} == payload):
-                    # (R5-05, main's step-2 rule, on main's path only: ruling Y+) a 422 of exactly this report with
-                    # its steer extensions, and the plain retry got through: only `steer` is forgotten, for that
-                    # listing's features
+                if mains and last and refused is not None and refused[1] == 422 and gen == self.features_gen:
+                    # (R5-05, main's step-2 rule, on main's path only: rulings Y+ and Y of round 6) a report main could
+                    # have sent, refused as built with a 422, and main's plain retry got through: only `steer` is
+                    # forgotten, for that listing's features. (For such a report the ladder is exactly main's: as
+                    # built, then without its steer extensions; so the two differ by those extensions only.)
                     self.hub_features = self.hub_features - {"steer"}
             return sent, answer, payload
         raise AssertionError("no rung")   # (unreachable: the last rung raises or returns)
