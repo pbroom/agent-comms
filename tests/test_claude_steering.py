@@ -3511,8 +3511,10 @@ def test_r5_w_kills_and_fences_with_a_drain_pending_and_a_raising_or_stalling_sa
     stall.set()
 
 
-def test_r5_w_the_kill_step_takes_no_lock(env):
-    """Ruling W+: the runner lock and the cutoff lock are held elsewhere (a stalled loop): the due SIGKILL is sent."""
+def test_r6_n1_the_kill_step_waits_for_the_loops_lock_as_main(env):
+    """Ruling N1 (round 6; round 5's lock-free kill withdrawn): the runner lock is held elsewhere (a stalled loop):
+    the due SIGKILL waits for it, with main's unbounded wait, and goes as soon as it is let go (main's; the loop
+    holds the lock only for local work: the documented residual)."""
     import threading
     runner = env.node.sessions
     host = runner.host
@@ -3531,22 +3533,20 @@ def test_r5_w_the_kill_step_takes_no_lock(env):
     threading.Thread(target=stalled_loop, daemon=True).start()
     assert held.wait(3)
     t, done, ident, err = _on_watchdog(runner)
+    import time as _time
     try:
-        for _ in range(60):
-            if s.killed:
-                break
-            import time as _time
-            _time.sleep(0.05)
-        assert s.killed, "the kill needs no lock"
+        _time.sleep(runner.watch_seconds + 0.5)
+        assert not s.killed and not done.is_set(), "it waits for the lock, never skips the kill"
     finally:
         release.set()
-        done.wait(5)
+    assert done.wait(5) and s.killed, "and kills as soon as the lock is let go"
 
 
 def test_r5_w_a_stalled_loop_with_a_partial_write_pending(env):
-    """Ruling W+ and W6 (the residual, literally): the loop holds the runner lock in a stalled save while a Claude
-    frame taken in part is past its limit: no further byte is written, the watchdog's pass still sends a due
-    SIGKILL; once the loop goes on, its next pass cuts the frame (nothing more of it) and reports N's own end."""
+    """Ruling W+ and W6 (the residual, literally; round 6, N1: the kill step is main's): the loop holds the runner
+    lock in a stalled save while a Claude frame taken in part is past its limit: no further byte is written; the
+    watchdog's due SIGKILL waits for the lock (main's) and goes as soon as the loop lets go; the loop's next pass
+    cuts the frame (nothing more of it) and reports N's own end."""
     import threading
     import time as _time
     from test_hosted_sessions import P2
@@ -3570,14 +3570,11 @@ def test_r5_w_a_stalled_loop_with_a_partial_write_pending(env):
     threading.Thread(target=stalled_loop, daemon=True).start()
     assert held.wait(3)
     t, done, ident, err = _on_watchdog(runner)
-    for _ in range(60):
-        if s2.killed:
-            break
-        _time.sleep(0.05)
-    assert s2.killed, "kills go on while the loop is stalled"
+    _time.sleep(runner.watch_seconds + 0.5)
+    assert not s2.killed, "pinned (main's): the due SIGKILL waits for the loop's lock"
     assert len(child.stdin) == before, "no further byte of S while the loop is stalled"
-    assert done.wait(runner.watch_seconds + 3), "the pass waits for the loop's lock one watch at most, then returns"
     release.set()
+    assert done.wait(5) and s2.killed, "the SIGKILL goes as soon as the loop lets go"
     tick(env)
     assert len(child.stdin) == before, "the loop cuts: no further byte of S"
     assert s.stopping_since is not None or s.child is None
@@ -3888,6 +3885,310 @@ def test_r5_known_limit_a_raising_log_handler_between_a_claim_and_its_signal(hen
     assert raised, "the handler raised"
     assert len(ends(out)) == 1, "N decided and reported once"
     assert child.terminated >= 1, "the stop went (by the host-error path)"
+
+
+# ---------------------------------------------------------------- review round 6 (narrow)
+
+
+def _stopping_turn(env, project=None):
+    """An ordinary turn whose process ignores SIGTERM, stopped by the loop (under its lock), its grace not yet over."""
+    sid, child, m = _ordinary_turn_in_flight(env, project=project)
+    runner = env.node.sessions
+    s = runner.host.sessions[sid]
+    child.exits_on_terminate = False
+    with runner.lock:
+        runner.host._stop(s, env.clock())
+    return sid, child, s
+
+
+def test_r6_n1_a_kill_qualified_by_the_watchdog_never_hits_a_replacement(env):
+    """Sol's round-6 interleaving 1 (ruling N1): the watchdog qualifies A's process for its SIGKILL; the loop then
+    replaces A's child before the signal. On main the kill step holds the runner lock, so the loop cannot run in
+    between: the SIGKILL reaches A's own process, never the replacement."""
+    import threading
+    from test_session_host import FakeSessionChild
+    sid, child, s = _stopping_turn(env)
+    runner = env.node.sessions
+    env.clock.advance(runner.host.kill_grace + 1)
+    repl = FakeSessionChild(child.pid + 500)
+    loop_done = threading.Event()
+
+    def loop_replaces():
+        with runner.lock:
+            s.child = repl          # (the loop: A's process went, its successor started)
+        loop_done.set()
+    fired = []
+
+    class Hooked(type(s)):
+        def __setattr__(self, name, value):
+            if name == "killed" and value is True and not fired:
+                fired.append(1)
+                threading.Thread(target=loop_replaces, daemon=True).start()
+                loop_done.wait(1)       # (the loop gets its chance here, unless the watchdog holds its lock)
+            object.__setattr__(self, name, value)
+    s.__class__ = Hooked
+    t, done, ident, err = _on_watchdog(runner)
+    assert done.wait(5) and not err, err
+    loop_done.wait(5)
+    s.__class__ = Hooked.__mro__[1]
+    assert fired, "the watchdog qualified A"
+    assert child.killed and not repl.killed, "the SIGKILL reached A's process, never its replacement"
+
+
+def test_r6_n1_no_kill_comes_between_a_stop_and_its_sigterm(env):
+    """Sol's round-6 interleaving 2 (ruling N1): the loop is paused between registering a stop (`stopping_since`)
+    and sending its SIGTERM, long enough for the grace; the watchdog's pass cannot SIGKILL in between: it waits for
+    the runner lock, as on main, so the order is SIGTERM, then SIGKILL."""
+    import threading
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    host = runner.host
+    s = host.sessions[sid]
+    child.exits_on_terminate = False
+    order = []
+    real_term, real_kill = child.terminate, child.kill
+    child.terminate = lambda: (order.append("TERM"), real_term())[1]
+    child.kill = lambda: (order.append("KILL"), real_kill())[1]
+    real_stopping = host.groups.stopping
+    watch = {}
+
+    def stopping(token):
+        real_stopping(token)
+        env.clock.advance(host.kill_grace + 1)      # (the loop is held up here)
+        watch["run"] = _on_watchdog(runner)
+        watch["run"][1].wait(1)
+    host.groups.stopping = stopping
+    with runner.lock:
+        host._stop(s, env.clock())
+    host.groups.stopping = real_stopping
+    assert watch["run"][1].wait(5)
+    assert order[:1] == ["TERM"], order
+    assert "KILL" not in order or order.index("KILL") > order.index("TERM"), order
+
+
+def test_r6_n2_a_stalled_transcript_write_at_shutdown_holds_up_no_kill(henv, monkeypatch, tmp_path):
+    """Ruling N2 (the one regression Sol found in round 6): lines a watchdog drain left buffered for s1's
+    transcript, and a transcript write that stalls at shutdown: every group's SIGKILL is still sent before any
+    remaining transcript is written."""
+    import os as _os
+    import threading
+    from agent_comms import session_host
+    (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
+    host = henv.host
+    c1.exits_on_terminate = c2.exits_on_terminate = False
+    fd = _os.open(tmp_path / "t1", _os.O_WRONLY | _os.O_CREAT, 0o600)
+    s1.transcript_fd = fd
+    if hasattr(s1, "tee_pending"):
+        s1.tee_pending.append(b'{"left": "by a watchdog drain"}')
+    stall, released = threading.Event(), threading.Event()
+    real_write = session_host.os.write
+
+    def write(f, data):
+        if f == fd and not released.is_set():
+            stall.set()
+            released.wait(5)
+        return real_write(f, data)
+    monkeypatch.setattr(session_host.os, "write", write)
+    t = threading.Thread(target=host.stop_all, daemon=True)
+    t.start()
+    import time as _time
+    deadline = _time.monotonic() + 3
+    while _time.monotonic() < deadline and not (c1.killed and c2.killed):
+        _time.sleep(0.02)
+    killed = (c1.killed, c2.killed)
+    released.set()
+    t.join(5)
+    assert killed[0] and killed[1], f"every group's SIGKILL before any transcript write: {killed}"
+
+
+def test_r6_n3_no_handler_runs_for_a_provider_logger_on_the_watchdogs_thread(env):
+    """Ruling W2.3 (N3): a late answer to a Codex request retired with its turn is read by main's watchdog drain;
+    the Codex provider's own logger says so. No handler runs on the watchdog's thread (a stalling one would hold the
+    pass); the loop's next pass writes the line."""
+    import logging
+    import threading
+    import test_codex_steering as tcs
+    from agent_comms.session_host import STEER_PARTIAL_SECONDS
+    sid, child = tcs.codex_turn_in_flight(env)
+    child.accept = 10
+    tcs.post_steer(env, sid)
+    tick(env)
+    s = env.node.sessions.host.sessions[sid]
+    assert s.steer is not None and 0 < s.steer.sent < s.steer.length
+    s.provider._retired.add(987)
+    child.emit(tcs.cx.reply(987, {"turnId": tcs.cx.TURN}))
+    env.clock.advance(STEER_PARTIAL_SECONDS)
+    seen, stall = [], threading.Event()
+
+    class Stalling(logging.Handler):
+        def emit(self, record):
+            seen.append((record.name, threading.get_ident()))
+            stall.wait(3)
+    h = Stalling()
+    pkg = logging.getLogger("agent_comms")
+    provider = logging.getLogger("agent_comms.providers.codex")
+    level = provider.level
+    provider.setLevel(logging.INFO)     # (the provider's line is an INFO one)
+    pkg.addHandler(h)
+    try:
+        t, done, ident, err = _on_watchdog(env.node.sessions)
+        returned = done.wait(1.5)
+        stall.set()
+        done.wait(5)
+        assert returned and not err, "the pass was not held by a handler"
+        assert not [n for n, th in seen if th == ident[0]], "no handler on the watchdog's thread"
+        stall.clear()
+        stall.set()
+        env.node.sessions.pass_once()
+        assert any(n == "agent_comms.providers.codex" for n, th in seen), "the loop wrote the provider's line"
+    finally:
+        pkg.removeHandler(h)
+        provider.setLevel(level)
+
+
+def test_r6_n3_no_traceback_is_formatted_on_the_watchdogs_thread(env, monkeypatch):
+    """Ruling W2.3 (N3): the self-stop raises on the watchdog's thread and is logged with its exception: nothing
+    formats a traceback there (only the exception's type and text are kept); the loop writes the line."""
+    import threading
+    import traceback
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    env.clock.advance(runner.self_stop_seconds + 1)
+
+    def fails(*a, **k):
+        raise OSError("the self-stop failed here")
+    runner.host.stop_turns = fails
+    formatted = []
+    for name in ("format_exc", "format_exception", "format_tb", "extract_tb"):
+        real = getattr(traceback, name)
+        monkeypatch.setattr(traceback, name,
+                            lambda *a, _r=real, **k: (formatted.append(threading.get_ident()), _r(*a, **k))[1])
+    t, done, ident, err = _on_watchdog(runner)
+    assert done.wait(5) and not err, err
+    assert ident[0] not in formatted, "no traceback formatted on the watchdog's thread"
+
+
+def test_r6_y_an_extension_only_next_turn_422_forgets_nothing(env):
+    """Ruling Y (the literal legacy rung, Sol's round-6 sequence): A's report carries no modes and only a
+    `next_turn` extension; the hub refuses it with 422 and takes it with only `next_turn` stripped (rung (ii)): that
+    is not main's plain retry of a step-2 outcome, so `steer` is not forgotten."""
+    a, b, runner = _claude_next_turn_and_codex_steer_pending(env)
+    runner.hub_features = set(runner.hub_features) - {"restart"}       # (no `modes` in the report)
+    _posts(runner, lambda path, body: 422 if any(isinstance(e.get("steer"), dict)
+                                                 and e["steer"].get("outcome") == "next_turn"
+                                                 for e in body["events"]) else None)
+    with runner.lock:
+        assert runner._flush()
+    assert "steer" in runner.hub_features, "only main's literal legacy rung forgets `steer`"
+
+
+def test_r6_x_a_checkpoint_and_its_receipt_commit_together(env):
+    """Ruling X (round 6): a checkpoint's acceptance and its receipt commit together: a raise after the commit, a
+    flush, then the retry: one checkpoint POST."""
+    sid, child, n, s_uuid = claude_steered(env)
+    runner = env.node.sessions
+    posts = []
+    real_req = runner.client.request
+
+    def request(method, path, **kw):
+        if method == "POST" and isinstance(kw.get("json"), dict) and "held" in kw["json"]:
+            posts.append(path)
+        return real_req(method, path, **kw)
+    runner.client.request = request
+    real, calls = runner._checkpoint, []
+
+    def checkpoint(*a, **k):
+        r = real(*a, **k)
+        if not calls:
+            calls.append(1)
+            raise RuntimeError("after the commit")
+        return r
+    runner._checkpoint = checkpoint
+    child.emit(cresult(sid, n, text="N's reply"))
+    with pytest.raises(RuntimeError):
+        runner.pass_once()
+    with runner.lock:
+        runner._flush()
+    runner._checkpoint = real
+    tick(env, times=2)
+    assert len(posts) == 1, posts
+
+
+@pytest.mark.parametrize("fails", [1, 2])
+def test_r6_x_the_final_shutdown_handoff_is_retried_once(env, fails):
+    """Ruling X (round 6): shutdown's final handoff raises: it is tried once more. One failure: everything is
+    reported. Two (exhausted, pinned): shutdown still completes; what was not taken stays in the host's outbox (the
+    next node process reports those turns as lost), and the error is logged."""
+    sid = start(env, "an ordinary turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    child.emit(cinit(sid, written(child)[-1]["uuid"]))
+    tick(env)
+    runner = env.node.sessions
+    real, calls = runner._put, []
+
+    def put(e):
+        if len(calls) < fails:
+            calls.append(1)
+            raise RuntimeError("the handoff failed")
+        return real(e)
+    runner._put = put
+    runner.signal()
+    runner.kill()
+    runner.shutdown()
+    runner._put = real
+    m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    if fails == 1:
+        assert m["state"] == "failed" and "shut down" in m["detail"], m
+    else:
+        assert m["state"] != "failed" or "shut down" not in m["detail"], "exhausted: not reported by this process"
+        assert any(e.session_id == sid for e in runner.host._outbox), "left in the outbox"
+
+
+def test_r6_n4_known_limit_a_registry_wait_ahead_of_the_kill_step(env):
+    """Known limit (round 6, N4; main e6b421f's behaviour): a spawn holds the group registry's lock while the
+    watchdog's self-stop needs it: the due SIGKILL of another group waits behind it (the kill step comes after the
+    self-stop, under the same runner lock, as on main), and goes as soon as the lock is let go."""
+    import threading
+    import time as _time
+    from test_hosted_sessions import P2
+    sid2, c2, m2 = _ordinary_turn_in_flight(env, project=P2)
+    sid, child, s = _stopping_turn(env)
+    runner = env.node.sessions
+    host = runner.host
+    env.clock.advance(max(host.kill_grace, runner.self_stop_seconds) + 1)
+    release, held = threading.Event(), threading.Event()
+
+    def spawn_holding_the_registry():
+        with host.groups.lock:
+            held.set()
+            release.wait(10)
+    threading.Thread(target=spawn_holding_the_registry, daemon=True).start()
+    assert held.wait(3)
+    t, done, ident, err = _on_watchdog(runner)
+    _time.sleep(0.5)
+    waited = not child.killed
+    release.set()
+    assert done.wait(5) and not err, err
+    assert waited, "pinned: the due SIGKILL waited behind the registry's lock (main's)"
+    assert child.killed, "and went once the lock was let go"
+
+
+def test_r6_n4_known_limit_a_kill_that_returns_with_survivors_releases_ownership(henv, monkeypatch):
+    """Known limit (round 6, N4; main e6b421f's behaviour): at shutdown a KILL that returns while members of the
+    group survive (a no-op signal, or one not yet delivered): the session lets go of its handle, its group entry
+    and its record, as main does; its sibling is stopped. (A KILL that RAISES keeps the group: round 5.)"""
+    import json as _json
+    (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
+    host = henv.host
+    c1.exits_on_terminate = False
+    c1.kill = lambda: None          # (returns; the group is still there)
+    henv.groups.add(c1.pid)
+    token = s1.group_token
+    host.stop_all()
+    assert s2.child is None, "the sibling is stopped"
+    assert s1.child is None and not any(token in g for g in host.groups.entries.values()), "pinned: released"
+    assert s1.session_id not in _json.loads(host._state_path().read_text()), "pinned: no record kept"
 
 
 RESULT_FIELDS = ["subtype", "is_error", "num_turns", "origin", "user_message_uuid", "user_message_uuids", "result",

@@ -84,6 +84,7 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
 from __future__ import annotations
 
 import json
+import sys
 import logging
 import os
 import signal
@@ -105,7 +106,8 @@ from .providers import Event, ProviderSession, validate_model, validate_session_
 # (Review round 5, ruling W) The threads that run the node's deadline watchdog (node_sessions registers its own). On
 # them the host only reads clocks and memory, takes the cutoff lock, makes a claim, sends signals and appends events
 # already built: a state save is left for the loop (`_save_due`), a transcript line waits in memory (`tee_pending`),
-# and a log line is kept in memory (`WatchLog`) until the loop's next pass writes it.
+# and a log line of any logger of the package is kept in memory (`_diverting_log`) until the loop's next pass writes
+# it.
 WATCH_THREADS: set[int] = set()
 _WATCH_LINES: deque = deque(maxlen=2000)
 
@@ -114,43 +116,33 @@ def on_watch() -> bool:
     return threading.get_ident() in WATCH_THREADS
 
 
-class WatchLog:
-    """A module logger that, on a watchdog thread, never raises and never blocks: the line is kept in memory (a
-    bounded queue: the oldest goes first if the loop is away that long) and written by the loop (`flush_watch_logs`).
-    On any other thread it is the logger itself."""
+_PACKAGE = "agent_comms"
+_real_log = getattr(logging.Logger._log, "_real", logging.Logger._log)     # (once, even if this module is reloaded)
 
-    def __init__(self, logger: logging.Logger):
-        self._logger = logger
 
-    def log(self, level: int, msg: str, *args, exc_info: Any = None, stacklevel: int = 2, **kw) -> None:
-        if not on_watch():
-            self._logger.log(level, msg, *args, exc_info=exc_info, stacklevel=stacklevel, **kw)
-            return
+def _diverting_log(self, level, msg, args, exc_info=None, extra=None, stack_info=False, stacklevel=1):
+    """(Review round 6, ruling W2.3) Every logger of the package, provider loggers included: on a watchdog thread a
+    line is never made into a record, formatted or handed to a handler there. It is kept in memory (a bounded queue:
+    the oldest goes first if the loop is away that long), with an exception's type and text only (no traceback is
+    formatted), and the loop writes it at its next pass (`flush_watch_logs`). On any other thread, logging as ever."""
+    if on_watch() and (self.name == _PACKAGE or self.name.startswith(_PACKAGE + ".")):
         try:
             if exc_info:
-                import traceback
-                msg = msg + "\n" + traceback.format_exc()
-            _WATCH_LINES.append((self._logger, level, msg, args))
+                ex = exc_info if isinstance(exc_info, BaseException) else (
+                    exc_info[1] if isinstance(exc_info, tuple) else sys.exc_info()[1])
+                if ex is not None:
+                    msg = f"{msg} ({type(ex).__name__}: %s)"
+                    args = tuple(args) + (ex,) if isinstance(args, tuple) else (args, ex)
+            _WATCH_LINES.append((self.name, level, msg, args))
         except Exception:       # (never raises on the watchdog's thread)
             pass
+        return
+    _real_log(self, level, msg, args, exc_info=exc_info, extra=extra, stack_info=stack_info,
+              stacklevel=stacklevel + 1)
 
-    def debug(self, msg, *a, **k):
-        self.log(logging.DEBUG, msg, *a, stacklevel=3, **k)
 
-    def info(self, msg, *a, **k):
-        self.log(logging.INFO, msg, *a, stacklevel=3, **k)
-
-    def warning(self, msg, *a, **k):
-        self.log(logging.WARNING, msg, *a, stacklevel=3, **k)
-
-    def error(self, msg, *a, **k):
-        self.log(logging.ERROR, msg, *a, stacklevel=3, **k)
-
-    def exception(self, msg, *a, **k):
-        self.log(logging.ERROR, msg, *a, exc_info=True, stacklevel=3, **k)
-
-    def __getattr__(self, name):
-        return getattr(self._logger, name)
+_diverting_log._real = _real_log
+logging.Logger._log = _diverting_log
 
 
 def flush_watch_logs() -> None:
@@ -159,16 +151,16 @@ def flush_watch_logs() -> None:
         return
     while _WATCH_LINES:
         try:
-            logger, level, msg, args = _WATCH_LINES.popleft()
+            name, level, msg, args = _WATCH_LINES.popleft()
         except IndexError:
             return
         try:
-            logger.log(level, msg, *args)
+            logging.getLogger(name).log(level, msg, *args)
         except Exception:
             pass
 
 
-log = WatchLog(logging.getLogger("agent_comms.session_host"))
+log = logging.getLogger("agent_comms.session_host")
 
 STATE_FILE = "node-sessions.json"   # session id -> {pid, proc_start, ...}: what a restarted host must clean up
 PROVIDER_FILE = "node-session-providers.json"   # session id -> the provider's own id for it (Codex's thread id)
@@ -2700,7 +2692,7 @@ class SessionHost:
             finally:
                 logs, self._defer_logs, self._claimer = self._defer_logs, None, None
         for level, msg, args in logs:
-            log.log(level, msg, *args)      # (ruling W: `log` keeps it in memory on the watchdog's thread)
+            log.log(level, msg, *args)      # (ruling W2.3: kept in memory on a watchdog's thread)
         return True
 
     def _say(self, level: int, msg: str, *args) -> None:
@@ -3024,23 +3016,33 @@ class SessionHost:
             deadline = self.clock() + self.kill_grace
             while any(going(s) for s in live) and self.clock() < deadline:
                 self.sleep(0.2)
+            # (Review round 6, ruling N2) The bulk signal pass first: every group still going gets its SIGKILL
+            # before anything of any session is read or written to a transcript (a transcript write that stalls,
+            # the watchdog's buffered lines included, never holds up a group's SIGKILL or a sibling's).
+            failed: set[str] = set()
             for s in live:
-                self._flush_tee(s)
+                try:
+                    if going(s):
+                        s.child.kill()
+                except Exception:
+                    failed.add(s.session_id)
+                    log.exception("session %s: its SIGKILL at shutdown failed", s.session_id)
+            for s in live:
                 # (Review round 4, ruling T) every step of the traversal per session: one session's fault (its
-                # kill, read, close or cleanup) skips no other, and the final save runs in the `finally`
-                steps = (lambda: s.child.kill() if going(s) else None,
+                # read, close or cleanup) skips no other, and the final save runs in the `finally`
+                steps = (lambda: self._flush_tee(s),       # (ruling W: what a watchdog's drain left, first)
                          lambda: self._read(s, now, out),     # the transcript keeps what was written until the end
                          lambda: (getattr(s.child, "close", None) or (lambda: None))(),
                          lambda: (os.close(s.transcript_fd) if s.transcript_fd is not None else None))
-                failed = False
+                failed_here = s.session_id in failed
                 for step in steps:
                     try:
                         step()
                     except Exception:
-                        failed = True
+                        failed_here = True
                         log.exception("session %s: a step of its shutdown failed", s.session_id)
                 s.transcript_fd = None
-                if failed and going(s):
+                if failed_here and going(s):
                     # (Review round 5, ruling Z) a step failed and its group may still be there: the session keeps
                     # its process handle, its SIGTERM's time and its group's entry (no checkout is given away under
                     # it), and the final save below records it, so a later kill (`kill_due`) or the next node
