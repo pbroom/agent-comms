@@ -117,6 +117,8 @@ Q7. (stand-in only, and only with `--only steering`: it takes 82 s) A partition 
     (the turn not proved yet): the hub is stopped (SIGSTOP) past the node's 75 s contact clock; once it is back and
     the turn proved, the steer is still never written; N completes and the steer is `not_delivered`.
 Q8. Stop; nothing is left; the user's Codex config.toml is unchanged (with --codex-bin).
+(Claude steering ships off by default: this script's node configuration turns it on, `[dispatch.sessions]
+claude_steer = true`, for every run of it.)
 Then Claude steering, step 3 (with `--only steering` too; DESIGN_NOTES "Mid-turn steering, step 3: Claude steering,
 as built"), on a hub and a node of their own whose VERIFIED and STEER_MODES name the Claude CLI's version (that node
 process only): the stand-in's, or with --claude-bin the real one's (gate M8 as an e2e check, as M5 is for Codex):
@@ -709,6 +711,7 @@ kill_grace_seconds = 5
 [dispatch.sessions]
 enabled = true
 codex = true
+claude_steer = true
 """)
 
     def codex_runner(self) -> list[str]:
@@ -2581,6 +2584,7 @@ worktree_dir = {json.dumps(str(self.worktrees))}
 [dispatch.sessions]
 enabled = true
 codex = true
+claude_steer = true
 allow_full_access = {"true" if allow_full else "false"}
 max_live = 8
 """)

@@ -1,6 +1,6 @@
 """The mutation check of Claude steering (step 3): one change per row, applied alone to an EXPORT of the branch
 (never a working tree), the steering tests run first and, only if they did not catch it, the wider tests; the file
-restored after each. The rows are review rounds 2 to 8's (DESIGN_NOTES "Mid-turn steering, step 3", each round's
+restored after each. The rows are review rounds 2 to 9's (DESIGN_NOTES "Mid-turn steering, step 3", each round's
 "Mutation check"): each is (file, name, the exact text, what replaces it); a row whose text is no longer there once
 is reported STALE.
 
@@ -14,7 +14,8 @@ import sys
 from pathlib import Path
 
 FILES = {"A": "agent_comms/providers/claude.py", "H": "agent_comms/session_host.py", "ST": "agent_comms/hosted_steer.py",
-         "HS": "agent_comms/hosted.py", "NS": "agent_comms/node_sessions.py", "API": "agent_comms/api.py"}
+         "HS": "agent_comms/hosted.py", "NS": "agent_comms/node_sessions.py", "API": "agent_comms/api.py",
+         "G": "agent_comms/node_groups.py", "D": "agent_comms/dispatch.py"}
 ROWS = [('A', "F init naming S in N's bracket is a contradiction", '                if names_s:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")', '                if False:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")'),
     ('A', "F S's init: no origin", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and scalar is None'),
     ('A', "F S's init: no scalar", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and quiet'),
@@ -68,7 +69,6 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('H', 'M the incarnation tag', '        return [e for e, g in zip(self, self._gens) if g is None or g == self._gen(e)]', '        return [e for e, g in zip(self, self._gens)]'),
     ('H', 'M ended despite a raising stop', '        try:\n            self._stop_from(s, now, at_signal)\n        finally:\n            # (Review round 3, ruling M)', '        if True:\n            self._stop_from(s, now, at_signal)\n        if True:\n            # (Review round 3, ruling M)'),
     ('H', 'M the held end before its log line', '        out.append(dataclasses.replace(held.end, steer=dict(steer)))\n        out.extend(held.after)      # (ruling M', '        log.info("session %s: the steer into message %s: %s (%s)", s.session_id, held.end.message_id,\n                 steer["outcome"], steer["why"])\n        out.append(dataclasses.replace(held.end, steer=dict(steer)))\n        out.extend(held.after)      # (ruling M'),
-    ('H', 'N the held timeout through the cutoff stop', '        if live or s.held is not None:\n            self._cutoff_stop(s, detail, now, out)', '        if False:\n            self._cutoff_stop(s, detail, now, out)'),
     ('H', 'N stop_turns per session', '                    try:        # (ruling N) one session\'s fault never skips the others\n                        self._fail(s, detail[:300], out)\n                        self._stop(s, now)\n                    except Exception:\n                        log.exception("session %s: could not stop its turn", s.session_id)', '                    self._fail(s, detail[:300], out)\n                    self._stop(s, now)'),
     ('H', 'N stop_all per session', '                try:        # (ruling N) one session\'s fault never skips the others\n                    self._fail(s, "the session host shut down", out)\n                    self._stop(s, now)\n                except Exception:\n                    log.exception("session %s: could not stop it at shutdown", s.session_id)', '                self._fail(s, "the session host shut down", out)\n                self._stop(s, now)'),
     ('H', 'N the watchdog publishes a due fence', '                    if s.held is not None:\n                        self._hold_deadline(s, self.clock(), out)', '                    if False:\n                        self._hold_deadline(s, self.clock(), out)'),
@@ -98,8 +98,6 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('NS', "U the entry's own generation", ' and s.gen == entry.gen\n', '\n'),
     ('H', 'T a close, a fatal frame, a host error claimed', '        if self._steering(s):\n            # (ruling T) a close, a fatal frame', '        if False:\n            # (ruling T) a close, a fatal frame'),
     ('H', 'T a cancel claimed', '            if self._steering(s):\n                # (ruling T) a steering session: the claim', '            if False:\n                # (ruling T) a steering session: the claim'),
-    ('H', "T the interrupted timeout's cutoff", '                if self._steering(s):\n                    self._cutoff_stop(s, self._timeout_detail(), now, out)      # (ruling T)', '                if False:\n                    self._cutoff_stop(s, self._timeout_detail(), now, out)      # (ruling T)'),
-    ('H', "T the broken pipe's cutoff", '            elif self._steering(s):\n                self._cutoff_stop(s, detail, now, out)', '            elif False:\n                self._cutoff_stop(s, detail, now, out)'),
     ('H', 'T a reap with survivors claimed', '                if self._steering(s):\n                    if not self._claim(s, lambda: self._went_by_itself', '                if False:\n                    if not self._claim(s, lambda: self._went_by_itself'),
     ('H', "T no save on the watchdog's cut", "        if self._defer_save:\n            self._save_due = True       # (ruling T) the watchdog's boundary persists nothing", "        if False:\n            self._save_due = True       # (ruling T) the watchdog's boundary persists nothing"),
     ('A', "Q7 any init clears rule 10's marker first", '            self._s_init_last = False\n        named = _named(ev)', '            pass\n        named = _named(ev)'),
@@ -141,11 +139,22 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('H', 'R7-3 the dropped lines counted', '            if len(_WATCH_LINES) == _WATCH_LINES.maxlen:\n                _WATCH_DROPPED[0] += 1', '            if False:\n                _WATCH_DROPPED[0] += 1'),
     ('H', "T stop_all's final save in a finally (re-anchored)", '        finally:\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)\n            self._save_state()\n        return self._take_outbox()', '        finally:\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)\n        self._save_state()\n        return self._take_outbox()'),
     ('H', 'R7-2 the final save made with logging restored', '        finally:\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)\n            self._save_state()', '        finally:\n            self._save_state()\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)'),
-    ('H', 'C1 the checkout reserved before the claim', '                if s.child is None or s.group_token is None or not self.groups.try_stopping(s.group_token):\n                    return False', '                pass'),
-    ('H', 'C1 registry busy: nothing changes', '                if s.child is None or s.group_token is None or not self.groups.try_stopping(s.group_token):\n                    return False', '                if s.child is None or s.group_token is None or not self.groups.try_stopping(s.group_token):\n                    pass'),
     ('H', "C1 the same code in the loop's tick", '            self._cutoff_stop(s, why, now, out, reserve=True)', '            self._cutoff_stop(s, why, now, out, reserve=not drain)'),
-    ('H', 'C1 a failed SIGTERM starts no kill clock', '                    except BaseException:\n                        s.stopping_since = None     # (round 8, ruling C1) a SIGTERM that failed starts no kill clock\n                        raise', '                    except BaseException:\n                        raise'),
-    ('H', 'T the claim checks the latch (re-anchored)', '            if self.steer_stopped or (s.steer is not None and s.steer.stopping):\n                return False\n            if reserve:', '            if reserve:')]
+    ('H', 'T the claim checks the latch (re-anchored)', '            if self.steer_stopped or (s.steer is not None and s.steer.stopping):\n                return False\n            if reserve:', '            if reserve:'),
+    ('H', "D1 a raising SIGTERM keeps main's clock", '                s.child.terminate()\n\n    def _release_steer', '                try:\n                    s.child.terminate()\n                except BaseException:\n                    s.stopping_since = None\n                    raise\n\n    def _release_steer'),
+    ('H', "D2 the held turn's own timeout reserves without waiting", '            self._cutoff_stop(s, detail, now, out, reserve=True)\n            return', '            self._cutoff_stop(s, detail, now, out, reserve=False)\n            return'),
+    ('H', 'E2 a registry miss is not a refusal', '                if got == self.groups.BUSY:\n', '                if got in (self.groups.BUSY, self.groups.MISSING):\n'),
+    ('H', "E1 only the attempt's own reservation undone", '                if got == self.groups.RESERVED:\n', '                if got in (self.groups.RESERVED, self.groups.ALREADY):\n'),
+    ('H', "E1 the attempt's reservation undone", '                    self.groups.unreserve(s.group_token)\n', '                    pass\n'),
+    ('G', 'D3 a barrier there before is ALREADY', '                    if groups[token][0] == self.STOPPING:\n                        return self.ALREADY\n', ''),
+    ('A', 'F the adapter steers only with the switch on', '        return (obj.steering_on and obj.verified', '        return (obj.verified'),
+    ('H', 'F the host sets the switch on each adapter', '            s.provider.steering_on = self.claude_steer()', '            s.provider.steering_on = True'),
+    ('H', 'F the one place a hold is made asks the switch', '            if steer is HOLD and not self.claude_steer():', '            if False:'),
+    ('D', 'F off by default', '    claude_steer: bool = False', '    claude_steer: bool = True'),
+    ('H', 'C1 the checkout reserved before the claim (re-anchored)', '                got = self.groups.try_stopping(s.group_token)\n                if got == self.groups.BUSY:\n                    return False', '                got = None'),
+    ('H', 'C1 registry busy: no stop committed (re-anchored)', '                if got == self.groups.BUSY:\n                    return False', '                if got == self.groups.BUSY:\n                    pass'),
+    ('H', "T the interrupted timeout's cutoff (re-anchored)", '                if self._steering(s):\n                    # (ruling T; round 9, ruling D2', '                if False:\n                    # (ruling T; round 9, ruling D2'),
+    ('H', "T the broken pipe's cutoff (re-anchored)", '            elif self._steering(s):\n                # (ruling T: nothing after the latch. Round 9', '            elif False:\n                # (ruling T: nothing after the latch. Round 9')]
 FIRST = ["tests/test_claude_steering.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_session_restart.py",
         "tests/test_session_restart_hub.py", "tests/test_structured_results.py", "tests/test_hosted_sessions.py",

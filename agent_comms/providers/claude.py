@@ -428,8 +428,10 @@ class _Steers:
     def __get__(self, obj, owner=None) -> bool:
         if obj is None:
             return False
-        # (Ruling Q6) at RETIRED_MAX it takes no more steers, so it no longer says it does
-        return obj.verified and obj._steer_mode is not None and len(obj._retired) < RETIRED_MAX
+        # (Ruling Q6) at RETIRED_MAX it takes no more steers, so it no longer says it does. (Review round 9, ruling
+        # F) and only with Claude steering switched on for this node (`steering_on`, set by the host from its config)
+        return (obj.steering_on and obj.verified and obj._steer_mode is not None
+                and len(obj._retired) < RETIRED_MAX)
 
 
 class ClaudeSession:
@@ -437,6 +439,9 @@ class ClaudeSession:
     verifies_mode = True        # ... and says what the turn really runs with: the host's kill switch reads it
 
     steers = _Steers()
+    # (Review round 9, ruling F) Claude steering is off unless the host's config turns it on (`[dispatch.sessions]
+    # claude_steer = true`): the host sets this on each session's adapter; the class's own word is off
+    steering_on = False
     # (Review round 2, ruling J) The capability the hub records with a steer's attempt: this adapter holds N's end
     # and may run S as a turn of its own (`held` among a session's modes). Exactly when it steers.
     holds = _Steers()

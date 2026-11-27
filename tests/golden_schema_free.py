@@ -53,12 +53,15 @@ def _fields(e) -> dict:
     return d
 
 
-def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = False, version=None) -> dict:
+def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = False, version=None,
+           claude_steer: bool = False) -> dict:
     """`verified`: the Claude adapter's VERIFIED for this run (set on main's adapter too, which has no use for it).
     `allow`: take the allowance out of the raw stdin and transcripts before anything is normalized (`allowed`).
     `named`: take out what mid-turn steering's step 2 names for a run with no steer (`step2_named`), likewise.
     `version`: the Claude Code version every Claude process's `init` reports (step 3's parity: see the module text);
-    None: as before (the sequences report OTHER_VERSION, every other process none)."""
+    None: as before (the sequences report OTHER_VERSION, every other process none).
+    `claude_steer`: Claude steering switched ON for this run (review round 9, ruling F: it ships off, the node's
+    `[dispatch.sessions] claude_steer`); off, as shipped."""
     import logging
     import test_hosted_tree
     from agent_comms.providers import claude
@@ -71,6 +74,11 @@ def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = Fal
     real_hex, real_uuid4 = secrets.token_hex, uuid.uuid4
     secrets.token_hex = lambda n=32: format(next(counter), "x").rjust(2 * n, "0")[-2 * n:]
     uuid.uuid4 = lambda: uuid.UUID(int=next(counter))
+    from agent_comms.session_host import SessionHost
+    real_switch, real_on = SessionHost.claude_steer, claude.ClaudeSession.steering_on
+    if claude_steer:
+        SessionHost.claude_steer = lambda self: True
+        claude.ClaudeSession.steering_on = True
     had, before = hasattr(claude, "VERIFIED"), getattr(claude, "VERIFIED", None)
     if verified is not None:
         claude.VERIFIED = frozenset(verified)
@@ -91,6 +99,7 @@ def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = Fal
         board.setLevel(level)
         secrets.token_hex, uuid.uuid4 = real_hex, real_uuid4
         test_hosted_tree.began, VERSION = real_began, OTHER_VERSION
+        SessionHost.claude_steer, claude.ClaudeSession.steering_on = real_switch, real_on
         if had:
             claude.VERIFIED = before
         elif hasattr(claude, "VERIFIED"):

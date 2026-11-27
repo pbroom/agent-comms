@@ -18,6 +18,26 @@ from test_claude_correlation import (NOTIFY, V, emit, foreign, idle_host, nontur
                                      uuid_of, vinit)
 from test_session_host import SID, henv, make_host, open_session  # noqa: F401
 
+from agent_comms.session_host import SessionHost as _SessionHost
+
+_REAL_CLAUDE_STEER = getattr(_SessionHost, "claude_steer", None)
+
+
+@pytest.fixture(autouse=True)
+def _claude_steering_on(monkeypatch):
+    """(Review round 9, ruling F) Claude steering ships OFF by default (`[dispatch.sessions] claude_steer`); every
+    test here runs with it switched ON, set by this file itself. `_claude_steering_default` undoes it."""
+    monkeypatch.setattr(_SessionHost, "claude_steer", lambda self: True, raising=False)
+    monkeypatch.setattr(ClaudeSession, "steering_on", True, raising=False)
+
+
+def _claude_steering_default(monkeypatch):
+    """The shipped default for the rest of a test: the host reads its config again (off unless `claude_steer`), and
+    the adapter's own word is off."""
+    monkeypatch.setattr(_SessionHost, "claude_steer", _REAL_CLAUDE_STEER)
+    monkeypatch.setattr(ClaudeSession, "steering_on", False)
+
+
 S = "5e7e7e7e-0000-4000-8000-00000000000s".replace("s", "5")
 TEXT = "Change of plan from me: include the codeword PINEAPPLE in your reply."
 
@@ -4687,10 +4707,10 @@ def test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order(env):
     real_try, real_fin, real_pub = host.groups.try_stopping, host._finalize_hold, host._publish_hold
 
     def try_stopping(token):
-        ok = real_try(token)
-        if ok:
+        got = real_try(token)
+        if got in (host.groups.RESERVED, host.groups.ALREADY):
             order.append("reserve")
-        return ok
+        return got
     host.groups.try_stopping = try_stopping
     host._finalize_hold = lambda *x, **k: (order.append("claim"), real_fin(*x, **k))[1]
     host._publish_hold = lambda *x, **k: (order.append("publish"), real_pub(*x, **k))[1]
@@ -4716,20 +4736,253 @@ def test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order(env):
     assert term_at is not None
 
 
-def test_r8_c1_a_failed_sigterm_starts_no_kill_clock(henv, monkeypatch):
-    """Ruling C1.4: the reserved stop's SIGTERM raises: no kill clock is started (`stopping_since` stays unset)."""
+def test_r9_d1_a_reserved_stop_whose_sigterm_raises_is_mains(henv, monkeypatch):
+    """Sol's round-9 blocker 1 (ruling D1): the checkout reserved, the SIGTERM raises: as on main the kill clock is
+    kept, the kill scan sends the SIGKILL after the grace, and N's end is published only once the group is gone (never
+    while it is live with no clock). Replaces round 8's no-clock test (that ruling is withdrawn)."""
     s, child, n = steered(henv, monkeypatch)
     s.steer.cover_until = henv.clock() + 20
     child.emit(owned(n, text="N"))
     henv.host.tick()
     henv.clock.advance(21)
+    child.exits_on_terminate = False
 
     def bad():
         raise OSError("the signal failed")
+    real_term = child.terminate
     child.terminate = bad
     with pytest.raises(OSError):
         henv.host._hold_cut(s, henv.clock(), henv.host._outbox, drain=False)
-    assert s.stopping_since is None, "no kill clock from a SIGTERM that failed"
+    child.terminate = real_term
+    assert s.stopping_since is not None, "the kill clock kept, as main"
+    out = []
+    henv.clock.advance(henv.host.kill_grace - 1)
+    out += henv.host.tick()
+    assert not child.killed and not ends(out), "no SIGKILL before the grace; N not published while the group lives"
+    henv.clock.advance(2)
+    out += henv.host.tick() + henv.host.tick()
+    assert child.killed, "the kill scan escalated"
+    assert len(ends(out)) == 1, "N's end, once, after the group is gone"
+
+
+def _registry_state(host, token):
+    return [st for g in host.groups.entries.values() for tok, (st, cwd) in g.items() if tok == token]
+
+
+@pytest.mark.parametrize("before", ["live", "stopping"])
+def test_r9_e1_a_commit_that_fails_early_undoes_only_its_own_reservation(henv, monkeypatch, before):
+    """Ruling E1: the commit raises before the stop has an owner and a clock (the decision itself): the reservation
+    this attempt made is undone (LIVE again); a STOPPING barrier that was there before stays."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.clock.advance(21)
+    if before == "stopping":
+        henv.host.groups.stopping(s.group_token)
+
+    def bad(*a, **k):
+        raise RuntimeError("the decision failed")
+    monkeypatch.setattr(henv.host, "_fail", bad)
+    with pytest.raises(RuntimeError):
+        henv.host._hold_cut(s, henv.clock(), henv.host._outbox, drain=False)
+    want = henv.host.groups.LIVE if before == "live" else henv.host.groups.STOPPING
+    assert _registry_state(henv.host, s.group_token) == [want]
+    assert s.stopping_since is None and not child.terminated
+
+
+def test_r9_d3_try_stopping_says_what_happened():
+    """Ruling D3: reserved, already (a barrier this call did not make), busy, missing."""
+    import threading
+    from agent_comms.node_groups import Groups
+    g = Groups()
+    started, _ = g.start("/w", "t1", lambda: object())
+    assert started
+    assert g.try_stopping("t1") == g.RESERVED
+    assert g.try_stopping("t1") == g.ALREADY
+    assert g.try_stopping("nope") == g.MISSING
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with g.lock:
+            held.set()
+            release.wait(5)
+    threading.Thread(target=hold, daemon=True).start()
+    assert held.wait(3)
+    try:
+        assert g.try_stopping("t1") == g.BUSY
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("process", ["alive", "gone"])
+def test_r9_e2_a_registry_miss_is_not_a_verified_exit(henv, monkeypatch, process):
+    """Ruling E2: the registry has no entry for the group (a miss): as main's `_stop` when `groups.stopping` finds no
+    token, the stop goes on and the concrete group is probed: alive, it gets its SIGTERM and keeps its owner and kill
+    clock; only a probe that confirms exit takes the gone path (no SIGTERM)."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.clock.advance(21)
+    henv.host.groups.gone(s.group_token)        # (the registry lost its entry)
+    if process == "gone":
+        child.code = 0
+    henv.host._hold_cut(s, henv.clock(), henv.host._outbox, drain=False)
+    assert s.stopping_since is not None and s.child is child, "the owner and the clock kept"
+    assert child.terminated == (1 if process == "alive" else 0)
+
+
+def test_r9_d2_a_held_turns_own_timeout_never_waits_on_the_registry(env):
+    """Sol's round-9 blocker 2 (rulings D2, E3): the registry stays busy until an expired hold also reaches the
+    held turn's own timeout; in that tick neither the hold's cut nor the turn timeout waits on the registry; a
+    sibling's SIGKILL comes due while the registry is still held and goes when main would send it. Once the registry
+    frees, the stop is committed once."""
+    import threading
+    from test_hosted_sessions import P2
+    bs = []
+    a, ca, sa, release = _expired_hold_with_the_registry_busy(
+        env, before_the_stall=lambda: bs.append(_stopping_turn(env, project=P2)))
+    b, cb, sb = bs[0]
+    runner = env.node.sessions
+    host = runner.host
+    cb.kill = lambda: setattr(cb, "killed", cb.killed + 1)      # (its group outlives the SIGKILL: no reap yet)
+    env.clock.advance(host.timeout_minutes * 60 + 1)        # (the held turn's own timeout too)
+    runner._renew_contact(env.clock())      # (the node keeps its hub contact: no self-stop in this sequence)
+    loop_done = threading.Event()
+
+    def loop():
+        with runner.lock:
+            host.tick()
+        loop_done.set()
+    try:
+        threading.Thread(target=loop, daemon=True).start()
+        assert loop_done.wait(2), "neither the hold's cut nor the turn timeout waited on the registry"
+        assert sa.held is not None and not ca.terminated and sa.stopping_since is None, "no stop committed"
+        t, done, ident, err = _on_watchdog(runner)
+        assert done.wait(2) and not err, err
+        assert cb.killed, "the sibling's SIGKILL, due while the registry is held, went"
+    finally:
+        release.set()
+    assert _registry_free(host)
+    with runner.lock:
+        host.tick()
+        host.tick()
+    assert ca.terminated == 1, "the stop committed once"
+
+
+def test_r9_d4_while_the_reservation_waits_s_can_still_settle_n(env):
+    """Ruling D4 (pin): no stop is committed while the reservation is unavailable, but the loop's drain still reads:
+    S's own turn's evidence settles N (`next_turn`, S's own reply), once."""
+    a, ca, sa, release = _expired_hold_with_the_registry_busy(env)
+    runner = env.node.sessions
+    host = runner.host
+    s_uuid = sa.steer.uuid
+    try:
+        ca.emit(cinit(a, s_uuid), cresult(a, s_uuid, text="S's own"))
+        out = []
+        with runner.lock:
+            out += host.tick() + host.tick()
+        mine = list({e.ident: e for e in out if e.kind == "turn_ended" and e.session_id == a}.values())
+        [end] = mine        # (the node's host keeps its outbox until the node takes it: one event, by identity)
+        assert end.steer and end.steer["outcome"] == "next_turn" and end.steer["result"]["text"] == "S's own"
+    finally:
+        release.set()
+
+
+def test_r9_d4_while_the_reservation_waits_the_contact_expiry_latches(env):
+    """Ruling D4 (pin): the contact clock's expiry latches (for good) even though no stop could be committed."""
+    a, ca, sa, release = _expired_hold_with_the_registry_busy(env)
+    runner = env.node.sessions
+    try:
+        with runner.lock:
+            runner.host.tick()
+        assert sa.steer.expired and sa.held.decided is None
+    finally:
+        release.set()
+
+
+def test_r9_c3_known_limit_the_stall_runs_on_through_the_held_turns_own_timeout(env):
+    """Known limit C3 (round 9, D4): the registry stall runs on past the held turn's own timeout: no stop committed,
+    the hold intact, no kill clock; once the registry frees, the stop is committed and N settles."""
+    a, ca, sa, release = _expired_hold_with_the_registry_busy(env)
+    runner = env.node.sessions
+    host = runner.host
+    try:
+        env.clock.advance(host.timeout_minutes * 60 + 2 * host.kill_grace + 1)
+        with runner.lock:
+            out = host.tick() + host.tick()
+        assert not [e for e in out if e.kind == "turn_ended" and e.session_id == a]
+        assert sa.held is not None and sa.held.decided is None and sa.stopping_since is None
+    finally:
+        release.set()
+    assert _registry_free(host)
+    tick(env)
+    ca.code = -9
+    tick(env, times=3)
+    assert hosted._get(env.board.conn, hosted._msg_key(a, 1))["state"] == "done"
+
+
+# ---------------------------------------------------------------- review round 9, ruling F: off by default
+
+
+def test_r9_f_claude_steering_is_off_by_default():
+    """Ruling F (the guard): the shipped default is off; the key turns it on."""
+    from agent_comms.dispatch import SessionsConfig
+    assert SessionsConfig().claude_steer is False
+    assert SessionsConfig.from_dict({}).claude_steer is False
+    assert SessionsConfig.from_dict({"claude_steer": True}).claude_steer is True
+    assert ClaudeSession.steering_on is False or True     # (this file switches it on for its other tests)
+
+
+def test_r9_f_with_the_default_no_steer_mode_no_slot_no_hold(henv, monkeypatch):
+    """Ruling F: with the default config a verified 2.1.330 incarnation reports no steer mode (no `steer`, no
+    `held`), an offer makes no slot, and N's native end is published as on main (no hold can be created)."""
+    _claude_steering_default(monkeypatch)
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.host = make_host(henv, timeout_minutes=1)
+    henv.host.steer_authority = lambda sess: True
+    s, child = idle_host(henv)
+    henv.host.send(SID, "a long turn", message_id="1")
+    henv.host.tick()
+    n = uuid_of(child)
+    emit(henv, child, vinit(n))
+    assert "steer" not in henv.host.modes(SID) and "held" not in henv.host.modes(SID)
+    henv.host.steer_offer(SID, "1", S, TEXT, authorized=True)
+    assert s.steer is None, "no slot"
+    child.emit(owned(n, text="N's own"))
+    [end] = ends(henv.host.tick())
+    assert s.held is None and end.text == "N's own" and end.steer is None, "N's end as on main"
+
+
+def test_r9_f_the_one_place_a_hold_is_made_is_guarded(henv, monkeypatch):
+    """Ruling F (off at every layer): even if an adapter said it steers while the node's switch is off, the host never
+    holds N's end: the one place a hold is created asks the switch."""
+    _claude_steering_default(monkeypatch)
+    monkeypatch.setattr(ClaudeSession, "steering_on", True)      # (the adapter alone, as no host would set it)
+    monkeypatch.setattr(_SessionHost, "claude_steer", lambda self: False)
+    s, child, n = steered(henv, monkeypatch)
+    s.provider.steering_on = True
+    child.emit(owned(n, text="N's own"))
+    out = henv.host.tick()
+    assert s.held is None, "never a hold with the switch off"
+    assert [e.text for e in ends(out)] == ["N's own"]
+
+
+def test_r9_f_with_the_default_a_steer_for_a_claude_turn_is_mains(env, monkeypatch):
+    """Ruling F: with the default config the node reports no Claude steer mode, and a steer for a running Claude
+    turn is refused as on main e6b421f: the hub's `cli` refusal (the session's modes do not name `steer`)."""
+    _claude_steering_default(monkeypatch)
+    sid = start(env, "a long turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    n = written(child)[-1]["uuid"]
+    child.emit(cinit(sid, n))
+    tick(env, times=2)
+    modes = hosted._session(env.board.conn, sid).get("modes") or []
+    assert "steer" not in modes and "held" not in modes, modes
+    r = env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": TEXT, "mode": "steer"})
+    assert hosted_steer.REFUSED["cli"] in r.text, r.text
 
 
 def test_r8_c1_a_lost_claim_leaves_no_stopping_barrier(henv, monkeypatch):

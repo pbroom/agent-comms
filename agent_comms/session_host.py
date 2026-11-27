@@ -982,6 +982,10 @@ class SessionHost:
                     thread_id=int(thread_id), resume=bool(resume), asked=access, access=label, effort=effort,
                     seal=seal, bind=bind)
         s.gen = next(self._gens)
+        if hasattr(s.provider, "steering_on"):
+            # (Review round 9, ruling F) Claude steering only with `[dispatch.sessions] claude_steer = true`: off, the
+            # adapter says it steers nothing, so no Claude steer mode is reported and no offer is taken
+            s.provider.steering_on = self.claude_steer()
         runs_in = getattr(s.provider, "runs_in", None)
         if runs_in is not None:
             runs_in(cwd)        # a child's own worktree when it has one: the process, and so the thread, works there
@@ -1338,6 +1342,11 @@ class SessionHost:
         s = self.sessions.get(session_id)
         return s is not None and getattr(s.provider, "steer_named", None) is not None
 
+    def claude_steer(self) -> bool:
+        """(Review round 9, ruling F) `[dispatch.sessions] claude_steer`, read on the node: Claude steering, off by
+        default in this PR (the machinery ships dark; Codex steering is unaffected)."""
+        return bool(getattr(getattr(self.config, "sessions", None), "claude_steer", False))
+
     def modes(self, session_id: str) -> tuple[str, ...]:
         """What this session's LIVE process can do with a turn in flight (providers.MODES), as its adapter says now
         (Claude: what this process's `init` said). Nothing while it has no process, or one going down."""
@@ -1638,6 +1647,8 @@ class SessionHost:
                             answered=bool(ev.answered),     # the adapter's word: the provider took the turn
                             restarted_by=s.restart_by if by_restart else None)
             steer = self._steer_end(s, msg.id, native=bool(ev.answered), evidence=ev.steer)
+            if steer is HOLD and not self.claude_steer():
+                steer = None        # (round 9, ruling F) Claude steering off: never a hold (unreachable: no steer)
             if steer is HOLD:
                 s.in_flight = msg       # held: N stays in flight here until its end is published
                 self._hold(s, end, now, out)
@@ -1862,7 +1873,8 @@ class SessionHost:
                     if s.in_flight is None and s.writing is None:
                         return
                 if self._steering(s):
-                    self._cutoff_stop(s, self._timeout_detail(), now, out)      # (ruling T)
+                    # (ruling T; round 9, ruling D2: the reservation without waiting, as the expired hold's cut)
+                    self._cutoff_stop(s, self._timeout_detail(), now, out, reserve=True)
                     return
                 self._fail(s, self._timeout_detail(), out)
                 self._stop_from(s, now, live)
@@ -1902,7 +1914,9 @@ class SessionHost:
         else:
             detail = self._timeout_detail()
         if live or s.held is not None:
-            self._cutoff_stop(s, detail, now, out)      # (ruling N: the held timeout too; nothing after the latch)
+            # (ruling N: the held timeout too; nothing after the latch. Review round 9, ruling D2: the reservation
+            # without waiting, as the expired hold's cut: registry busy, no stop is committed, tried next tick)
+            self._cutoff_stop(s, detail, now, out, reserve=True)
             return
         self._fail(s, detail, out)
         self._stop_from(s, now, live)
@@ -2134,6 +2148,10 @@ class SessionHost:
         Nothing about the dating is stored or inferred from a slot or a past drain."""
         if s.child is not None and s.stopping_since is None:
             s.stopping_since = now
+            # (Review round 9, ruling D1) `reserved`: the claim already marked the group STOPPING without waiting
+            # (`_claim`); that is the one difference from main's `_stop`. Everything after it is main's code, so a
+            # failure after it (a SIGTERM that raises) is main's, in main's form: the kill clock stays and the kill scan
+            # escalates to SIGKILL after the grace.
             if not reserved:
                 self.groups.stopping(s.group_token)     # from now on nothing starts in its directory until it is gone
             # The whole process group (PopenChild). Not once all of it is known to be gone (a caller may have
@@ -2143,13 +2161,6 @@ class SessionHost:
                     s.stopping_since = self.clock()
                 if s.held is not None and s.held.fenced_at is not None:
                     s.held.fenced_at = self.clock()     # (shoulds) the bounded publication counts from the SIGTERM
-                if reserved:
-                    try:
-                        s.child.terminate()
-                    except BaseException:
-                        s.stopping_since = None     # (round 8, ruling C1) a SIGTERM that failed starts no kill clock
-                        raise
-                    return
                 s.child.terminate()
 
     def _release_steer(self, s: Session) -> None:
@@ -2712,11 +2723,25 @@ class SessionHost:
                 # claim, no fence, no publication, no SIGTERM, no kill clock: the hold stays as a hold before its
                 # deadline, and the next pass or tick tries again. Lock order: this cutoff lock, then the registry's
                 # non-blocking attempt; nothing that holds the registry waits for this lock, so no deadlock.
-                if s.child is None or s.group_token is None or not self.groups.try_stopping(s.group_token):
+                # (Round 9, ruling E2) MISSING, a registry miss, is not a verified exit: as main's `_stop` when
+                # `groups.stopping` finds no token, the stop goes on and `_stop` probes the concrete group (the gone
+                # path only when the probe confirms exit). ALREADY: a barrier that was there before (not ours).
+                if s.child is None or s.group_token is None:
                     return False
+                got = self.groups.try_stopping(s.group_token)
+                if got == self.groups.BUSY:
+                    return False
+            else:
+                got = None
             self._defer_logs, self._claimer = [], threading.get_ident()
             try:
                 decide()
+            except BaseException:
+                # (Round 9, ruling E1) the commit failed before the stop had an owner and a kill clock: only the
+                # reservation THIS attempt made is undone; a STOPPING barrier that was there before stays
+                if got == self.groups.RESERVED:
+                    self.groups.unreserve(s.group_token)
+                raise
             finally:
                 logs, self._defer_logs, self._claimer = self._defer_logs, None, None
         for level, msg, args in logs:
@@ -2730,7 +2755,7 @@ class SessionHost:
         else:
             log.log(level, msg, *args)
 
-    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent], reserve: bool = False) -> bool:
+    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent], *, reserve: bool) -> bool:
         """THE single-session stop of a session holding a live steer attempt or a held end (review round 3, ruling N;
         callers: `_hold_cut`, and the turn timeout `_hold_to_timeout`, the held one included). The decision and the
         fence are made under the cutoff lock; after the global latch it does nothing (the stop of every turn is the
@@ -2913,7 +2938,9 @@ class SessionHost:
             if (s.provider.waits_for_ready and not s.ready) or s.checking:
                 self._fail_start(s, detail, out)
             elif self._steering(s):
-                self._cutoff_stop(s, detail, now, out)      # (ruling T: nothing after the latch)
+                # (ruling T: nothing after the latch. Round 9, ruling E4: listed in the notes, not changed here: this
+                # cut keeps the registry's blocking wait, as main's own write-failure stop does)
+                self._cutoff_stop(s, detail, now, out, reserve=False)
                 return
             else:
                 self._fail(s, detail, out)
