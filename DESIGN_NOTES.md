@@ -16104,3 +16104,217 @@ Machine load averages were 5.3 to 5.5 throughout.
   - Stand-ins, all PASS: steer 27, steering 115, correlation 24, structured 36, tree 143; the full stand-in e2e 395.
   - The full suite: 5277 passed, 10 skipped, in 11 min 37 s. Its stand-in e2e test passed.
   - The `~/.codex/config.toml` hash was 18fcebe0d94018f8 before, after each real run and at the end.
+
+## Enabling Claude steering
+
+Step 3 merged dark as #118 (main 256c3e6). This PR closes what has to be closed before the switch goes on, then flips
+the default: `[dispatch.sessions] claude_steer` is now true, and `claude_steer = false` turns it off. The structure was
+checked by Sol before the build (rulings S1 to S5).
+
+Three rules from rounds 6 to 11 apply to every item:
+- no new state where an existing one will do;
+- one decision point, never a choice per call site;
+- where main has code for the situation, main's code runs, by identity.
+
+The tests are in tests/test_claude_steering_enable.py, plus changes to tests/test_claude_steering.py,
+tests/test_steering_off_tripwire.py and tests/golden_schema_free.py.
+
+### S1. The stop's cause decides, in the one predicate (the host)
+
+- **Owner.** `SessionHost._reserves(s, cause)`, THE predicate of the stop's path. It reads the cause and the session's
+  recorded steering state. The causes are the module's `CAUSE_*` constants. Callers pass a cause and none chooses the
+  path.
+- **When it is true.** Only for a stop main e6b421f would NOT perform in that state, with Claude steering on for the
+  node and the adapter a Claude one it was copied onto (`steering_on`):
+  - `CAUSE_HOLD_CUT`, `CAUSE_TIMEOUT` or `CAUSE_CANCEL` with a held end (`s.held`);
+  - `CAUSE_STEER_BYTES` for a Claude attempt (`slot.holds`, recorded at the offer; H2 of round 10).
+- **When it is false.** Every other cause and state. With the switch off it is false for every session, and for a
+  Codex session it is false with the switch on too.
+- **The paths.**
+  - True: `_reserved_stop`, which never waits on the registry (S2).
+  - False: main's path. `_cutoff_stop` fails the turn and stops it (`_fail`, `_stop_from`, with main's registry wait
+    inside `_stop`). For a steering session that is claimed first under the cutoff lock, as on every other of main's
+    routes (ruling T: after the latch the bulk stop owns it; the decision's log lines are deferred). For any other
+    session it is exactly main's two calls.
+- **Callers.**
+  - `_hold_cut` (hold cut);
+  - `_hold_to_timeout`, both branches (timeout);
+  - `_write`'s broken pipe: steer bytes when the write that failed held the steer frame, an ordinary write otherwise;
+  - `_steer_cut` (steer bytes);
+  - `cancel` (cancel).
+- **What changed against #118.**
+  - A live attempt's own turn timeout before N's native end, and a broken pipe while writing an ordinary reply, are
+    now main's path. #118 reserved for every Claude attempt.
+  - A partial-write cut and a cancel of held N are now reserved. In #118 they took main's wait.
+
+**The routes** (cause; does main e6b421f perform this stop in this state; the path taken; the test). Every test runs
+with the registry held by another thread and a sibling's SIGKILL due.
+- `test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[...]`: the pass does not wait; the sibling's
+  KILL goes in it; nothing of A is committed or changed; the retry commits once.
+- `test_s1_a_stop_main_also_performs_is_mains_with_its_registry_wait[...]`: the stop waits for the registry, as on main;
+  it commits once the registry lets go; the sibling's KILL goes in the pass after, as on main.
+
+| Route | Cause | Main has it here? | Path | Test id |
+| --- | --- | --- | --- | --- |
+| The hold's deadline cut (contact, authority, `lost`) | hold_cut | no: main settled N at its native end | reserved | `r_hold_cut` |
+| The held turn's own timeout | timeout + held | no: the same | reserved | `r_held_timeout` |
+| A partial write of the steer frame, cut | steer_bytes | no: main writes no steer | reserved | `r_partial_write` |
+| A broken pipe while writing the steer frame | steer_bytes | no: the same | reserved | `r_steer_pipe` |
+| A cancel of held N after its native end | cancel + held | no: main had settled N; no cancel-and-signal there | reserved | `r_cancel_held` |
+| An explicit close (live attempt) | (`_end`) | yes | main's (claimed) | `m_close_live` |
+| An explicit close (held end) | (`_end`) | yes | main's (claimed) | `m_close_held` |
+| A fatal error | (`_end`) | yes | main's (claimed) | `m_fatal` |
+| A host error | (`_end`) | yes | main's (claimed) | `m_host_error` |
+| The reap of a dead leader with survivors | (`_reap`) | yes | main's (claimed) | `m_reap_survivors` |
+| Parking an idle session | (`park`) | yes | main's | `m_park` |
+| A cancel before N's native end | cancel, no hold | yes | main's (claimed) | `m_cancel_live` |
+| A broken pipe while writing an ordinary reply | write | yes | main's (claimed) | `m_reply_pipe` |
+| A live attempt's turn timeout, before N's native end | timeout, no hold | yes | main's (claimed) | `m_live_timeout` |
+
+On main's routes, steering adds only the settlement of a held end. That settlement is in memory, inside the claim, and
+never sits between the claim and main's stop. The registry wait on those routes is main's own, inherited, and is left
+for the hardening PR.
+
+**S1.4, a cancel of held N after its native end with the registry busy.**
+- **The intent is kept by an existing state.** The hub lists a message's `cancel` on every listing while the message
+  is unsettled (hosted.py: `item["cancel"] = True` for an unsettled message), so the next listing offers the cancel
+  again. N stays in flight here and the node reports nothing for it, so the hub keeps N unsettled.
+- **No session field was added.**
+- **Further steering is fenced by the held end's one slot:** any other steer is "not the held attempt".
+- **The stop is retried without waiting** by that next listing. Once committed, N is published when the group is
+  verified gone, or at the bounded deadline from the SIGTERM (`_hold_fence`).
+- **Without a hub** to list the cancel, the hold's own contact clock cuts it (`r_hold_cut`).
+
+### S2. Preparation has no side effects, and escalation comes first (the host, the registry)
+
+- **Owner.** `SessionHost._reserved_stop(s, now, commit)`, THE reserved stop.
+- **Before the cutoff lock:** the group's probe, and the checkout's registry key, made with `node_groups.key`, which
+  stats the directory.
+- **Under the cutoff lock, in order:**
+  1. The claim is confirmed available (the latch). Preparing changes nothing: the buffer, the slot, the hold and the
+     adapter are as they were.
+  2. `try_stopping` reserves the checkout without waiting.
+  3. On BUSY it returns False with everything preserved.
+  4. On a reservation, escalation is armed FIRST. That is main's `_stop` body: the kill clock and the SIGTERM, dated at
+     the signal; a raising SIGTERM keeps main's clock (D1). THEN `commit` runs: the decision, the adapter's callbacks,
+     the buffer, publication and any diagnostic. Its log lines are deferred until the lock is let go, and are replayed
+     even if `commit` raises.
+- **Partial cut.** `_steer_cut`'s reserved branch no longer clears the buffer or logs before deciding. It reads what
+  the process wrote first, and clears the buffer inside `commit`.
+- **Steer-frame broken pipe.** `_write`'s branch for it leaves the buffer as it is until `commit`.
+- **Deleted.** `Groups.unreserve`, and with it the registry wait under the cutoff and runner locks. Nothing is rolled
+  back. No log call, deferred or not, comes between the claim and armed escalation.
+- **Superseded earlier pins** (their names kept for the record, their bodies now S2's):
+  - round 3, ruling N: the SIGTERM outside the cutoff lock (`test_r3_n_...`);
+  - round 8's order: now reserve, TERM, decision, publication (`test_r8_c1_once_free_...`);
+  - round 9's E1 rollback (`test_r9_e1_...`);
+  - round 4's T+ latch between claim and signal. The latch now waits for the reserved stop's whole critical section
+    (`test_r4_t_a_stop_claimed_before_the_latch_may_signal_after_it`).
+- **Tests.**
+  - `test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[...]` compares the session's state before
+    and after the BUSY attempt: the buffer's bytes, the turn, the stop's clock, the slot, the hold, and the adapter's
+    `_attempt` and `_retired`. The contact expiry latch is set before the comparison: it is the cause, pinned by
+    round 9's D4.
+  - `test_s2_a_raising_commit_after_the_reservation_still_escalates[...]` covers every reserved route: the commit
+    raises after the reservation, the group has its SIGTERM and kill clock, and `kill_due` escalates it to SIGKILL.
+
+### S3. A live group the registry does not know gets a barrier (the host, the registry)
+
+- **Owner.** `Groups.try_stopping(token, barrier)`.
+  - **A miss with a barrier given:** the normal STOPPING entry is inserted for the token under that key (RESERVED:
+    this call made it).
+  - **Otherwise** it is as before. A verified exit (the probe says gone) gives no barrier, so it records nothing.
+- **The caller.** `_reserved_stop` gives the barrier when the probe found the group alive.
+  - It makes a token when the live child has none (`group_token is None`), and attaches it to the session only when
+    the entry was made, so the verified reap's `gone` removes exactly that entry.
+  - The key is computed before the cutoff lock. A registry that cannot be taken at once is BUSY: nothing is committed.
+  - No other registry repair. Main's own `_stop` is unchanged: on a miss it still records nothing.
+- **Tests.**
+  - `test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[kept|none]`: the barrier stands, a run's admission
+    on that checkout is refused, and the entry goes at the verified reap.
+  - `test_s3_a_lost_claim_leaves_no_entry`.
+  - `test_s3_a_verified_exit_needs_no_entry`.
+  - `test_s3_try_stopping_inserts_the_barrier_only_on_a_miss`.
+
+### S4. The default flips (the node, the tripwires, the e2e script)
+
+- **The default.** `claude_steer` defaults to true; `claude_steer = false` turns it off. It is read when the node
+  starts and copied onto each Claude adapter when its session opens. The config comment, the host's reader and the
+  adapter's comment say so, and README's steer section says how to turn it off.
+- **The guard.** `test_r9_f_claude_steering_is_off_by_default` (the name kept for the record) is now the guard of the
+  default and of the explicit-off configuration. Its old last assert could never fail (S5(b)). It checks:
+  - a default config is on, and the host copies that onto an adapter it opens;
+  - `claude_steer = false` turns it off, and the host copies that.
+- **Off-configuration tests.** The off tests of tests/test_claude_steering.py use `_claude_steering_off`, which sets
+  the config itself to false.
+- **The tripwire module.**
+  - It sets the switch explicitly to false on every configuration made there, before any node or adapter starts.
+  - It now also tripwires `_steer_adjudicate`, `_retire_hold`, `ClaudeSession.steer_facts` and
+    `ClaudeSession.steer_done`.
+  - `_reserved_stop` replaces `_reserved_cutoff`, and `unreserve` is gone. Every tripwire must exist now.
+  - It still runs every Codex scenario. None fired: 394 passed.
+- **The e2e script.**
+  - The first node writes `claude_steer = false`, so S1 keeps proving the off configuration with the real CLI. The
+    correlation scenario reuses those settings.
+  - The tree node and the steering section's node have NO key, so the steering section proves the default.
+- **The golden recording.** `golden_schema_free.record`'s switch is now three-way: on, off, or as the config says.
+  The structured-results test of the off configuration asks for off explicitly.
+- **Mixed versions.** The G3 pins are modelled shapes, a listing shaped as d11ff99's and a report shaped as a d11ff99
+  node's. They do not run old binaries.
+
+### S5. From the independent review of #118
+
+- **(a) The 400 fallback.** `_post_report` sends a report whose steer extension gets a 400 again, at once, without the
+  extension. Kept. This is a difference from main e6b421f, which retries a steer report only on a 422. Pinned by
+  `test_s5a_a_report_whose_steer_extension_gets_a_400_is_sent_again_at_once_without_it`.
+- **(b)** The vacuous assert is fixed (S4).
+- **(c) The lanes follow the reconciliation's PHASE.**
+  - **Reproduced first:** a close inside the reconciliation, which returns the whole outbox after an earlier failed
+    handoff, put the watchdog's watched terminal ahead of the LOST the reconciliation reports. The hub then recorded the
+    self-stop's detail instead of LOST.
+  - **The fix.** `_reconcile` marks the phase (`SessionRunner.reconciling`, set and cleared in a `finally` around the
+    listing's application), and `_emit` hands off the watched lane only outside it. It is one flag on the node's
+    runner, not on a session: the phase had no existing state.
+  - **Pinned** by `test_s5c_a_handoff_inside_reconciliation_keeps_lost_ahead_of_a_watched_terminal[False|True]`: LOST
+    with and without the close.
+- **(d) Whether a valid event can wedge the outbox head.** Checked: `_put`, `_event`, `_checkpoint`, `_add` and
+  `_commit` on the enabled path.
+  - Every field they read is typed by its producer: detail and text are strings, meta is a dict, ids are strings,
+    and a steer result's meta is built as a dict in `_steer_adjudicate` or `_finalize_hold`.
+  - `_finite` and `_clean` make a value serialisable without raising.
+  - No valid event makes `_put` raise every time. Only an injected failure can, so this goes to the hardening PR's
+    list and nothing is changed here.
+
+### Reproduction, mutation check and runs
+
+- **Reproduction first.** On 256c3e6, with the switch on, these tests fail:
+  - S1: the partial-write, steer-pipe and held-cancel routes waited on the registry or changed state; the
+    ordinary-reply pipe and the live timeout did not take main's wait.
+  - S2: every reserved route.
+  - S3: all three cases.
+  - S5(c): the close inside the reconciliation.
+
+  The hold cut and the held timeout already passed S1 there. The S4 guard fails there too: the default was off.
+- **Mutation check.** 21 rows, for the new and changed code only, on d704cbf: all 21 caught
+  (scripts/steering-mutation-results.txt). The script now has 152 rows. Earlier rows whose lines this PR rewrote are
+  left out as stale, with a row here standing for each.
+- **Runs** on d704cbf, the last code commit. Claude Code 2.1.330 and codex-cli 0.172.0, run the way
+  scripts/session-host-e2e.py runs them.
+
+  | Run | Real CLIs | Stand-ins |
+  | --- | --- | --- |
+  | `--only steer` | PASS, 28 | PASS, 27 |
+  | `--only steering` | PASS, 54 | PASS, 115 |
+  | `--only correlation` | PASS, 23 | PASS, 24 |
+  | `--only structured` | PASS, 30 | PASS, 36 |
+  | `--only tree` | PASS, 101 | PASS, 143 |
+  | Full e2e | not run | PASS, 395 |
+
+  - The full suite: 5304 passed, 10 skipped, in 11 min 37 s.
+  - The `~/.codex/config.toml` hash was 18fcebe0d94018f8 before, after each real run and at the end.
+
+### Not in this PR
+
+Kill records; a verified exit for main's own stops; reservations retained across a restart; restart identity; the
+package-owned logger adapter; general outbox failure recovery; the parallel test suite. For the hardening PR: main's
+inherited registry wait on main's routes (S1.3), and (d) above.
