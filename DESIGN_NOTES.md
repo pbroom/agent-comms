@@ -16541,3 +16541,17 @@ tests/test_claude_steering_enable.py.
   - The full suite: 5338 passed, 10 skipped, in 12 min 40 s. No timing failure, so nothing was rerun.
   - The `~/.codex/config.toml` hash was 18fcebe0d94018f8 before, after each real run and at the end.
   - The protected files are unchanged.
+
+### Review round 1 of the follow-ups (Sol: APPROVED on a144231, one should: tests only)
+
+- **A1's edges, pinned at the selector.** Each pin is checked against its own mutation row.
+  - `test_a1_a_watched_event_published_after_the_ended_is_not_promoted`: a watched event with a higher publication
+    sequence stays behind the `ended`. Row "A1 only earlier watched events".
+  - `test_a1_a_watched_event_of_another_generation_is_not_promoted`: an earlier watched event of another generation of
+    the same session id stays in its lane. Row "A1 the generation counts". It also fails alone under the existing row
+    "A1 only that session incarnation's", which `test_s5c_...` catches first.
+  - `test_a1_the_same_incarnations_earlier_watched_event_is_promoted`: the positive edge.
+- **A3's other branch.** `test_a3_after_a_raising_commit_a_proved_s_turn_settles_next_turn_failed_at_the_reap`: S's own
+  turn was proved before the cut. At the verified reap, N settles once with S `next_turn` failed (`own_turn_cut`), and
+  its detail is the cut's.
+- **No defect was found, and no product code changed.**
