@@ -25,9 +25,12 @@ lock, the cutoff lock, the registry lock), on any thread, for any host-side line
 - A watchdog thread (`WATCH_THREADS`: node_sessions registers its deadline watchdog) never drains: its records wait
   for the loop. A drain on a thread that is already draining (a handler that logs, or that calls back into the host)
   leaves what it adds to that ACTIVE drainer, which writes until the queue is empty: it never waits on itself. A
-  drain on another thread waits until its own records are written (by the active drainer, or by itself once that one
-  is done), holding no host lock (it is at depth 0) and no lock of this module: no cycle is possible, and the
-  watchdog, which never drains, never waits on a drainer.
+  drain on another thread waits only while a record of its OWN is not yet written (by the active drainer, or by
+  itself once that one is done; a thread with nothing of its own pending never waits), holding no host lock (it is at
+  depth 0) and no lock of this module: no cycle is possible, and the watchdog, which never drains, never waits on a
+  drainer. The serialization is the drainer's turn (`_state["drainer"]`), taken and handed back under the queue's own
+  short lock; it is not a lock held while a host lock is taken, except that a handler may itself call back into the
+  host from the active drainer's thread, which cannot deadlock for the reason just given.
 """
 from __future__ import annotations
 
@@ -303,6 +306,7 @@ def _write(r: _Record) -> None:
     rec.msecs = int((r.created - int(r.created)) * 1000) + 0.0
     rec.relativeCreated = (r.created - logging._startTime) * 1000
     rec.thread, rec.threadName = r.thread, r.thread_name
+    rec.hostlog_seq = r.seq     # (its place in the queue: the write order is the queue's)
     if r.exc is not None:
         rec.exc_text = _exc_text(r.exc)
         rec.hostlog_exc = r.exc

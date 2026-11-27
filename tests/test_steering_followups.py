@@ -189,3 +189,39 @@ def test_a1_the_same_incarnations_earlier_watched_event_is_promoted(env):
         runner._deliver(late=False)
     assert _pending_kinds(runner, s.session_id) == ["turn_ended", "ended"]
     assert runner.watched == []
+
+
+def test_a1_the_promoted_event_is_taken_from_where_it_is_in_watched(env):
+    """Ruling A1 (#120's review): the same incarnation's earlier watched event is promoted while ANOTHER session's
+    watched event is ahead of it in `watched`: exactly the promoted one leaves the lane (`pop(at)`, never the head),
+    and the other session's stays where it was."""
+    runner, s, ended = _a_session_and_its_ended(env)
+    other_sid = "0e0e0e0e-0000-4000-8000-0000000000aa"
+    ahead = _watched(other_sid, 1, ended.ident[2] - 2)
+    earlier = _watched(s.session_id, s.gen, ended.ident[2] - 1)
+    runner.watched.extend([ahead, earlier])
+    with runner.lock:
+        runner._deliver(late=False)
+    assert _pending_kinds(runner, s.session_id) == ["turn_ended", "ended"]
+    assert _pending_kinds(runner, other_sid) == [], "the other session's event is not handed off"
+    assert runner.watched == [ahead] and runner.watched[0] is ahead, "the other session's event stays in its lane"
+
+
+def test_a1_only_an_ended_promotes_the_sessions_watched_events(env):
+    """Ruling A1 (#120's review): an event of the session other than `ended` (here a `turn_ended` it published after
+    the watched one) handed off while `watched` waits promotes nothing: the watched event stays in its lane."""
+    import dataclasses
+    from agent_comms.session_host import HostEvent
+    runner = env.node.sessions
+    sid = start(env, "a turn")["session_id"]
+    tick(env)
+    host = runner.host
+    s = host.sessions[sid]
+    host._outbox.append(HostEvent(sid, "turn_ended", "9", ok=True, delivered=True, detail=""))
+    [late] = [e for e in host._outbox.current() if e.session_id == sid and e.message_id == "9"]
+    earlier = dataclasses.replace(_watched(sid, s.gen, late.ident[2] - 1), message_id="8")
+    runner.watched.append(earlier)
+    with runner.lock:
+        runner._deliver(late=False)
+    assert [e["message"] for x, e in runner.pending if x == sid and e["kind"] == "turn_ended"] == [9]
+    assert runner.watched == [earlier], "not promoted: only an `ended` promotes"

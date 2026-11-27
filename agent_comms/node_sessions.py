@@ -512,7 +512,10 @@ class SessionRunner:
         a reconciliation), a session's `ended` about to be handed off makes THAT session incarnation's earlier
         `watched` events eligible first, by publication sequence: an explicit close follows the turn end the
         watchdog's self-stop published before it, as on main. Other sessions' watched events stay where they are (a
-        LOST the reconciliation reports keeps its precedence over them)."""
+        LOST the reconciliation reports keeps its precedence over them). The promotion applies wherever `watched`
+        waits (`late` False), not only inside a reconciliation: also at the pass's handoff before it (`pass_once`) and
+        at `_after_tick`'s handoff before a session is forgotten. Only an `ended` promotes; the promoted event is
+        taken from wherever it is in `watched`."""
         while True:
             heads = []
             e = self.host.outbox_head()
