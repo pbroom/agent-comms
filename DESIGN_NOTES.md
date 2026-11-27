@@ -17251,4 +17251,45 @@ selection also matched.
   `test_r4_an_errno_left_by_an_earlier_call_does_not_fail_a_clean_answer`.
 - **Two older pins changed by the rulings:**
   - `test_c1_shutdown_keeps_a_group_that_survived_its_sigkill`: its bound is now the kill grace plus the one window;
-  - `test_s2_a_failed_final_read_still_says_the_hold_once`: the line now waits for the bound (R11).
+  - `test_s2_a_failed_final_read_still_says_the_hold_once`: the line now waits for the bound (R11), and the final
+    read raises on every pass, so the line can only come from the raising path.
+- **Pins the mutation check asked for** (23b34a5, below): `test_a1_a_part_pid_after_a_real_one_is_no_proof`,
+  `test_a1_a_malformed_answer_is_not_retried_into_proof`, `test_a1_a_negative_count_is_no_proof_whatever_errno_says`,
+  and `test_r9_the_nodes_watch_covers_the_sessions_it_killed`. The shared-deadline pin now also asserts that the
+  deadline, not the count of looks, ends the watch.
+
+#### Mutation check (review round 4)
+
+- **R8's 5 rows on 784f695:** all caught.
+- **This round's rows,** in `c1r5`'s set: A1 (4), R9 and A2 (6), R10 and A3 (8), R11 and A4 (4), R12 and A5 (3), and
+  16 re-anchored rows for earlier rounds' lines this round rewrote. The script now has 228 rows.
+- **On 40175cd,** with R8's rows again (A1 rewrote the code around them): 38 of 45 caught. The 7 misses were weak pins,
+  not dead code:
+  - a negative count, a part pid and an over-long count were each caught by A1's other checks, or retried into a later
+    answer, so each needed a pin of its own (one of them, an over-long count retried until some later call answered 0,
+    shows why the check is there);
+  - the watch's deadline was masked by its count of looks;
+  - S2's line came from a later pass that did not raise;
+  - the node's watch of killed sessions was masked by the host's own grace wait, which also polls.
+- **On 23b34a5,** which adds those pins, the 7 rows again: all caught.
+- The results are in scripts/steering-mutation-results.txt.
+
+#### Runs (C1 review round 4, on 23b34a5)
+
+Run 16:07 to 16:37, with load averages of 3.8 to 4.4. Claude Code 2.1.330 and codex-cli 0.172.0, run the way
+scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- **The parallel inner-loop suite** (on 40175cd's tree, before the four mutation pins): 5438 passed, 10 skipped, in
+  4 min 9 s.
+- **The full suite, serial, on 23b34a5:** 5442 passed, 10 skipped, in 12 min 45 s, the in-suite e2e test included.
+- **The `~/.codex/config.toml` hash** was be07f3845d522521 (the baseline since 12:37) before, after each real run and
+  at the end. There was no further change.
+- The protected files are unchanged.

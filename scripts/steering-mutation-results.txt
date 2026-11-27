@@ -115,3 +115,82 @@ rows: 1
 stale or broken: []
 missed: []
 exit 0
+
+# Review round 4 of C1 (the PR's reviews). R8's rows on 784f695; then R8's and this round's rows on 40175cd (38 of 45
+# caught: seven pins were too weak against A1's layered checks, the watch's count bound, the S2 raising path and the
+# node's watch of killed sessions); then those seven again on 23b34a5, which adds the pins: all caught.
+
+commit 784f695
+CAUGHT  R4 errno is cleared before each call  test_r4_zero_with_errno_clear_is_an_empty_group
+CAUGHT  R4 a zero with errno set is a failure  test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof[estimate]
+CAUGHT  R4 a negative result is a failure  test_c1_a_failed_or_refused_listing_is_not_proof
+CAUGHT  R4 the estimate's failure is no proof  test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof[estimate]
+CAUGHT  R4 the listing's failure is no proof  test_c1_a_failed_or_refused_listing_is_not_proof
+rows: 5
+stale or broken: []
+missed: []
+exit 0
+
+commit 40175cd
+CAUGHT  R4 errno is cleared before each call  test_r4_zero_with_errno_clear_is_an_empty_group
+CAUGHT  R4 a zero with errno set is a failure  test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof[estimate]
+MISSED  R4 a negative result is a failure  
+CAUGHT  R4 the estimate's failure is no proof  test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof[estimate]
+MISSED  C1R5A1 a count that is no whole number of pids is no proof  
+MISSED  C1R5A1 a count beyond the buffer is no proof  
+CAUGHT  C1R5A1 a slot with no pid is no proof  test_a1_a_malformed_byte_count_is_no_proof[zero-slots]
+CAUGHT  C1R5 the listing's failure is no proof (A1's form)  test_c1_a_failed_or_refused_listing_is_not_proof
+MISSED  C1R5 S2 a failed final read still says the hold (past the bound)  
+CAUGHT  C1R5 a filled buffer is not a complete listing (re-anchored)  test_r4_group_absent_against_real_children_of_this_test
+CAUGHT  C1R5 the session's proof needs the leader's exit observed (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1R5 the session's proof needs the group's absence (re-anchored)  test_c1_shutdown_keeps_a_group_that_survived_its_sigkill
+CAUGHT  C1R5 the run's proof needs the leader's exit observed  test_c1_report_stopped_keeps_a_run_whose_group_survived_its_kill
+CAUGHT  C1R5 the run's proof needs the group's absence (re-anchored)  test_r1_a_retained_run_fences_its_checkout_until_the_proof
+CAUGHT  C1R5 a proof that raises retains (re-anchored)  test_c1_the_rule_releases_nothing_without_proof[raises]
+CAUGHT  C1R5 the rule fences admission before the final reads (re-anchored)  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+CAUGHT  C1R5 the rule releases only on proof (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1R5 the veto writes the HELD index (re-anchored)  test_r5_after_the_first_kill_no_numeric_signal_reaches_the_group_again[pass-False]
+CAUGHT  C1R5 N stop_all per session (re-anchored)  test_r3_n_a_bulk_stop_survives_one_sessions_fault[stop_all]
+CAUGHT  C1R5 R7-2 the replay after the last SIGKILL, not before (re-anchored)  test_r7_2_what_a_process_wrote_last_reaches_its_transcript_at_shutdown
+CAUGHT  C1R5 R2 try_stopping leaves a HELD entry as it is (re-anchored)  test_r2_held_is_sticky_until_the_proof_is_true[false]
+CAUGHT  C1R5 R2 _stop sends nothing to a HELD record (re-anchored)  test_r2_a_held_session_is_never_signalled_by_number_again[cancel]
+CAUGHT  C1R5 R2 the run's _stop sends nothing to a HELD run (re-anchored)  test_r2_a_held_run_is_never_signalled_by_number_again[signal_runs]
+CAUGHT  C1R5 report_stopped keeps what is not proved gone (re-anchored)  test_r9_a_run_whose_group_keeps_a_member_is_retained_past_the_bounded_wait
+CAUGHT  C1R5R9 the node watches its killed runs  test_r9_a_run_killed_at_shutdown_is_reported_ended_when_nothing_survives
+CAUGHT  C1R5R9 the kill pass names what it killed  test_r9_a_run_killed_at_shutdown_is_reported_ended_when_nothing_survives
+MISSED  C1R5R9 the deadline ends the watch  
+MISSED  C1R5A2 the node's watch covers the killed sessions  
+MISSED  C1R5A2 the sessions' kill names what it killed  
+CAUGHT  C1R5A2 the host watches its own kill pass  test_r9_a_hosted_session_killed_at_shutdown_is_released_when_nothing_survives
+CAUGHT  C1R5R10 the release fence is not HELD  test_r10_a_start_failed_read_at_the_reap_fails_only_its_own_message
+CAUGHT  C1R5R10 a LIVE entry is fenced  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+CAUGHT  C1R5R10 a missing entry is fenced  test_r10_the_fence_keeps_a_stopping_entry_and_fences_a_miss
+CAUGHT  C1R5R10 a FENCED entry refuses admission  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+CAUGHT  C1R5R10 a refused proof makes it HELD  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1R5R10 a FENCED entry is reserved as the LIVE one it was  test_r10_the_fence_keeps_a_stopping_entry_and_fences_a_miss
+CAUGHT  C1R5R10 the shutdown's stop of a vetoed group keeps main's bookkeeping  test_r10_a_session_killed_by_the_nodes_shutdown_reads_its_last_lines_as_main_does
+CAUGHT  C1R5R10 a HELD group gets no shutdown clock  test_r2_a_held_session_is_never_signalled_by_number_again[shutdown]
+CAUGHT  C1R5R11 the line waits for the bound  test_r11_a_runs_zombie_instant_logs_nothing
+CAUGHT  C1R5R11 the line is written once  test_s2_a_failed_final_read_still_says_the_hold_once
+CAUGHT  C1R5R11 the shutdown says what it keeps  test_r9_a_run_whose_group_keeps_a_member_is_retained_past_the_bounded_wait
+CAUGHT  C1R5R11 report_stopped is final  test_r9_a_run_whose_group_keeps_a_member_is_retained_past_the_bounded_wait
+CAUGHT  C1R5R12 off macOS, main's liveness probe  test_r12_off_macos_the_membership_half_is_mains_liveness_probe
+CAUGHT  C1R5A5 a libproc load failure is no proof  test_c1_no_libproc_is_not_proof
+CAUGHT  C1R5A5 a load failure is said once  test_r12_on_macos_a_libproc_load_failure_retains_and_says_so_once
+rows: 45
+stale or broken: []
+missed: ['R4 a negative result is a failure', 'C1R5A1 a count that is no whole number of pids is no proof', 'C1R5A1 a count beyond the buffer is no proof', 'C1R5 S2 a failed final read still says the hold (past the bound)', 'C1R5R9 the deadline ends the watch', "C1R5A2 the node's watch covers the killed sessions", "C1R5A2 the sessions' kill names what it killed"]
+exit 0
+
+commit 23b34a5
+CAUGHT  R4 a negative result is a failure  test_a1_a_negative_count_is_no_proof_whatever_errno_says
+CAUGHT  C1R5A1 a count that is no whole number of pids is no proof  test_a1_a_part_pid_after_a_real_one_is_no_proof
+CAUGHT  C1R5A1 a count beyond the buffer is no proof  test_a1_a_malformed_answer_is_not_retried_into_proof
+CAUGHT  C1R5 S2 a failed final read still says the hold (past the bound)  test_s2_a_failed_final_read_still_says_the_hold_once
+CAUGHT  C1R5R9 the deadline ends the watch  test_r9_one_shared_post_kill_deadline_for_every_killed_run
+CAUGHT  C1R5A2 the node's watch covers the killed sessions  test_r9_the_nodes_watch_covers_the_sessions_it_killed
+CAUGHT  C1R5A2 the sessions' kill names what it killed  test_r9_the_nodes_watch_covers_the_sessions_it_killed
+rows: 7
+stale or broken: []
+missed: []
+exit 0
