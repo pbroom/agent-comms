@@ -1,13 +1,12 @@
-# The output of scripts/steering-mutation-check.py (review round 5), on exports of the branch, in three runs.
-# Run 1: all 119 rows on 84d0812 (rounds 2-5; rows whose lines a later round rewrote are left out, a later row
+# The output of scripts/steering-mutation-check.py (review round 6), on exports of the branch, in two runs.
+# Run 1: all 123 rows on 02e96b1 (rounds 2-6; rows whose lines a later round rewrote are left out, a later row
 # standing for each).
-# Run 2: the 14 rows missed in run 1, on e85d73a: tests for 8 of them (e85d73a), one made stale by deleting its path
-# ("M shutdown delivers on a fault": shutdown carries no detached batch since d0ad6b9; 118 rows now), and 5 that are
-# equivalent (DESIGN_NOTES, step 3, review round 5, "Mutation check").
-# Run 3: the 6 rows on the watchdog's pass, on 32bd521 (its steps back in main's order; two rows re-anchored).
+# Run 2: on ce186ec, after the misses: one row's path deleted ("Y main's forget only when only the extensions
+# differ": the check was implied by main's ladder; 122 rows now), a test for "N1 the steer deadlines' bounded wait",
+# and the three rows on the lines that changed. 117 caught; 5 equivalent (DESIGN_NOTES, step 3, review round 6).
 
 ## Run 1
-commit 84d0812
+commit 02e96b1
 CAUGHT  F init naming S in N's bracket is a contradiction  test_model_claude_steer_walks_against_an_independent_reference
 CAUGHT  F S's init: no origin  test_r1_b2_only_the_exact_init_opens_ss_own_turn[notification]
 CAUGHT  F S's init: no scalar  test_r2_m_an_s_init_with_a_scalar_echo_is_a_contradiction
@@ -61,7 +60,6 @@ MISSED  M forget purges
 MISSED  M the incarnation tag  
 CAUGHT  M ended despite a raising stop  test_r3_m_ended_is_published_even_when_the_stop_raises
 CAUGHT  M the held end before its log line  test_r3_m_a_raising_log_handler_loses_no_held_end
-MISSED  M shutdown delivers on a fault  
 CAUGHT  N the held timeout through the cutoff stop  test_r3_n_the_held_timeout_after_the_latch_starts_no_stop
 CAUGHT  N stop_turns per session  test_r3_n_a_bulk_stop_survives_one_sessions_fault[stop_turns]
 CAUGHT  N stop_all per session  test_r3_n_a_bulk_stop_survives_one_sessions_fault[stop_all]
@@ -77,8 +75,6 @@ CAUGHT  Q N's identity before the cap  test_r4_q_ns_identity_wins_over_the_lengt
 CAUGHT  Q rule 10 only while S's init is the last  test_r4_q_rule_10_only_while_ss_init_is_the_last_init
 CAUGHT  Q no steering advertised at RETIRED_MAX  test_r4_q_at_retired_max_the_pair_is_not_advertised
 CAUGHT  R a rejection forgets no feature  test_r5_y_a_next_turn_fallback_never_strips_a_codex_outcome
-CAUGHT  R rung (ii) keeps a Codex extension  test_r4_r_one_ladder_reaches_a_payload_without_both_modes_and_extension
-CAUGHT  R rung (ii) removes the Claude pair  test_r3_o_a_native_end_survives_a_rollback_hubs_refusal_of_held
 CAUGHT  R a fallback asks for a fresh listing  test_r4_r_a_rollback_refusal_of_one_report_never_strips_anothers_outcome
 CAUGHT  R the write gate asks the pair  test_r4_r_the_write_gate_asks_the_pair
 CAUGHT  R the checkpoint gate asks the pair  test_r4_r_the_checkpoint_gates_ask_the_pair
@@ -89,9 +85,9 @@ CAUGHT  T nothing logged under the cutoff lock  test_r5_known_limit_a_raising_lo
 CAUGHT  T nothing saved under the cutoff lock  test_r5_small_emit_hold_saves_nothing_under_a_claim
 CAUGHT  T a host error decides nothing new after the latch  test_r4_t_a_host_error_of_a_held_end_after_the_latch_decides_nothing
 CAUGHT  T the under-lock latch check in the hold cut  test_r4_t_a_latch_between_the_first_check_and_the_expiry_changes_no_state
-CAUGHT  T stop_all's steps apart  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  T stop_all's steps apart  test_r4_t_stop_all_survives_a_fault_in_every_step_of_its_traversal
 CAUGHT  T stop_all's final save in a finally  test_r4_t_stop_all_saves_even_when_its_traversal_raises
-CAUGHT  T the watchdog's steps apart  test_r4_t_a_failing_self_stop_keeps_no_later_watchdog_step_from_running
+CAUGHT  T the watchdog's steps apart  test_r6_n3_no_traceback_is_formatted_on_the_watchdogs_thread
 CAUGHT  T no save on the watchdog's boundary  test_r4_t_the_watchdogs_boundary_saves_nothing[cut]
 CAUGHT  U the entry's own generation  test_r3_p_a_checkpoint_is_bound_to_its_incarnation_and_the_stop_flag
 CAUGHT  T a close, a fatal frame, a host error claimed  test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[close]
@@ -101,66 +97,51 @@ CAUGHT  T the broken pipe's cutoff  test_r4_t_after_the_latch_no_single_session_
 CAUGHT  T a reap with survivors claimed  test_r4_t_a_reap_whose_drain_meets_the_latch_decides_nothing
 CAUGHT  T no save on the watchdog's cut  test_r4_t_the_watchdogs_boundary_saves_nothing[cut]
 CAUGHT  Q7 any init clears rule 10's marker first  test_r4_q_rule_10_only_while_ss_init_is_the_last_init
-CAUGHT  Y main's forget only after a 422  test_r5_y_main_forgets_steer_only_on_its_own_legacy_path[400]
 MISSED  Y main's forget only when only the extensions differ  
 CAUGHT  Y the acknowledged modes are the accepted rung's  test_r5_y_the_acknowledged_modes_are_recorded_and_corrected_explicitly
 CAUGHT  Y an explicit report corrects modes acknowledged with less  test_r5_y_the_acknowledged_modes_are_recorded_and_corrected_explicitly
 CAUGHT  Y rung (iii) is main's plain retry of rung (ii)  test_r5_y_main_forgets_steer_only_on_its_own_legacy_path[422]
 CAUGHT  X a second put of one identity is a no-op  test_r5_x_a_raise_after_the_consumer_committed_duplicates_nothing
-CAUGHT  X the receipt with the queue entry  test_r5_x_a_raise_after_the_consumer_committed_duplicates_nothing
-MISSED  X the receipt is forgotten only after the source's removal  
-MISSED  X publication order across lanes  
+CAUGHT  X the receipt is forgotten only after the source's removal  test_r5_x_both_sides_forget_once_the_source_removed_it
+CAUGHT  X publication order across lanes  test_r5_x_the_handoff_keeps_publication_order_across_lanes
 CAUGHT  X the host keeps what it published until the node took it  test_e2e_in_process_next_turn_checkpoint_then_ns_native_end_with_ss_reply
-MISSED  X the self-stop puts its own events first, also when it raises  
+CAUGHT  X the self-stop puts its own events first, also when it raises  test_r5_x_a_self_stop_that_raises_puts_what_it_published_into_watched
 CAUGHT  X the boundary puts its own events into watched_steer  test_e_the_node_watchdog_cuts_a_half_written_frame_past_its_limit
-MISSED  W no save on the watchdog's thread  
-MISSED  W no transcript write on the watchdog's thread  
+CAUGHT  W no save on the watchdog's thread  test_r5_w_a_codex_cut_on_the_watchdog_writes_nothing_to_disk
+CAUGHT  W no transcript write on the watchdog's thread  test_r5_w_a_codex_cut_on_the_watchdog_writes_nothing_to_disk
 CAUGHT  W no Claude partial cut on the watchdog  test_r5_w_the_watchdog_thread_makes_no_forbidden_call[partial]
 CAUGHT  W no drain in the watchdog's hold cut  test_r5_w_the_watchdog_thread_makes_no_forbidden_call[hold]
-CAUGHT  W the kills take no lock  test_r5_w_the_kill_step_takes_no_lock
-MISSED  W the runner lock with a timeout  
-MISSED  W the watchdog's log lines kept in memory  
 CAUGHT  W the self-stop never saves  test_r5_w_the_watchdog_thread_makes_no_forbidden_call[self_stop]
-CAUGHT  Z a failed step keeps a live group owned  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
 CAUGHT  Z a survivor's registration is no SIGTERM  test_r5_z_a_survivor_registered_after_the_latch_is_no_sigterm_time
 CAUGHT  Z a parked session stays the bulk stop's  test_r5_small_an_early_reap_after_the_latch_reads_nothing
 CAUGHT  the partial cut's claim is for Claude attempts only  test_r5_small_a_codex_partial_cut_at_the_latch_is_mains
 CAUGHT  T the Claude cut's decision is claimed  test_model_claude_steer_walks_against_an_independent_reference
 CAUGHT  S the self-stop takes only its own  test_r5_w_the_watchdog_thread_makes_no_forbidden_call[self_stop]
-rows: 119
+CAUGHT  N1 the self-stop and kills under main's unbounded lock  test_r6_n1_the_kill_step_waits_for_the_loops_lock_as_main
+MISSED  N1 the steer deadlines' bounded wait  
+CAUGHT  N2 the bulk signal pass before any transcript  test_r6_n2_a_stalled_transcript_write_at_shutdown_holds_up_no_kill
+CAUGHT  N3 every package logger diverted on a watchdog thread  test_r6_n3_no_handler_runs_for_a_provider_logger_on_the_watchdogs_thread
+CAUGHT  N3 no traceback on a watchdog thread  test_r6_n3_no_traceback_is_formatted_on_the_watchdogs_thread
+CAUGHT  Y main's literal legacy rung  test_r6_y_an_extension_only_next_turn_422_forgets_nothing
+CAUGHT  X the receipt with its entry, undone together  test_r5_x_a_raise_after_the_consumer_committed_duplicates_nothing
+CAUGHT  X a checkpoint commits with its receipt  test_r6_x_a_checkpoint_and_its_receipt_commit_together
+CAUGHT  X the final handoff tried once more  test_r6_x_the_final_shutdown_handoff_is_retried_once[1]
+CAUGHT  R rung (ii) keeps a Codex extension  test_r5_y_main_forgets_steer_only_on_its_own_legacy_path[422]
+CAUGHT  R rung (ii) removes the Claude pair  test_r3_o_a_native_end_survives_a_rollback_hubs_refusal_of_held
+CAUGHT  Y main's forget only after a 422  test_r5_y_main_forgets_steer_only_on_its_own_legacy_path[400]
+CAUGHT  Z a failed step keeps a live group owned  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+rows: 123
 stale or broken: []
-missed: ['F echo shape: the scalar is the first', 'F echo shape: strings only', 'L no eviction: the bound refuses', 'M forget purges', 'M the incarnation tag', 'M shutdown delivers on a fault', "Y main's forget only when only the extensions differ", "X the receipt is forgotten only after the source's removal", 'X publication order across lanes', 'X the self-stop puts its own events first, also when it raises', "W no save on the watchdog's thread", "W no transcript write on the watchdog's thread", 'W the runner lock with a timeout', "W the watchdog's log lines kept in memory"]
+missed: ['F echo shape: the scalar is the first', 'F echo shape: strings only', 'L no eviction: the bound refuses', 'M forget purges', 'M the incarnation tag', "Y main's forget only when only the extensions differ", "N1 the steer deadlines' bounded wait"]
 exit 0
 
 ## Run 2
-commit e85d73a
-MISSED  F echo shape: the scalar is the first  
-MISSED  F echo shape: strings only  
-MISSED  L no eviction: the bound refuses  
-MISSED  M forget purges  
-MISSED  M the incarnation tag  
-CAUGHT  Y main's forget only when only the extensions differ  test_r5_y_a_422_of_more_than_the_extensions_forgets_nothing
-CAUGHT  X the receipt is forgotten only after the source's removal  test_r5_x_both_sides_forget_once_the_source_removed_it
-CAUGHT  X publication order across lanes  test_r5_x_the_handoff_keeps_publication_order_across_lanes
-CAUGHT  X the self-stop puts its own events first, also when it raises  test_r5_x_a_self_stop_that_raises_puts_what_it_published_into_watched
-CAUGHT  W no save on the watchdog's thread  test_r5_w_a_codex_cut_on_the_watchdog_writes_nothing_to_disk
-CAUGHT  W no transcript write on the watchdog's thread  test_r5_w_a_codex_cut_on_the_watchdog_writes_nothing_to_disk
-CAUGHT  W the runner lock with a timeout  test_r5_w_a_stalled_loop_with_a_partial_write_pending
-CAUGHT  W the watchdog's log lines kept in memory  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
-rows: 13
-stale or broken: []
-missed: ['F echo shape: the scalar is the first', 'F echo shape: strings only', 'L no eviction: the bound refuses', 'M forget purges', 'M the incarnation tag']
-exit 0
-
-## Run 3
-commit 32bd521
-CAUGHT  T the watchdog's steps apart  test_r4_t_a_failing_self_stop_keeps_no_later_watchdog_step_from_running
-CAUGHT  X the self-stop puts its own events first, also when it raises  test_r5_x_a_self_stop_that_raises_puts_what_it_published_into_watched
-CAUGHT  W the kills take no lock  test_r5_w_the_kill_step_takes_no_lock
-CAUGHT  W the runner lock with a timeout  test_r5_w_the_kill_step_takes_no_lock
-CAUGHT  W the watchdog's log lines kept in memory  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
-CAUGHT  S the self-stop takes only its own  test_r5_w_the_watchdog_thread_makes_no_forbidden_call[self_stop]
-rows: 6
+commit ce186ec
+CAUGHT  N1 the steer deadlines' bounded wait  test_r6_n1_only_the_steer_deadlines_wait_is_bounded
+CAUGHT  Y main's literal legacy rung  test_r5_y_a_422_of_more_than_the_extensions_forgets_nothing
+CAUGHT  R rung (ii) keeps a Codex extension  test_r5_y_main_forgets_steer_only_on_its_own_legacy_path[422]
+CAUGHT  Y main's forget only after a 422  test_r5_y_main_forgets_steer_only_on_its_own_legacy_path[400]
+rows: 4
 stale or broken: []
 missed: []
 exit 0
