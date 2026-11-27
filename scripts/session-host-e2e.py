@@ -64,7 +64,8 @@ Then the send modes on a running turn (`--only steer` runs nothing else; DESIGN_
 for a Claude session (an agent of its own, whose runner may also run `sleep`) and a Codex one:
 S1/S4. A long turn (the stand-in holds it until the script releases it; a real model runs `sleep 12`), then
     `--mode steer` (DESIGN_NOTES "Mid-turn steering", step 2). Claude (S1): refused with the reason (its adapter does
-    not steer), nothing is sent, and the turn runs to its end. Codex (S4): taken as a steer into that turn (no message
+    not steer: this node runs with Claude steering off, as shipped, so with --claude-bin this proves the shipped
+    configuration on the real CLI), nothing is sent, and the turn runs to its end. Codex (S4): taken as a steer into that turn (no message
     of its own); its `turn/steer` is written once; `--mode steer --wait` (a retry with the same request id) prints
     the turn's reply and exits 0 with the steer `in_turn`.
 S2/S5. A long turn (`sleep 12` again), then `--mode restart --wait`: the long turn ends `interrupted by a restart:
@@ -117,8 +118,9 @@ Q7. (stand-in only, and only with `--only steering`: it takes 82 s) A partition 
     (the turn not proved yet): the hub is stopped (SIGSTOP) past the node's 75 s contact clock; once it is back and
     the turn proved, the steer is still never written; N completes and the steer is `not_delivered`.
 Q8. Stop; nothing is left; the user's Codex config.toml is unchanged (with --codex-bin).
-(Claude steering ships off by default: this script's node configuration turns it on, `[dispatch.sessions]
-claude_steer = true`, for every run of it.)
+(Claude steering ships off by default, `[dispatch.sessions] claude_steer` absent. Every node of this script runs
+with that shipped default except the steering section's own (Q1-Q8 and Z0-Z4, `--only steering`), whose node
+configuration turns it on, `claude_steer = true`: Q3 expects a version that passed gate M8 to steer, and Z1-Z3 steer.)
 Then Claude steering, step 3 (with `--only steering` too; DESIGN_NOTES "Mid-turn steering, step 3: Claude steering,
 as built"), on a hub and a node of their own whose VERIFIED and STEER_MODES name the Claude CLI's version (that node
 process only): the stand-in's, or with --claude-bin the real one's (gate M8 as an e2e check, as M5 is for Codex):
@@ -711,7 +713,6 @@ kill_grace_seconds = 5
 [dispatch.sessions]
 enabled = true
 codex = true
-claude_steer = true
 """)
 
     def codex_runner(self) -> list[str]:
@@ -1212,7 +1213,9 @@ claude_steer = true
         running(sid, 1)
         pid = self.show(sid)["pid"]
         if label == "Claude":
-            # Step 2: Claude's adapter does not steer; the send is refused with the reason and nothing is made for it.
+            # Step 2, and the shipped configuration (this node runs with Claude steering off, `claude_steer` absent):
+            # Claude's adapter does not steer, real CLI or stand-in; the send is refused with the reason, as on main,
+            # and nothing is made for it.
             out, err, _ = self.board("session", "send", sid, steer, "--mode", "steer", ok=False)
             self.check(steer_no in err, "a steer is refused with the reason, and nothing is sent")
             self.check(len(self.show(sid)["messages"]) == 1, "no message was made for it")
@@ -2534,7 +2537,9 @@ claude_steer = true
             self.git("commit", "-q", "-m", "init")
 
     def node_settings(self, allow_full: bool) -> None:
-        """The node's board.toml for the tree scenario."""
+        """The node's board.toml for the tree scenario (and the steering section's, which alone switches Claude
+        steering on: `claude_steer_on`)."""
+        self.node_allow_full = allow_full
         exe = str(self.tmp / "bin" / "claude")
         quiet = ["--setting-sources=", "--strict-mcp-config"] if self.real else []
         # The two runners that load a settings fixture: the fixture itself through --settings, and of the settings
@@ -2584,7 +2589,7 @@ worktree_dir = {json.dumps(str(self.worktrees))}
 [dispatch.sessions]
 enabled = true
 codex = true
-claude_steer = true
+{"claude_steer = true" if getattr(self, "claude_steer_on", False) else ""}
 allow_full_access = {"true" if allow_full else "false"}
 max_live = 8
 """)
@@ -4407,8 +4412,12 @@ def main() -> int:
                           "the user's own Claude settings files (~/.claude/settings.json, settings.local.json) are "
                           "what they were before the run: the settings fixtures live in the temp directory only")
         if steering:
-            # Its own hub and node, with child sessions on (the tree scenario's settings), after the others stopped.
+            # Its own hub and node, with child sessions on (the tree scenario's settings), after the others stopped;
+            # the one node of this script with Claude steering switched on (`claude_steer = true`): every earlier
+            # section ran with the shipped default.
             run.enable_tree()
+            run.claude_steer_on = True
+            run.node_settings(run.node_allow_full)
             run.start_services()
             run.steering_scenario()
             print("\n[Q8] stopping the node (SIGTERM) and the hub")
