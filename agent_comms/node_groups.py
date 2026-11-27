@@ -58,8 +58,9 @@ class Groups:
                     groups[token][0] = self.STOPPING
 
     def try_stopping(self, token: Hashable) -> bool:
-        """`stopping`, only if the registry is free at once (review round 7, ruling A1: the node's watchdog thread
-        never waits behind a spawn that holds it across process creation). False: nothing was recorded."""
+        """`stopping`, only if the registry is free at once (review round 8, ruling C1: an expired Claude hold's cut
+        never waits behind a spawn that holds it across process creation, on any thread). False: nothing was
+        recorded."""
         if not self.lock.acquire(blocking=False):
             return False
         try:

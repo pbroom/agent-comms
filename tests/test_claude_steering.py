@@ -4324,10 +4324,11 @@ def test_r7_1_a_kill_due_after_the_scan_goes_when_main_would(env):
 
 
 def test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry(env):
-    """Ruling A1: a spawn holds the group registry while a held Claude end's contact runs out and another session's
-    kill comes due after the scan: the watchdog fences the hold (its decision recorded) without waiting for the
-    registry, so the next scan sends the kill on its cadence; the hold's stop goes on a later pass once the
-    registry is free, and its SIGKILL is never earlier than its real SIGTERM plus the grace."""
+    """Ruling A1, as round 8's C1 has it: a spawn holds the group registry while a held Claude end's contact runs
+    out and another session's kill comes due after the scan: the watchdog does not wait for the registry and changes
+    nothing of the hold (no claim, no fence, no SIGTERM, no kill clock), so the next scan sends the kill on its
+    cadence; once the registry is free the hold's stop goes on a later pass, and its SIGKILL is never earlier than
+    its real SIGTERM plus the grace."""
     import threading
     import time as _time
     from test_hosted_sessions import P2
@@ -4367,7 +4368,7 @@ def test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry(env):
     try:
         assert _wait_for(lambda: killed, 5), "b's kill was sent"
         assert killed[0] - scans[0] <= runner.watch_seconds + 0.5, "on the watchdog's cadence"
-        assert sa.held is not None and sa.held.decided is not None, "the hold fenced: its decision recorded"
+        assert sa.held is not None and sa.held.decided is None and sa.held.fenced_at is None, "the hold untouched"
         assert not ca.terminated and sa.stopping_since is None, "no SIGTERM, no kill clock, while the registry waits"
         release.set()
         assert _wait_for(lambda: ca.terminated, 5), "its stop goes once the registry is free"
@@ -4457,9 +4458,10 @@ def test_r7_2_both_shutdown_entry_points_signal_every_group_with_a_stalling_hand
     assert ok, (ca.terminated, cb.terminated, ca.killed, cb.killed)
 
 
-def test_r7_a1_the_loop_sends_a_deferred_stop_by_itself(env):
-    """Ruling A1 (a mutation row): a held end's stop deferred on the watchdog's thread (the registry was busy) is
-    sent by the loop's next tick once the registry is free, with no watchdog pass needed."""
+def test_r7_a1_the_loop_stops_an_expired_hold_by_itself(env):
+    """Ruling A1, as round 8's C1 has it (a mutation row): an expired hold left as it was on the watchdog's thread
+    (the registry was busy) is stopped by the loop's next tick once the registry is free, with no watchdog pass:
+    the same code on both."""
     import threading
     a, ca, n, s_uuid = claude_steered(env)
     runner = env.node.sessions
@@ -4479,11 +4481,11 @@ def test_r7_a1_the_loop_sends_a_deferred_stop_by_itself(env):
     assert held.wait(3)
     t, done, ident, err = _on_watchdog(runner)
     assert done.wait(5) and not err, err
-    assert sa.stop_due and not ca.terminated
+    assert sa.held.decided is None and not ca.terminated
     release.set()
     _wait_for(lambda: host.groups.lock.acquire(blocking=False) and (host.groups.lock.release() or True), 3)
     host.tick()
-    assert ca.terminated == 1 and sa.stopping_since is not None and not sa.stop_due
+    assert ca.terminated == 1 and sa.stopping_since is not None and sa.held.decided is not None
 
 
 def test_r7_2_what_a_process_wrote_last_reaches_its_transcript_at_shutdown(henv, monkeypatch, tmp_path):
@@ -4588,6 +4590,188 @@ def test_r7_3_the_deferred_queue_counts_what_it_drops(env):
         session_host.flush_watch_logs()
     lines = [m for _, _, m in h.seen]
     assert any("7" in m and "dropped" in m for m in lines), lines[-3:]
+
+
+# ---------------------------------------------------------------- review round 8
+
+
+def _expired_hold_with_the_registry_busy(env, project=None, before_the_stall=None):
+    """A Claude session whose held end's contact ran out, its process ignoring SIGTERM, and a spawn holding the
+    group registry (`before_the_stall` runs first, once A is held): (sid, child, session, release)."""
+    import threading
+    a, ca, n, s_uuid = claude_steered(env, project=project)
+    runner = env.node.sessions
+    host = runner.host
+    ca.emit(cresult(a, n, text="N's reply"))
+    tick(env)
+    sa = host.sessions[a]
+    assert sa.held is not None
+    if before_the_stall is not None:
+        before_the_stall()
+    ca.exits_on_terminate = False
+    sa.steer.cover_until = env.clock() - 1
+    release, held = threading.Event(), threading.Event()
+
+    def spawn_holding_the_registry():
+        with host.groups.lock:
+            held.set()
+            release.wait(15)
+    threading.Thread(target=spawn_holding_the_registry, daemon=True).start()
+    assert held.wait(3)
+    return a, ca, sa, release
+
+
+def _registry_free(host):
+    return _wait_for(lambda: host.groups.lock.acquire(blocking=False) and (host.groups.lock.release() or True), 3)
+
+
+def test_r8_c1_the_loops_tick_never_waits_on_the_registry(env):
+    """Sol's round-8 blocker 1 (ruling C1): a spawn holds the registry, A's hold has expired, the loop ticks (under
+    the runner lock), B's KILL comes due: neither thread waits on the registry; the watchdog takes the runner lock
+    and B's KILL goes when main would send it."""
+    import threading
+    from test_hosted_sessions import P2
+    bs = []
+    a, ca, sa, release = _expired_hold_with_the_registry_busy(
+        env, before_the_stall=lambda: bs.append(_stopping_turn(env, project=P2)))
+    b, cb, sb = bs[0]
+    runner = env.node.sessions
+    host = runner.host
+    loop_done = threading.Event()
+
+    def loop():
+        with runner.lock:
+            host.tick()
+        loop_done.set()
+    try:
+        threading.Thread(target=loop, daemon=True).start()
+        assert loop_done.wait(2), "the loop's tick did not wait on the registry"
+        env.clock.advance(host.kill_grace + 1)      # (B's KILL comes due: the watchdog's)
+        t, done, ident, err = _on_watchdog(runner)
+        assert done.wait(2) and not err, err
+        assert cb.killed, "B's KILL went"
+        assert sa.held.decided is None and not ca.terminated, "A's hold untouched while the registry is busy"
+    finally:
+        release.set()
+
+
+def test_r8_c1_during_the_stall_the_checkout_is_as_for_a_hold_before_its_deadline(env):
+    """Ruling C1/C2: while the registry is busy an expired hold reads as any held end: its group stays LIVE in the
+    registry (no STOPPING barrier invented, none taken away), N's end is not published (N's turn still holds the
+    checkout on the hub), its process is not stopped."""
+    a, ca, sa, release = _expired_hold_with_the_registry_busy(env)
+    runner = env.node.sessions
+    host = runner.host
+    try:
+        out = []
+        for _ in range(3):
+            with runner.lock:
+                out += host.tick()
+            t, done, ident, err = _on_watchdog(runner)
+            assert done.wait(3) and not err, err
+        states = [st for g in host.groups.entries.values() for tok, (st, cwd) in g.items() if tok == sa.group_token]
+        assert states == [host.groups.LIVE], states
+        assert not [e for e in out + list(host._outbox) if e.kind == "turn_ended" and e.session_id == a]
+        assert sa.in_flight is not None and not ca.terminated
+    finally:
+        release.set()
+
+
+def test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order(env):
+    """Ruling C1: after the registry frees: the reservation, the claim, the SIGTERM, the publication, once each, in
+    that order; the SIGKILL never earlier than that SIGTERM plus the grace."""
+    a, ca, sa, release = _expired_hold_with_the_registry_busy(env)
+    runner = env.node.sessions
+    host = runner.host
+    order = []
+    real_try, real_fin, real_pub = host.groups.try_stopping, host._finalize_hold, host._publish_hold
+
+    def try_stopping(token):
+        ok = real_try(token)
+        if ok:
+            order.append("reserve")
+        return ok
+    host.groups.try_stopping = try_stopping
+    host._finalize_hold = lambda *x, **k: (order.append("claim"), real_fin(*x, **k))[1]
+    host._publish_hold = lambda *x, **k: (order.append("publish"), real_pub(*x, **k))[1]
+    real_term = ca.terminate
+    ca.terminate = lambda: (order.append("TERM"), real_term())[1]
+    with runner.lock:
+        host.tick()
+    assert order == [], "nothing while the registry is busy"
+    release.set()
+    assert _registry_free(host)
+    with runner.lock:
+        host.tick()
+    term_at = sa.stopping_since
+    assert order == ["reserve", "claim", "TERM"], order
+    env.clock.advance(host.kill_grace - 1)
+    with runner.lock:
+        host.kill_due()
+    assert not ca.killed, "no SIGKILL before its SIGTERM plus the grace"
+    ca.code = -9
+    with runner.lock:
+        host.tick()
+    assert order == ["reserve", "claim", "TERM", "publish"], order
+    assert term_at is not None
+
+
+def test_r8_c1_a_lost_claim_leaves_no_stopping_barrier(henv, monkeypatch):
+    """Ruling C1 (pin): the claim is lost between the deadline and the attempt (the latch came): no STOPPING barrier
+    is left on the checkout, nothing is claimed or signalled."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    assert s.held is not None
+    henv.clock.advance(21)
+    henv.host.steer_drain_hook = lambda sess: henv.host.steer_stopping()     # (the latch, during the drain)
+    henv.host._hold_cut(s, henv.clock(), henv.host._outbox)
+    henv.host.steer_drain_hook = None
+    states = [st for g in henv.host.groups.entries.values() for tok, (st, cwd) in g.items() if tok == s.group_token]
+    assert states == [henv.host.groups.LIVE] and not child.terminated and s.held.decided is None
+
+
+def test_r8_c1_an_expired_hold_at_shutdown_gets_the_real_sigterm(env):
+    """Ruling C1 (pin): an expired, still-held session at shutdown gets `stop_all`'s real SIGTERM, and its kill
+    clock starts there."""
+    a, ca, sa, release = _expired_hold_with_the_registry_busy(env)
+    host = env.node.sessions.host
+    release.set()
+    assert _registry_free(host)
+    stopped_at = []
+    real_term = ca.terminate
+    ca.terminate = lambda: (stopped_at.append(sa.stopping_since), real_term())[1]
+    host.stop_all()
+    assert ca.terminated == 1 and stopped_at and stopped_at[0] is not None
+
+
+def test_r8_c3_known_limit_a_registry_stall_past_two_graces(env):
+    """Known limit C3 (pinned): a registry stall past two grace periods: nothing published, the hold intact, no kill
+    clock; a hub listing during the stall; once the registry frees, N's eventual settlement is taken by the hub."""
+    a, ca, sa, release = _expired_hold_with_the_registry_busy(env)
+    runner = env.node.sessions
+    host = runner.host
+    try:
+        env.clock.advance(2 * host.kill_grace + 5)
+        with runner.lock:
+            out = host.tick()
+        t, done, ident, err = _on_watchdog(runner)
+        assert done.wait(3) and not err, err
+        assert not [e for e in out + list(host._outbox) if e.kind == "turn_ended" and e.session_id == a]
+        assert sa.held is not None and sa.held.decided is None and sa.stopping_since is None
+        with runner.lock:
+            runner._flush()
+        runner.pass_once()          # (a listing from the hub during the stall)
+        assert hosted._get(env.board.conn, hosted._msg_key(a, 1))["state"] != "done"
+    finally:
+        release.set()
+    assert _registry_free(host)
+    tick(env)
+    ca.code = -9
+    tick(env, times=3)
+    m = hosted._get(env.board.conn, hosted._msg_key(a, 1))
+    assert m["state"] == "done" and show(env, a)["reply"] == "N's reply", m
 
 
 RESULT_FIELDS = ["subtype", "is_error", "num_turns", "origin", "user_message_uuid", "user_message_uuids", "result",

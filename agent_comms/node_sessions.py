@@ -1689,8 +1689,8 @@ class SessionRunner:
             # is one-way, and a half-written steer frame past its limit is cut (a Codex one: main's step 2; a Claude
             # one is left to the loop, which reads N's end first: ruling W). Still in this one section (review round
             # 7, ruling R7-1): the pass has main's lock structure exactly. The Claude part of this step waits for
-            # nothing (rulings W and A1: no save, transcript write, log handler, drain or registry wait on this
-            # thread; a stop that cannot take the registry at once is left to a later pass).
+            # nothing (rulings W and C1: no save, transcript write, log handler, drain or registry wait on this
+            # thread; an expired hold whose checkout cannot be reserved at once is left as it is, for a later pass).
             try:
                 self._steer_watch(now)
                 self.host.steer_deadlines(into=self.watched_steer, watchdog=True)

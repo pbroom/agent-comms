@@ -444,9 +444,6 @@ class Session:
     # (Review round 5, ruling Z2) its leader went after the stop latch, leaving its group: registered as stopping for
     # the bulk stop, which owns it; no SIGTERM was sent for it (so no SIGKILL may come of this)
     parked: bool = False
-    # (Review round 7, ruling A1) a stop decided on the watchdog's thread that could not take the group registry at
-    # once: retried on every pass; no `stopping_since` and no SIGTERM until it really goes (no kill clock before)
-    stop_due: bool = False
     tee_pending: list = field(default_factory=list)     # (ruling W) transcript lines the watchdog's thread read
     stopping_since: float | None = None
     killed: bool = False
@@ -1247,8 +1244,6 @@ class SessionHost:
     def _steer_deadlines(self, now: float, out: list[HostEvent], watchdog: bool = False) -> None:
         with self.one_drain_budget():      # one drain deadline for every cut in this call
             for s in list(self.sessions.values()):
-                if s.stop_due:
-                    self._stop_due(s, wait_registry=not watchdog)       # (ruling A1) a deferred stop, again
                 slot = s.steer
                 if (slot is not None and slot.mark is not None and slot.sent > 0 and s.child is not None
                         and s.stopping_since is None and not self._steer_stopped(slot)
@@ -1393,8 +1388,6 @@ class SessionHost:
             flush_watch_logs()      # (ruling W) what the watchdog's thread logged, written here
             for s in list(self.sessions.values()):
                 self._flush_tee(s)
-                if s.stop_due:
-                    self._stop_due(s, wait_registry=True)       # (ruling A1) the loop waits for the registry
             if self._save_due:      # (ruling T) what the watchdog's path published is persisted here, by the loop
                 self._save_due = False
                 self._save_state()
@@ -1764,7 +1757,7 @@ class SessionHost:
         s.group_token = None
         s.sealed_by = s.confirmed_by = None     # what that process said went with it
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
-        s.parked = s.stop_due = False
+        s.parked = False
         s.outbuf.clear()
         if s.steer is not None and s.steer.outcome is not None:
             s.steer = None          # its turn is decided and its process is gone: nothing more of it is written
@@ -2133,25 +2126,16 @@ class SessionHost:
                  s.session_id, msg.id)
         self._save_state()
 
-    def _stop(self, s: Session, now: float, at_signal: bool = False, wait_registry: bool = True) -> None:
+    def _stop(self, s: Session, now: float, at_signal: bool = False, reserved: bool = False) -> None:
         """`at_signal` (review round 8, R8-01): passed True only by a single-session steering caller, for the stop
         that directly follows a live attempt's drain in that same call, or the contact cut's: the stop is then dated
         by a clock read immediately before its SIGTERM (after the registry, `poll` and the group probe, R8-02), so no
         SIGKILL comes before the grace from it. Every other caller passes nothing: main's `now`, exactly as on main.
         Nothing about the dating is stored or inferred from a slot or a past drain."""
         if s.child is not None and s.stopping_since is None:
-            if not wait_registry:
-                # (Review round 7, ruling A1) the watchdog's thread never waits for the group registry (a spawn holds
-                # it across process creation): taken only if it is free at once; else the stop waits for a later
-                # pass (`stop_due`), with no `stopping_since` and no SIGTERM (no kill clock) until then
-                if not self.groups.try_stopping(s.group_token):
-                    s.stop_due = True
-                    return
-                s.stopping_since = now
-            else:
-                s.stopping_since = now
+            s.stopping_since = now
+            if not reserved:
                 self.groups.stopping(s.group_token)     # from now on nothing starts in its directory until it is gone
-            s.stop_due = False
             # The whole process group (PopenChild). Not once all of it is known to be gone (a caller may have
             # stopped it already, node.shut_down): its id could be another group's by now.
             if s.child.poll() is None or self.group_alive(s.child.pid):
@@ -2159,6 +2143,13 @@ class SessionHost:
                     s.stopping_since = self.clock()
                 if s.held is not None and s.held.fenced_at is not None:
                     s.held.fenced_at = self.clock()     # (shoulds) the bounded publication counts from the SIGTERM
+                if reserved:
+                    try:
+                        s.child.terminate()
+                    except BaseException:
+                        s.stopping_since = None     # (round 8, ruling C1) a SIGTERM that failed starts no kill clock
+                        raise
+                    return
                 s.child.terminate()
 
     def _release_steer(self, s: Session) -> None:
@@ -2697,15 +2688,7 @@ class SessionHost:
         if drain:       # (ruling W: never on the watchdog's thread; S is then decided from what was read so far)
             now = self._drain_before_stop(s, now, out)
         if s.held is held:
-            self._cutoff_stop(s, why, now, out, wait_registry=drain)     # (ruling A1: no registry wait off the loop)
-
-    def _stop_due(self, s: Session, wait_registry: bool) -> None:
-        """(Review round 7, ruling A1) A stop decided earlier whose SIGTERM could not go (the registry was busy on the
-        watchdog's thread): tried again, dated at its SIGTERM; after the latch the bulk stop sends it."""
-        if s.child is None or s.stopping_since is not None or self.steer_stopped:
-            s.stop_due = s.child is not None and s.stopping_since is None and s.stop_due
-            return
-        self._stop(s, self.clock(), at_signal=True, wait_registry=wait_registry)
+            self._cutoff_stop(s, why, now, out, reserve=True)   # (round 8, ruling C1: reserve first, commit second)
 
     def _steering(self, s: Session) -> bool:
         """The session holds a Claude steer whose outcome is open, or a held end: from the latch on the bulk stop
@@ -2713,7 +2696,7 @@ class SessionHost:
         what was read before it), pinned by tests/test_codex_steering.py, which this round leaves unchanged."""
         return s.held is not None or (s.steer is not None and s.steer.outcome is None and s.steer.holds)
 
-    def _claim(self, s: Session, decide: Callable[[], None]) -> bool:
+    def _claim(self, s: Session, decide: Callable[[], None], reserve: bool = False) -> bool:
         """(Review round 4, ruling T) THE claim of a single-session stop of a steering session: under the cutoff
         lock, the latch checked and the decision made (`decide`: N failed, S decided, the fence stamped), frozen;
         nothing logged or persisted there (`_defer_logs`). After the latch it claims nothing and decides nothing: the
@@ -2722,6 +2705,15 @@ class SessionHost:
         with self._steer_stop_lock:
             if self.steer_stopped or (s.steer is not None and s.steer.stopping):
                 return False
+            if reserve:
+                # (Review round 8, ruling C1) An expired hold's cut, on the watchdog's thread or in the loop's tick
+                # alike: the claim is confirmed available (above), then the checkout is reserved in the group
+                # registry WITHOUT waiting (a spawn may hold it across process creation). Busy: nothing changes, no
+                # claim, no fence, no publication, no SIGTERM, no kill clock: the hold stays as a hold before its
+                # deadline, and the next pass or tick tries again. Lock order: this cutoff lock, then the registry's
+                # non-blocking attempt; nothing that holds the registry waits for this lock, so no deadlock.
+                if s.child is None or s.group_token is None or not self.groups.try_stopping(s.group_token):
+                    return False
             self._defer_logs, self._claimer = [], threading.get_ident()
             try:
                 decide()
@@ -2738,16 +2730,16 @@ class SessionHost:
         else:
             log.log(level, msg, *args)
 
-    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent], wait_registry: bool = True) -> bool:
+    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent], reserve: bool = False) -> bool:
         """THE single-session stop of a session holding a live steer attempt or a held end (review round 3, ruling N;
         callers: `_hold_cut`, and the turn timeout `_hold_to_timeout`, the held one included). The decision and the
         fence are made under the cutoff lock; after the global latch it does nothing (the stop of every turn is the
         one that acts, Shutdown simplified). The group registry and the SIGTERM come after the lock is let go (a
         stop decided before the latch whose signal lands after it is the same signal shutdown sends). False: it did
         nothing."""
-        if not self._claim(s, lambda: self._fail(s, why, out)):
+        if not self._claim(s, lambda: self._fail(s, why, out), reserve=reserve):
             return False
-        self._stop(s, now, at_signal=True, wait_registry=wait_registry)      # (dated at its SIGTERM: R8-01)
+        self._stop(s, now, at_signal=True, reserved=reserve)      # (dated at its SIGTERM: R8-01)
         return True
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
