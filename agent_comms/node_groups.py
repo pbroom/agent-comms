@@ -14,9 +14,61 @@ not by the string that names them.
 """
 from __future__ import annotations
 
+import ctypes
 import os
+import sys
 import threading
 from typing import Any, Callable, Hashable
+
+PROC_PGRP_ONLY = 2      # libproc's `proc_listpids` type: the processes of one process group (sys/proc_info.h)
+_LIBPROC: list = []
+
+
+def _libproc():
+    """macOS's libproc, loaded once (None where there is none)."""
+    if not _LIBPROC:
+        lib = None
+        if sys.platform == "darwin":
+            try:
+                lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+                lib.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+                lib.proc_listpids.restype = ctypes.c_int
+            except (OSError, AttributeError):
+                lib = None
+        _LIBPROC.append(lib)
+    return _LIBPROC[0]
+
+
+def group_members(pgid: int) -> tuple[int, ...] | None:
+    """(Ownership until verified exit, C1) A COMPLETE listing of the processes in process group `pgid`, zombies
+    included: macOS libproc's `proc_listpids(PROC_PGRP_ONLY)`, one call that the kernel answers from its process lists
+    under their lock, so a coherent snapshot. None when no complete listing could be made: no libproc, an error, or a
+    buffer the listing filled (it may have been truncated: a larger one is tried, a few times)."""
+    lib = _libproc()
+    if lib is None or isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1:
+        return None
+    for extra in (64, 1024, 16384):
+        need = lib.proc_listpids(PROC_PGRP_ONLY, pgid, None, 0)     # (an estimate, in bytes: every process's room)
+        if need < 0:
+            return None
+        n = need // ctypes.sizeof(ctypes.c_int) + extra
+        buf = (ctypes.c_int * n)()
+        got = lib.proc_listpids(PROC_PGRP_ONLY, pgid, buf, ctypes.sizeof(buf))
+        if got < 0:
+            return None
+        if got < ctypes.sizeof(buf):        # (room was left: the listing is complete)
+            return tuple(p for p in buf[:got // ctypes.sizeof(ctypes.c_int)] if p)
+    return None
+
+
+def group_absent(pgid: int) -> bool:
+    """(C1) The membership half of the proof that a group is gone: a complete, successful listing of the group shows
+    no member at all (`group_members`). A member of any kind (a zombie included), an error, or a listing that may be
+    truncated is NOT proof: False, and whoever asks retains. Not `killpg(pgid, 0)`: its ESRCH also answers for a
+    group whose only members are zombies, and its EPERM for a group whose members this user may not signal (and, on
+    macOS, briefly for one that is exiting), so its errno is a permission answer, not a membership observation."""
+    members = group_members(pgid)
+    return members is not None and not members
 
 
 def key(cwd: Any) -> Hashable:
@@ -87,8 +139,25 @@ class Groups:
         finally:
             self.lock.release()
 
-    def gone(self, token: Hashable) -> None:
-        """The whole group is gone: leader reaped, no member left."""
+    def release(self, token: Hashable, proof: Callable[[], bool], forget: Callable[[], None]) -> bool:
+        """(Ownership until verified exit, C1) THE one release rule: the only way a group's registry entry, and its
+        owner's tracking record (whose durable entry is that record's projection), go. `proof()` answers whether the
+        group is proved gone; it is supplied by the caller, so how absence is proved (today: the leader's exit observed
+        by its owning handle and `group_absent`; later an anchor's own word) never touches this rule or its callers.
+        Not proved (False, or it raised): nothing is released and False; the caller keeps its handle, the exact token
+        and its durable entry, and asks again on its next pass. Proved: `forget()` drops the tracking record, then the
+        registry entry goes (`_gone`); True."""
+        try:
+            if proof() is not True:
+                return False
+        except Exception:
+            return False
+        forget()
+        self._gone(token)
+        return True
+
+    def _gone(self, token: Hashable) -> None:
+        """The whole group is gone: leader reaped, no member left (only `release` says so)."""
         with self.lock:
             for k in list(self.entries):
                 self._drop(k, token)

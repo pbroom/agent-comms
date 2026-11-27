@@ -15,7 +15,7 @@ from pathlib import Path
 
 FILES = {"A": "agent_comms/providers/claude.py", "H": "agent_comms/session_host.py", "ST": "agent_comms/hosted_steer.py",
          "HS": "agent_comms/hosted.py", "NS": "agent_comms/node_sessions.py", "API": "agent_comms/api.py",
-         "G": "agent_comms/node_groups.py", "D": "agent_comms/dispatch.py"}
+         "G": "agent_comms/node_groups.py", "D": "agent_comms/dispatch.py", "N": "agent_comms/node.py"}
 ROWS = [('A', "F init naming S in N's bracket is a contradiction", '                if names_s:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")', '                if False:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")'),
     ('A', "F S's init: no origin", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and scalar is None'),
     ('A', "F S's init: no scalar", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and quiet'),
@@ -126,7 +126,6 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('NS', 'R rung (ii) keeps a Codex extension', '                                                              and v.get("outcome") == "next_turn")}', '                                                              )}'),
     ('NS', 'R rung (ii) removes the Claude pair', '            out["modes"] = [m for m in body["modes"] if not (m == "held" or (claude and m == "steer"))]', '            out["modes"] = list(body["modes"])'),
     ('NS', "Y main's forget only after a 422", 'refused is not None and refused[1] == 422 and gen == self.features_gen:', 'refused is not None and gen == self.features_gen:'),
-    ('H', 'Z a failed step keeps a live group owned', '                if failed_here and going(s):', '                if False:'),
     ('NS', 'R7-1 the steer deadlines inside the one section', '            try:\n                self._steer_watch(now)\n                self.host.steer_deadlines(into=self.watched_steer, watchdog=True)\n            except Exception:\n                log.exception("hosted sessions: the steer deadlines failed")\n', '        if not self.lock.acquire(timeout=self.watch_seconds):\n            return\n        try:\n            self._steer_watch(now)\n            self.host.steer_deadlines(into=self.watched_steer, watchdog=True)\n        except Exception:\n            log.exception("hosted sessions: the steer deadlines failed")\n        finally:\n            self.lock.release()\n'),
     ('H', "R7-2 shutdown's logging deferred through the last SIGKILL", '        me = threading.get_ident()\n        was_diverting = me in WATCH_THREADS\n        WATCH_THREADS.add(me)\n        diverting = [True]', '        me = threading.get_ident()\n        was_diverting = me in WATCH_THREADS\n        diverting = [True]'),
     ('H', "A2 the caller's prior diversion restored", '                if not was_diverting:\n                    WATCH_THREADS.discard(me)', '                WATCH_THREADS.discard(me)'),
@@ -165,7 +164,6 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('H', "A2 the reserved stop's lines go to the deferred queue", '            for level, msg, args in logs:\n                _keep_line(log.name, level, msg, args)', '            for level, msg, args in logs:\n                log.log(level, msg, *args)'),
     ('H', "A2 a node's host writes no line at its tick", "            if not self.keep_outbox:\n                # (ruling W) what the watchdog's thread", "            if True:\n                # (ruling W) what the watchdog's thread"),
     ('H', 'A3 the key cached at spawn', '            s.group_token, s.group_key = token, k', '            s.group_token = token'),
-    ('H', 'A3 the key cleared at the detach', '        self.groups.gone(s.group_token)      # the whole group is gone\n        s.group_token = s.group_key = None', '        self.groups.gone(s.group_token)      # the whole group is gone\n        s.group_token = None'),
     ('H', "A3 a live child with no key is main's", '        if s.group_key is None:\n            # (Review round 1, A3)', '        if False:\n            # (Review round 1, A3)'),
     ('H', 'R2 the barrier is under the cached key', '        barrier = (s.group_key, s.cwd) if alive else None', '        barrier = (node_groups.key(s.cwd), s.cwd) if alive else None'),
     ('H', 'S3 a verified exit needs no entry (re-anchored)', '        barrier = (s.group_key, s.cwd) if alive else None', '        barrier = (s.group_key, s.cwd)'),
@@ -177,11 +175,23 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('H', 'A3 the reap settles an armed hold whose decision never ran', '        if s.held is not None and (s.held.fenced_at is not None or s.stopping_since is not None):', '        if s.held is not None and s.held.fenced_at is not None:'),
     ('H', 'A3 an undecided hold is finalized at the reap', '            if s.held.decided is None:\n                self._finalize_hold(s, "the process was stopped", out)', '            if False:\n                self._finalize_hold(s, "the process was stopped", out)'),
     ('NS', 'A1 only earlier watched events', '                           and w.ident[:2] == e.ident[:2] and w.ident[2] < e.ident[2]), None)', '                           and w.ident[:2] == e.ident[:2]), None)'),
-    ('NS', 'A1 the generation counts', '                           and w.ident[:2] == e.ident[:2] and w.ident[2] < e.ident[2]), None)', '                           and w.ident[0] == e.ident[0] and w.ident[2] < e.ident[2]), None)')]
-FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py"]
+    ('NS', 'A1 the generation counts', '                           and w.ident[:2] == e.ident[:2] and w.ident[2] < e.ident[2]), None)', '                           and w.ident[0] == e.ident[0] and w.ident[2] < e.ident[2]), None)'),
+    ('G', 'C1 the rule releases only on proof', '            if proof() is not True:\n                return False', '            if False:\n                return False'),
+    ('G', 'C1 a proof that raises retains', '        except Exception:\n            return False\n        forget()', '        except Exception:\n            pass\n        forget()'),
+    ('G', 'C1 only a complete empty listing is absence', '    return members is not None and not members', '    return not members'),
+    ('G', 'C1 a filled buffer is not a complete listing', '        if got < ctypes.sizeof(buf):        # (room was left: the listing is complete)', '        if got <= ctypes.sizeof(buf):        # (room was left: the listing is complete)'),
+    ('H', "C1 the session's proof needs the leader's exit observed", '        return self.groups.release(token, lambda: child.poll() is not None and self.group_absent(child.pid), forget)', '        return self.groups.release(token, lambda: self.group_absent(child.pid), forget)'),
+    ('H', "C1 the session's proof needs the group's absence", '        return self.groups.release(token, lambda: child.poll() is not None and self.group_absent(child.pid), forget)', '        return self.groups.release(token, lambda: child.poll() is not None, forget)'),
+    ('H', 'C1 the reap keeps what is not proved gone', '        if not self._release(s, child):\n            return      # (C1)', '        if not (self._release(s, child) or True):\n            return      # (C1)'),
+    ('H', 'C1 shutdown keeps what is not proved gone', '                if not released:\n                    # (Review round 5, ruling Z; C1)', '                if False:\n                    # (Review round 5, ruling Z; C1)'),
+    ('H', 'C1 a retained process is left alone', '                # proves it gone. (Main never reaches this: its reap let the group go in this very call.)\n                return None', '                # proves it gone. (Main never reaches this: its reap let the group go in this very call.)\n                pass'),
+    ('N', "C1 the run's proof needs the group's absence", '                                   lambda: local.child.poll() is not None and self.group_absent(local.child.pid),', '                                   lambda: local.child.poll() is not None,'),
+    ('N', "C1 the run's reap keeps what is not proved gone", '                if not self._release(rid, local):\n                    continue    # (C1)', '                if False:\n                    continue    # (C1)'),
+    ('N', 'C1 report_stopped keeps what is not proved gone', '            if not self._release(rid, local):\n                # (C1) its group is not proved gone at shutdown', '            if False:\n                # (C1) its group is not proved gone at shutdown')]
+FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py", "tests/test_ownership_c1.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",
         "tests/test_session_restart_hub.py", "tests/test_structured_results.py", "tests/test_hosted_sessions.py",
-        "tests/test_session_host.py"]
+        "tests/test_session_host.py", "tests/test_nodes.py", "tests/test_dispatch.py"]
 
 
 def main() -> int:

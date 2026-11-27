@@ -85,6 +85,10 @@ class Node:
         self.session_group_alive = session_group_alive
         from .session_host import group_alive
         self.group_alive = session_group_alive or group_alive       # a run's process group, too
+        # (Ownership until verified exit, C1) the membership half of the release rule's proof (node_groups
+        # `group_absent`); with a group probe of its own (a test's fake processes), absence by that probe
+        from .node_groups import group_absent
+        self.group_absent = (lambda pgid: not session_group_alive(pgid)) if session_group_alive else group_absent
         # Hosted sessions (node_sessions.py), only with [dispatch.sessions] enabled = true. They share this node's log
         # directory, and have their own loop and thread: tick() below never touches them.
         self.sessions: SessionRunner | None = SessionRunner(
@@ -463,8 +467,8 @@ class Node:
                     self._stop(local, "kill")
                 continue
             if code is not None:
-                del self.running[rid]
-                self.groups.gone(("run", rid))
+                if not self._release(rid, local):
+                    continue    # (C1) its group is not proved gone: kept, tracked and on record; the next pass asks again
                 self._save_state()
                 self._remove_browser_output(rid, local.browser_out)
                 self._report(rid, "ended", exit_code=local.exit_code if local.exit_code is not None else code,
@@ -498,10 +502,22 @@ class Node:
             if local.child.poll() is None:
                 self._stop(local, "kill")
 
+    def _release(self, rid: str, local: _Local) -> bool:
+        """(Ownership until verified exit, C1) The dispatched run's side of THE release rule (`Groups.release`), for
+        its reap and the shutdown's `report_stopped`: the leader's exit observed by its own handle AND a complete,
+        successful membership observation of its group with no member. Proved: the run leaves `running` (and so
+        its state entry, at the next save) with its registry entry. Not proved: everything is kept."""
+        return self.groups.release(("run", rid),
+                                   lambda: local.child.poll() is not None and self.group_absent(local.child.pid),
+                                   lambda: self.running.pop(rid, None))
+
     def report_stopped(self) -> None:
         for rid, local in list(self.running.items()):
-            del self.running[rid]
-            self.groups.gone(("run", rid))
+            if not self._release(rid, local):
+                # (C1) its group is not proved gone at shutdown (a member survived its SIGKILL): the run keeps its
+                # registry entry, its handle and its state entry (saved below), and is not reported ended here: the
+                # next node process finds it on record and reports it once it has stopped it (`recover`)
+                continue
             self._remove_browser_output(rid, local.browser_out)
             c = checkout_state(local.cwd)
             self._report(rid, "ended", exit_code=local.child.poll(), error="node shut down",

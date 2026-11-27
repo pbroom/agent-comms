@@ -714,6 +714,7 @@ class SessionHost:
                  signal_group: Callable[[int, int], None] = _signal_group,
                  sleep: Callable[[float], None] = time.sleep,
                  group_alive: Callable[[int], bool] = group_alive,
+                 group_absent: Callable[[int], bool] | None = None,
                  provider_for: Callable[[list[str]], Callable[[], ProviderSession] | None] | None = None,
                  handshake_seconds: float = HANDSHAKE_SECONDS):
         self.config, self.log_dir, self.spawner, self.clock = config, Path(log_dir), spawner, clock
@@ -722,6 +723,11 @@ class SessionHost:
         self.provider_for = provider_for or (
             lambda template: providers.provider_for(template, codex=config.sessions.codex))
         self.group_alive = group_alive
+        # (Ownership until verified exit, C1) The membership half of the release rule's proof (node_groups
+        # `group_absent`: a complete listing of the group with no member). A host given its own group probe and no
+        # proof (a test's fake processes) proves absence by that probe.
+        self.group_absent = group_absent if group_absent is not None else (
+            node_groups.group_absent if group_alive is globals()["group_alive"] else (lambda pgid: not group_alive(pgid)))
         self.handshake_seconds = float(handshake_seconds)
         if not self.handshake_seconds > 0:
             raise ValueError("handshake_seconds must be positive")
@@ -1525,6 +1531,12 @@ class SessionHost:
         if s.child is not None:
             self._read(s, now, out)
             self._reap(s, now, out)
+            if (s.child is not None and s.stopping_since is None and not s.parked and s.child.poll() is not None
+                    and not self.group_alive(s.child.pid)):
+                # (C1) its leader exited and its group is neither seen alive nor proved gone (`_release`): it is kept,
+                # and nothing more is done with it (no write, no stop of a process already gone) until a later pass
+                # proves it gone. (Main never reaches this: its reap let the group go in this very call.)
+                return None
         if (s.child is not None and s.stopping_since is None and not s.ended and s.writing is not None
                 and s.turn_at is not None and s.writing.counted is None):
             # A deadline is decided before anything that can discard its input (review round 16): for a staged line
@@ -1787,7 +1799,9 @@ class SessionHost:
         if not s.ready:
             self._correct_start_mode(s)
         was_ready, was_checking = s.ready, s.checking
-        child, s.child, s.proc_start, s.ready = s.child, None, None, False
+        child = s.child
+        if not self._release(s, child):
+            return      # (C1) its leader exited; its group is not proved gone: kept, the next pass asks again
         if s.held is not None and (s.held.fenced_at is not None or s.stopping_since is not None):
             # Its group is gone: published before any cleanup (B). (After #119, ruling A3) Also a held end whose stop
             # was armed but whose decision never ran (a reserved stop's commit, or a claim's decision, that raised
@@ -1796,8 +1810,6 @@ class SessionHost:
                 self._finalize_hold(s, "the process was stopped", out)     # (no process: published at once)
             else:
                 self._publish_hold(s, out, s.held.decided)
-        self.groups.gone(s.group_token)      # the whole group is gone
-        s.group_token = s.group_key = None
         s.sealed_by = s.confirmed_by = None     # what that process said went with it
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
         s.parked = False
@@ -1816,6 +1828,21 @@ class SessionHost:
         self._forget_restart(s)     # nothing is left to interrupt
         s.held_since = None
         self._save_state()
+
+    def _release(self, s: Session, child: Any) -> bool:
+        """(Ownership until verified exit, C1) The session's side of THE release rule (`Groups.release`), for the
+        reap and the shutdown: the proof is the leader's exit OBSERVED by its own handle (`poll()`) AND a complete,
+        successful membership observation of its group showing no member (`group_absent`). Proved: the tracking
+        record (the process handle, its start time, the exact token and key) goes with the registry entry, so the
+        durable entry goes at the next save. Not proved: everything is kept."""
+        if child is None:
+            return True
+        token = s.group_token
+
+        def forget() -> None:
+            s.child, s.proc_start, s.ready = None, None, False
+            s.group_token = s.group_key = None
+        return self.groups.release(token, lambda: child.poll() is not None and self.group_absent(child.pid), forget)
 
     LINGER_LOG_SECONDS = 60.0       # how often a process group that outlives its SIGKILL is said again
 
@@ -3282,19 +3309,19 @@ class SessionHost:
                         failed_here = True
                         log.exception("session %s: a step of its shutdown failed", s.session_id)
                 s.transcript_fd = None
-                if failed_here and going(s):
-                    # (Review round 5, ruling Z) a step failed and its group may still be there: the session keeps
-                    # its process handle, its SIGTERM's time and its group's entry (no checkout is given away under
-                    # it), and the final save below records it, so a later kill (`kill_due`) or the next node
-                    # process's recovery stops it. Its siblings go on.
+                try:
+                    released = self._release(s, s.child)
+                except Exception:
+                    released = s.child is None
+                    log.exception("session %s: its group's record could not be cleared", s.session_id)
+                if not released:
+                    # (Review round 5, ruling Z; C1) its group is not proved gone (a member survived its SIGKILL, or
+                    # it cannot be told): the session keeps its process handle, its SIGTERM's time, the exact token and
+                    # its group's entry (no checkout is given away under it), and the final save below records it,
+                    # so a later kill (`kill_due`) or the next node process's recovery stops it. Its siblings go on.
                     log.warning("session %s: its process group may still be running after shutdown: kept", s.session_id)
                     continue
-                s.child, s.proc_start, s.ready, s.stopping_since, s.killed = None, None, False, None, False
-                try:
-                    self.groups.gone(s.group_token)
-                except Exception:
-                    log.exception("session %s: its group's record could not be cleared", s.session_id)
-                s.group_token = s.group_key = None
+                s.stopping_since, s.killed = None, False
                 s.outbuf.clear()
                 self._release_steer(s)
             for s in self.sessions.values():

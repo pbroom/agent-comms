@@ -4229,9 +4229,10 @@ def test_r6_n4_known_limit_a_registry_wait_ahead_of_the_kill_step(env):
 
 
 def test_r6_n4_known_limit_a_kill_that_returns_with_survivors_releases_ownership(henv, monkeypatch):
-    """Known limit (round 6, N4; main e6b421f's behaviour): at shutdown a KILL that returns while members of the
-    group survive (a no-op signal, or one not yet delivered): the session lets go of its handle, its group entry
-    and its record, as main does; its sibling is stopped. (A KILL that RAISES keeps the group: round 5.)"""
+    """Known limit (round 6, N4), CLOSED by "Ownership until verified exit (C1)" (the name kept for the record): at
+    shutdown a KILL that returns while members of the group survive (a no-op signal, or one not yet delivered): the
+    session now KEEPS its handle, its group entry and its record until its group is proved gone; its sibling is
+    stopped. (A KILL that RAISES keeps the group too: round 5.)"""
     import json as _json
     (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
     host = henv.host
@@ -4241,8 +4242,8 @@ def test_r6_n4_known_limit_a_kill_that_returns_with_survivors_releases_ownership
     token = s1.group_token
     host.stop_all()
     assert s2.child is None, "the sibling is stopped"
-    assert s1.child is None and not any(token in g for g in host.groups.entries.values()), "pinned: released"
-    assert s1.session_id not in _json.loads(host._state_path().read_text()), "pinned: no record kept"
+    assert s1.child is c1 and any(token in g for g in host.groups.entries.values()), "kept (C1)"
+    assert s1.session_id in _json.loads(host._state_path().read_text()), "its record kept (C1)"
 
 
 # ---------------------------------------------------------------- review round 7
@@ -4832,7 +4833,7 @@ def test_r9_e2_a_registry_miss_is_not_a_verified_exit(henv, monkeypatch, process
     child.emit(owned(n, text="N"))
     henv.host.tick()
     henv.clock.advance(21)
-    henv.host.groups.gone(s.group_token)        # (the registry lost its entry)
+    henv.host.groups._gone(s.group_token)        # (the registry lost its entry)
     if process == "gone":
         child.code = 0
     henv.host._hold_cut(s, henv.clock(), henv.host._outbox, drain=False)
