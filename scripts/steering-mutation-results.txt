@@ -1,7 +1,10 @@
-# The output of scripts/steering-mutation-check.py for "Ownership until verified exit (C1)" (DESIGN_NOTES): the rows for
-# the release rule, its proof and each of its callers. The whole set (172 rows) last ran in round 6. Run on 59cace3: 11 of
-# 12 caught. "C1 a retained process is left alone" was missed: the test's turn was in flight, so nothing was written
-# anyway. 16a641e's pin also lets the turn's timeout and a kill grace pass, and catches that row.
+# The output of scripts/steering-mutation-check.py for "Ownership until verified exit (C1)" (DESIGN_NOTES): C1's rows, then
+# review round 1's rows (HELD, its fence, every signal site that asks it, and four re-anchored C1 rows). The whole set
+# (188 rows) last ran in round 6.
+# - On 5d692a2: 22 of 23 caught. The reap's survivor-stop row was missed: for signals it is equivalent, since _stop also
+#   checks HELD, but it let the reap decide the turn. Two of the run's rows were caught only by the slow stand-in e2e
+#   test, not by a targeted test.
+# - 83d9632 adds targeted pins for all three, and they are caught.
 
 commit 59cace3
 CAUGHT  C1 the rule releases only on proof  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
@@ -24,6 +27,44 @@ exit 0
 commit 16a641e
 CAUGHT  C1 a retained process is left alone  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
 rows: 1
+stale or broken: []
+missed: []
+exit 0
+
+commit 5d692a2
+CAUGHT  R1 start refuses a HELD checkout  test_c1_shutdown_keeps_a_group_that_survived_its_sigkill
+CAUGHT  R1 blocked sees a HELD checkout  test_c1_shutdown_keeps_a_group_that_survived_its_sigkill
+CAUGHT  R2 HELD never goes back to STOPPING  test_r2_held_is_sticky_until_the_proof_is_true[false]
+CAUGHT  R2 try_stopping leaves a HELD entry as it is  test_r2_held_is_sticky_until_the_proof_is_true[false]
+CAUGHT  A2 a refused release makes the token HELD  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  A3 a refused release fences a missing entry  test_a3_a_refused_release_with_its_entry_missing_still_fences_the_checkout
+CAUGHT  R2 the one predicate reads HELD  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  R2 the HELD index is kept  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+MISSED  R2 the reap's survivor stop only while it may be signalled  
+CAUGHT  R2 _stop sends nothing to a HELD record  test_r2_a_held_session_is_never_signalled_by_number_again[cancel]
+CAUGHT  R2 the kill scan skips a HELD record  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  R2 shutdown's KILL pass skips a HELD record  test_r2_a_held_session_is_never_signalled_by_number_again[shutdown]
+CAUGHT  R2 a HELD session takes no further step  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+CAUGHT  A3 the session's fence  test_a3_a_refused_release_with_its_entry_missing_still_fences_the_checkout
+CAUGHT  R2 the runner's TERM step skips a HELD session  test_r2_the_runners_shutdown_steps_never_signal_a_held_session
+CAUGHT  R2 the runner's KILL step skips a HELD session  test_r2_the_runners_shutdown_steps_never_signal_a_held_session
+CAUGHT  R2 the run's _stop sends nothing to a HELD run  test_r2_a_held_run_is_never_signalled_by_number_again[signal_runs]
+CAUGHT  R2 the run's reap survivor stop only while it may be signalled  test_the_end_to_end_script_passes_with_the_stand_in
+CAUGHT  A3 the run's fence  test_the_end_to_end_script_passes_with_the_stand_in
+CAUGHT  C1 the rule releases only on proof (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1 a proof that raises retains (re-anchored)  test_c1_the_rule_releases_nothing_without_proof[raises]
+CAUGHT  C1 the session's proof needs the leader's exit observed (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1 the session's proof needs the group's absence (re-anchored)  test_c1_shutdown_keeps_a_group_that_survived_its_sigkill
+rows: 23
+stale or broken: []
+missed: ["R2 the reap's survivor stop only while it may be signalled"]
+exit 0
+
+commit 83d9632
+CAUGHT  R2 the reap's survivor stop only while it may be signalled  test_r2_a_held_session_is_never_signalled_by_number_again[reap]
+CAUGHT  R2 the run's reap survivor stop only while it may be signalled  test_r2_a_held_runs_reap_takes_no_survivor_stop
+CAUGHT  A3 the run's fence  test_a3_a_runs_refused_release_with_its_entry_missing_still_fences_the_checkout
+rows: 3
 stale or broken: []
 missed: []
 exit 0

@@ -16670,3 +16670,108 @@ Claude Code 2.1.330 and codex-cli 0.172.0, run the way scripts/session-host-e2e.
 - The full suite, serial: 5356 passed, 10 skipped, in 12 min 32 s.
 - The `~/.codex/config.toml` hash was 18fcebe0d94018f8 before, after each real run and at the end.
 - The protected files are unchanged.
+
+### C1: review round 1 (on 3493ee6; Sol: CHANGES, 2 blockers, 2 shoulds; then an amendment, A1 to A4)
+
+Both blockers are about the state C1 adds: a group RETAINED where main would have released it.
+
+#### R1 and R2: one HELD state, in the registry
+
+- **What HELD is.** A third registry state, beside LIVE and STOPPING (`Groups.HELD`).
+- **Why STOPPING could not carry it.** STOPPING also means "being stopped, signals still due". A parked survivor, for
+  instance, is STOPPING and still waiting for its first TERM. A session field would not fence dispatched runs.
+- **How a group becomes HELD.** At the release rule itself: `Groups.release` refuses, and the exact token is marked
+  HELD before it returns (A2). Every caller of the rule is at main's release point:
+  - the reap, after the leader's exit and a FALSE liveness answer;
+  - `_stop_all`, after its KILL attempt, sent or raised (A1);
+  - the run's reap;
+  - `report_stopped`.
+- **A missing entry (A3).** If the token has no entry when the release is refused, the checkout is fenced under its
+  known key: the session's cached `group_key`, or the run's key, now cached at spawn (`_Local.key`).
+- **The fence (R1).** `Groups.start` refuses a HELD checkout, and `blocked` and `stopping_dirs` show it, exactly as for
+  STOPPING.
+- **Sticky.** HELD never goes back to LIVE or STOPPING: `stopping` and `try_stopping` leave it as it is. It leaves only
+  through `release` with a True proof.
+- **Proof-only (R2).** For a HELD token, no numeric signal is sent again, and no signal clock is armed. One predicate,
+  `Groups.may_signal(token)`, decides it, and every signal site a retained record can reach asks it:
+  - `SessionHost._reap`'s survivor stop: main's first stop of a dead leader with `group_alive` true is kept by
+    identity (A2). It is never sent once the token is HELD.
+  - `SessionHost._stop` (and so every route that reaches it: a close, a cancel, a timeout, `stop_turns`, parking, the
+    reserved stop): a HELD record returns at once, with no clock and no signal.
+  - `SessionHost._kill_if_due`, the kill scan of the loop and the watchdog.
+  - `SessionHost._stop_all`'s KILL pass.
+  - `SessionRunner.signal` and `SessionRunner.kill`, the node's own shutdown steps.
+  - `Node._stop`, which covers hub stops, timeouts, `signal_runs` and `kill_runs`.
+  - `Node._reap`'s survivor stop.
+
+  The inert guard in `_steps` is now this predicate: a HELD session takes no further step in a pass.
+- **No race with the transition (A4).** The check and the signal run under the owner's serialization, and so does the
+  HELD transition: the node's runner lock for hosted sessions (the loop's pass, the watchdog, shutdown), and the node's
+  one loop thread for dispatched runs (`run`'s loop, then `shut_down` on the same thread).
+- **No new wait.** `may_signal` reads a HELD index (`Groups.held`) without the registry lock. The index is written
+  under the lock at each transition and at the release, so no pass and no signal site waits on the registry. A spawn
+  holds the registry across process creation (round 8, C1). A version that read the registry under its lock failed
+  round 8's pins.
+- **What a HELD record still gets** on every pass: the proof, and release once it is True.
+- **Shutdown** returns with HELD records still reserved and durable, and does not re-arm them.
+- **The normal kill path.** A KILL that returns with members left keeps the group STOPPING, with `killed` latched. It
+  sends no further numeric signal: the kill scan is latched, `_stop` is a no-op once stopping, and the survivor branch
+  sends nothing for a stopping session. It becomes HELD at the release rule if the later proof fails.
+- **Round 5's Z, inverted on purpose (A1).** A shutdown KILL that RAISES now leaves the group HELD: no later kill by
+  number, since delivery is uncertain. Identity-safe retries are C2's and C3's.
+
+#### R3: the claim's scope, and the comments
+
+- **The scope.** `Groups.release` is the removal path of a live node's started groups.
+  - A spawn that fails removes its provisional registration in `start`.
+  - A start never made, or a claim lost, has no group to release.
+  - After a successful proof, a crash before the next save leaves a stale disk record. That is the conservative
+    direction.
+- **The C3 hole.** Unchanged startup recovery (`stop_verified`) signals only a leader it verifies, so a leaderless
+  survivor is neither signalled nor reserved, and its entry is dropped. The comments that promised otherwise are
+  corrected: `Node.recover`, the node's `report_stopped`, `_stop_all`, and node_groups' module text.
+
+#### R4: the real proof, pinned in the suite
+
+`test_r4_group_absent_against_real_children_of_this_test` is macOS-only, and uses only its own children and its own
+temporary directory. It checks:
+- a live member is listed;
+- a zombie leader is listed;
+- the member alone is listed once the leader is reaped;
+- a listing that fills its buffer is no proof (the truncation rule, made reachable by `_LISTING_ROOM`);
+- an empty group is absent.
+
+The scratch test of sessions and runs stays out of the suite.
+
+#### C1's stated limit
+
+A HELD session can stay held indefinitely if a member never exits. Its turn is then still in flight at the hub, and
+the only sign is a log line, written once at the transition (and `_lingering`'s for a group that outlived its
+SIGKILL). That remains so until C3 reports held checkouts in the node's status.
+
+#### Tests (tests/test_ownership_c1.py)
+
+- **The reproductions,** all failing on 3493ee6:
+  - `test_r1_a_retained_session_fences_its_checkout_until_the_proof` and `..._run_...`;
+  - `test_r2_a_held_session_is_never_signalled_by_number_again[reap|kill_scan|cancel|close|shutdown|stop_turns]`;
+  - `test_r2_a_held_run_is_never_signalled_by_number_again[reap|signal_runs|timeout]`;
+  - `test_r2_held_is_sticky_until_the_proof_is_true[false|raises|none]`.
+- **The amendment's pins:**
+  - `test_a3_a_refused_release_with_its_entry_missing_still_fences_the_checkout`;
+  - `test_a3_the_rules_fence_on_a_miss`;
+  - `test_a4_the_held_transition_cannot_come_between_the_signal_check_and_the_signal`: a transition attempted between
+    the check and the TERM waits for the runner lock, so the order is check, TERM, HELD;
+  - `test_r2_the_runners_shutdown_steps_never_signal_a_held_session`.
+- **R4's** real-process pin.
+- `test_r5_z_...` inverted (A1). `test_agent_accounts`' `groups.start` wrapper passes the key through.
+
+#### Mutation check (review round 1)
+
+23 rows: HELD's states (4), its transition and fence (3), the predicate and its index (2), every signal site (7), the
+two fences (2), the runner's two shutdown steps (2), and four C1 rows re-anchored on lines this round rewrote.
+- On 5d692a2, 22 are caught.
+- **Missed: "the reap's survivor stop only while it may be signalled".** For signals it is equivalent, because `_stop`
+  also checks HELD; but it let the reap decide the turn of a HELD session.
+- **Two run rows** were caught only by the slow stand-in e2e test, not by a targeted test.
+- 83d9632 pins all three directly (a HELD session's turn stays unsettled; a HELD run logs no survivor stop; a run's
+  refused release with its entry missing still fences), and all three are caught.
