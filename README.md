@@ -2647,6 +2647,38 @@ they never start a real agent CLI. Hosted-session tests use scripted fake proces
 (`tests/stand_in_claude.py`); one runs `scripts/session-host-e2e.py`, which starts a real hub and node in a temp
 directory with that stand-in.
 
+### Running the tests in parallel (opt-in)
+
+```bash
+uv run pytest -q -n auto --dist worksteal
+```
+
+This uses `pytest-xdist` (a dev dependency) to spread the tests over one worker process per CPU. A plain
+`uv run pytest` is unchanged: serial, in the usual order. Parallel runs collect and run the same tests as the serial
+run. The totals are the same (passed plus skipped equals the count from `uv run pytest --collect-only -q`), and
+every node id runs exactly once. No test is grouped or kept serial: each worker is its own process, so
+process-wide state (the session host's watch registry, patched loggers, environment variables, the current
+directory) is not shared, and tests use their own `tmp_path`, in-process ASGI clients or free ports, and their own
+child processes.
+
+The wall time is set by one test, `test_the_end_to_end_script_passes_with_the_stand_in`
+(scripts/session-host-e2e.py), which takes about 240 seconds even alone because it mostly waits. The rest of the
+suite takes about 45 seconds on 18 workers. Under xdist, `tests/conftest.py` starts that test first, and
+`--dist worksteal` hands the tests queued behind it to idle workers, so the run ends soon after it. That
+reordering happens only in xdist workers. Plain `-n auto` (the default `--dist load`) also passes and took about
+the same time in one run. Worksteal keeps a slow test from waiting behind that one. To skip the 240-second test
+while iterating, add `--deselect tests/test_hosted_sessions.py::test_the_end_to_end_script_passes_with_the_stand_in`.
+That run no longer covers the whole suite.
+
+Measured on an 18-core Mac with other work running (load average about 4 to 7), 5331 passed and 10 skipped every
+time:
+
+| Command | Wall time |
+| --- | --- |
+| `uv run pytest -q` (serial) | 721 s, 738 s |
+| `uv run pytest -q -n auto --dist worksteal` | 253 s, 249 s, 252 s |
+| `uv run pytest -q -n auto` | 254 s |
+
 ## Files
 
 ```

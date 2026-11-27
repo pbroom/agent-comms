@@ -26,6 +26,22 @@ def legacy_plain(env, post_id: int, type: str | None = None) -> None:
                            (type, post_id))
 
 
+# A parallel run (`pytest -n auto --dist worksteal`, README "Tests") starts this test first. It runs
+# scripts/session-host-e2e.py, which takes about 240 s, mostly waiting: longer than the whole rest of the suite
+# on 18 workers (about 45 s), so started late it decides the wall time. Started first, with worksteal handing what
+# was queued behind it to idle workers, the run ends soon after it does. Only one test goes first: a worker
+# holds the test after the one it is running (pytest's `nextitem`), so a second long test placed next would wait
+# out the first. Order only: every test still runs, and a serial `pytest` keeps its usual order. If the node id
+# changes, nothing breaks; the test is simply not moved.
+START_FIRST_IN_PARALLEL = "tests/test_hosted_sessions.py::test_the_end_to_end_script_passes_with_the_stand_in"
+
+
+def pytest_collection_modifyitems(config, items):
+    if not hasattr(config, "workerinput"):     # only an xdist worker has it: a serial run keeps its order
+        return
+    items.sort(key=lambda item: item.nodeid != START_FIRST_IN_PARALLEL)     # stable: the rest keep their order
+
+
 @pytest.fixture(autouse=True)
 def _hostlog_fresh():
     """Each test starts with an empty host-side log queue (agent_comms.hostlog): no record a former test's watchdog
