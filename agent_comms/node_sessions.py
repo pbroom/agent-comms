@@ -1785,7 +1785,11 @@ class SessionRunner:
 
     def kill(self) -> None:
         """After `signal()` and the grace period: SIGKILL for every session process group that is still there. No
-        reporting; `shutdown()` then finds them gone."""
+        reporting; `shutdown()` then finds them gone. (C1, review round 3, S1) The veto set here may fall on a token
+        still LIVE in the registry (`signal()` sends its TERM without marking it STOPPING). That leaves no admission
+        bypass, by this precondition: from `stopping` (set by `signal()`) on, nothing starts a group. The loop's pass
+        and the watchdog return on `stopping` before touching the host, and dispatched runs are admitted only by
+        `Node.tick`, on the thread that is running this shutdown (node.py `run`, then `shut_down`)."""
         with self.lock:
             for s in self.host.sessions.values():
                 if self._going(s) and self.host.groups.may_signal(s.group_token):     # (C1: never a HELD one)

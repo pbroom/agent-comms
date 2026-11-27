@@ -855,3 +855,65 @@ def test_r5_a1_a_killed_group_that_outlives_its_kill_is_still_said_in_the_log(he
     assert [r for r in caplog.records if "is still there" in r.getMessage()], caplog.text
     assert henv.host.groups.state(s.group_token) == henv.host.groups.STOPPING, "main's survivor branch"
     assert s.child is child and s.stopping_since == clock
+
+
+# ---------------------------------------------------------------- review round 3: S1 (the shutdown precondition), S2
+
+
+def test_s1_after_stopping_no_session_group_is_started(env):
+    """Review round 3, S1: from `stopping` (set by `SessionRunner.signal`) on, nothing starts a session's group: a
+    session waiting for its first process gets none from the loop's pass or the watchdog's (so a veto that the
+    shutdown's KILL step puts on a token still LIVE leaves no admission beside it)."""
+    from test_hosted_sessions import start
+    runner = env.node.sessions
+    host = runner.host
+    starts = []
+    real = host.groups.start
+    host.groups.start = lambda *a, **k: (starts.append(a[1]), real(*a, **k))[1]
+    start(env, "a turn")            # (on the hub, not yet given a process)
+    runner.signal()
+    runner.pass_once()
+    runner.enforce_deadlines()
+    assert starts == [], "no group started after stopping"
+
+
+def test_s1_shutdown_starts_no_dispatched_run(nenv):
+    """Review round 3, S1: a dispatched run assigned to this node when it shuts down is never started by the
+    shutdown (its admission, `Node.tick`, runs on the thread that runs `shut_down`)."""
+    from agent_comms.node import shut_down
+    from test_nodes import allow, human_post
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()                   # (assigned to the node; the node has not ticked)
+    starts = []
+    real = nenv.node.groups.start
+    nenv.node.groups.start = lambda *a, **k: (starts.append(a[1]), real(*a, **k))[1]
+    shut_down(nenv.node)
+    assert starts == [] and nenv.node_spawner.calls == []
+
+
+def test_s2_a_failed_final_read_still_says_the_hold_once(henv, caplog):
+    """Review round 3, S2: the release path's final reads raise after the fence: the fence stays (HELD), and the one
+    retention line is written on that path too; a later pass that still cannot prove the group gone says nothing
+    more."""
+    import logging
+    s, child = _a_turn(henv)
+    henv.host.group_absent = lambda pgid: False
+    child.code = 0
+    real = henv.host._drain_before_stop
+    calls = []
+
+    def drain(sess, now, out):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("a read failed")
+        return real(sess, now, out)
+    henv.host._drain_before_stop = drain
+    token = s.group_token
+    with caplog.at_level(logging.WARNING, logger="agent_comms.session_host"):
+        henv.host.tick()
+        henv.host.tick()
+    lines = [r for r in caplog.records if "could not be proved gone" in r.getMessage()]
+    assert len(lines) == 1, caplog.text
+    assert henv.host.groups.state(token) == henv.host.groups.HELD and henv.host.groups.blocked(s.cwd)

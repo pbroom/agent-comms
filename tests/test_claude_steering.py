@@ -3518,21 +3518,20 @@ def test_r5_w_kills_and_fences_with_a_drain_pending_and_a_raising_or_stalling_sa
     from test_hosted_sessions import P2
     runner = env.node.sessions
     host = runner.host
+    from test_hosted_sessions import P3
     sid, child, n, s = _claude_partial_with_n_buffered(env)
-    sid2, c2, m2 = _ordinary_turn_in_flight(env, project=P2)
-    s2 = host.sessions[sid2]
-    c2.exits_on_terminate = False
-    with runner.lock:
-        host._stop(s2, env.clock())
-    env.clock.advance(host.kill_grace + 1)
+    due = []
+    for project in (P2, P3):        # (one group per save: a group's first KILL makes it proof-only, C1 R5)
+        sid2, c2, m2 = _ordinary_turn_in_flight(env, project=project)
+        s2 = host.sessions[sid2]
+        c2.exits_on_terminate = False
+        due.append(s2)
     stall = threading.Event()
-    for save in (lambda: (_ for _ in ()).throw(OSError("the disk is full")), lambda: stall.wait(10)):
+    for s2, save in zip(due, (lambda: (_ for _ in ()).throw(OSError("the disk is full")), lambda: stall.wait(10))):
+        with runner.lock:
+            host._stop(s2, env.clock())
+        env.clock.advance(host.kill_grace + 1)
         host._save_state = save
-        c2.killed = getattr(c2, "killed", False)
-        s2.killed = False
-        # (C1, review round 2, R5: the first KILL attempt makes a token proof-only; this test's own reset, to send a
-        # second due KILL with the other save, clears that too)
-        host.groups.held.discard(s2.group_token)
         t, done, ident, err = _on_watchdog(runner)
         assert done.wait(3), "the watchdog's pass returned"
         assert s2.killed, "the due SIGKILL was sent"

@@ -177,11 +177,14 @@ class Groups:
 
     def release(self, token: Hashable, proof: Callable[[], bool], forget: Callable[[], None],
                 fence: tuple[Hashable, Any] | None = None, prepare: Callable[[], None] | None = None) -> bool:
-        """(Ownership until verified exit, C1; review round 2, R6 and A3) THE one release rule. FIRST, under the
-        registry's lock, the exact token is fenced (HELD, or a HELD entry under `fence` if it has none), so there is
-        no moment at which its entry is LIVE while the caller's last reads (`prepare`, outside the lock) or the proof
-        are in progress; then `prepare()`, then the proof, outside the lock. A True proof removes the entry and the
-        fence in one step (`_gone`); anything else leaves the token HELD. The only way a group's registry entry, and its
+        """(Ownership until verified exit, C1; review rounds 2 and 3, R6, A3 and S4) THE one release rule. FIRST,
+        under the registry's lock, the exact token is fenced (HELD, or a HELD entry under `fence` if it has none):
+        admission is fenced when the release path installs the fence under the registry lock, before the final reads
+        and the membership proof. Then `prepare()` (the caller's final reads), then the proof, outside the lock. A
+        True proof removes the entry and the fence in one step (`_gone`); anything else leaves the token HELD (also
+        when `prepare()` raises: the fence stays). Work admitted while the token was LIVE can coexist with a survivor
+        discovered afterwards: a LIVE entry never fenced admission on main, and C1 does not change that (excluding it
+        would need a LIVE entry to fence, which would stop runs sharing an idle session's checkout). The only way a group's registry entry, and its
         owner's tracking record (whose durable entry is that record's projection), go. `proof()` answers whether the
         group is proved gone; it is supplied by the caller, so how absence is proved (today: the leader's exit observed
         by its owning handle and `group_absent`; later an anchor's own word) never touches this rule or its callers.

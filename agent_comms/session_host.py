@@ -1847,11 +1847,16 @@ class SessionHost:
             s.group_token = s.group_key = None
         was = self.groups.state(token) == self.groups.HELD
         fence = (s.group_key if s.group_key is not None else node_groups.key(s.cwd), s.cwd)
-        released = self.groups.release(token, lambda: child.poll() is not None and self.group_absent(child.pid),
-                                       forget, fence, prepare)
-        if not released and not was:
-            log.warning("session %s: its process group could not be proved gone: its checkout stays held (no signal "
-                        "is sent to it again)", s.session_id)
+        released = False
+        try:
+            released = self.groups.release(token, lambda: child.poll() is not None and self.group_absent(child.pid),
+                                           forget, fence, prepare)
+        finally:
+            # (C1, review round 3, S2) the one retention line, also when the final reads raised after the fence
+            # (the fence stays: HELD), so no hold is ever silent
+            if not released and not was:
+                log.warning("session %s: its process group could not be proved gone: its checkout stays held (no "
+                            "signal is sent to it again)", s.session_id)
         return released
 
     LINGER_LOG_SECONDS = 60.0       # how often a process group that outlives its SIGKILL is said again

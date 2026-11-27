@@ -16854,7 +16854,10 @@ Both blockers are edges of the HELD transition. After a KILL it came too late; b
      which now come AFTER the fence (A3).
   3. The proof.
   4. A True proof removes the entry and the fence in one step (`_gone`). Anything else leaves the token HELD.
-- **There is no moment at which the entry is LIVE** while the reads or the proof are in progress.
+- **The boundary (stated exactly in review round 3, S4):** admission is fenced when the release path installs the
+  fence under the registry lock, before the final reads and the membership proof. Work admitted while the token was
+  LIVE can coexist with a survivor discovered afterwards. A LIVE entry never fenced admission on main, and C1 does not
+  change that: excluding it would need a LIVE entry to fence, which would stop runs sharing an idle session's checkout.
 - **A fence that lifts in the same call is silent.** The "could not be proved gone" line is written only when the
   release is refused and the token was not HELD in the registry before.
 - **A4 and R6.3: a refusal at that fence defers, as a STOPPING refusal does today.** Neither fails the work:
