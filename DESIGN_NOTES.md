@@ -16654,3 +16654,19 @@ guard, the run's proof, the run's reap and `report_stopped`.
 - 16a641e's pin also lets the turn's timeout and a kill grace pass. Without the guard, main's timeout would arm a stop
   and the kill scan would send SIGKILL; with it, the row is caught.
 - The results are in scripts/steering-mutation-results.txt.
+
+### Runs (C1, on 73309f7, rebased onto main 03268de)
+
+Claude Code 2.1.330 and codex-cli 0.172.0, run the way scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- The full suite, serial: 5356 passed, 10 skipped, in 12 min 32 s.
+- The `~/.codex/config.toml` hash was 18fcebe0d94018f8 before, after each real run and at the end.
+- The protected files are unchanged.
