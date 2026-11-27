@@ -1637,29 +1637,54 @@ def test_r11_an_enqueue_after_the_seal_raises_nothing_starts_nothing_and_blocks_
 
 def test_r11_the_seal_and_the_idle_decision_are_one_step(monkeypatch):
     """R11 (the atomicity): a producer that tries to enqueue exactly when the final wait has decided "idle" cannot get
-    in before the seal: its record is rejected and no handler is entered."""
+    in before the seal: its record is rejected and no handler is entered.
+
+    Deterministic: `_cond` is wrapped so that, once "idle" has been decided, any LATER entry of the queue's lock by the
+    deciding thread first lets the producer in (and waits until it has enqueued or been rejected). A seal made in a
+    second critical section is therefore always preceded by the producer's record; the seal made in the deciding
+    critical section never re-enters, and the producer runs only after it."""
     import threading
     import time as _time
     from agent_comms import hostlog, session_host
-    real, go, done = hostlog._idle_by, threading.Event(), threading.Event()
+    real_idle_by, real_cond = hostlog._idle_by, hostlog._cond
+    go, done, decided, main = threading.Event(), threading.Event(), [False], threading.get_ident()
+
+    class Gate:
+        def __getattr__(self, name):
+            return getattr(real_cond, name)
+
+        def __enter__(self):
+            if decided[0] and threading.get_ident() == main:
+                decided[0] = False
+                go.set()                    # (the producer runs now, with the queue's lock free)
+                assert done.wait(5)
+            return real_cond.__enter__()
+
+        def __exit__(self, *a):
+            return real_cond.__exit__(*a)
 
     def idle_by(deadline, **k):
-        ok = real(deadline, **k)
-        if ok:
-            go.set()
-            _time.sleep(0.3)        # (a producer runs now, while the decision is made)
+        ok = real_idle_by(deadline, **k)
+        decided[0] = ok
         return ok
-    monkeypatch.setattr(hostlog, "_idle_by", idle_by)
 
     def producer():
-        go.wait(5)
+        go.wait(10)
         session_host.log.warning("between the idle decision and the seal")
         done.set()
     with _Records() as rec:
+        monkeypatch.setattr(hostlog, "_idle_by", idle_by)
+        monkeypatch.setattr(hostlog, "_cond", Gate())
         threading.Thread(target=lambda: _on_watch_thread(producer), daemon=True).start()
-        assert hostlog.final_flush(2.0) is True
-        assert done.wait(5)
-        _time.sleep(0.3)
+        try:
+            assert hostlog.final_flush(2.0) is True
+        finally:
+            decided[0] = False
+            go.set()                        # (the seal is made: the producer runs now, and is rejected)
+            assert done.wait(5)
+            monkeypatch.setattr(hostlog, "_cond", real_cond)
+        assert hostlog._state["sealed"]
+        _time.sleep(0.2)
     assert "between the idle decision and the seal" not in rec.messages()
 
 
@@ -1706,6 +1731,11 @@ def test_r12_a_writer_that_cannot_start_never_fails_a_log_call(monkeypatch):
     assert _time.monotonic() - t0 < 0.5
     assert len(calls) == 1, "one start attempt, not one per line"
     assert hostlog._writer[0] is None and not hostlog._state["starting"]
+    # (the production start points, refused too: `node.run`'s forced start and the pass boundary's retry, which is
+    # rate-limited; neither raises)
+    assert hostlog.start_writer(force=True) is False and len(calls) == 2
+    assert hostlog.start_writer() is False and len(calls) == 2, "within RESTART_SECONDS: not tried again"
+    assert not hostlog._state["starting"]
 
 
 def test_r12_the_final_wait_does_not_wait_for_a_writer_that_cannot_start(monkeypatch):
