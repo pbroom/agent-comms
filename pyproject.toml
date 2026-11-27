@@ -20,7 +20,11 @@ Repository = "https://github.com/pbroom/agent-comms"
 board = "agent_comms.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "jsonschema>=4.26"]   # jsonschema: the required differential test of output_schema.py (tests only)
+dev = [
+    "pytest>=8",
+    "jsonschema>=4.26",     # the required differential test of output_schema.py (tests only)
+    "pytest-xdist>=3.8.0",  # opt-in parallel test runs (`-n auto`, see README "Tests"); a plain `pytest` stays serial
+]
 
 [build-system]
 requires = ["hatchling"]
