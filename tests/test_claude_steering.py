@@ -4716,6 +4716,22 @@ def test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order(env):
     assert term_at is not None
 
 
+def test_r8_c1_a_failed_sigterm_starts_no_kill_clock(henv, monkeypatch):
+    """Ruling C1.4: the reserved stop's SIGTERM raises: no kill clock is started (`stopping_since` stays unset)."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.clock.advance(21)
+
+    def bad():
+        raise OSError("the signal failed")
+    child.terminate = bad
+    with pytest.raises(OSError):
+        henv.host._hold_cut(s, henv.clock(), henv.host._outbox, drain=False)
+    assert s.stopping_since is None, "no kill clock from a SIGTERM that failed"
+
+
 def test_r8_c1_a_lost_claim_leaves_no_stopping_barrier(henv, monkeypatch):
     """Ruling C1 (pin): the claim is lost between the deadline and the attempt (the latch came): no STOPPING barrier
     is left on the checkout, nothing is claimed or signalled."""
