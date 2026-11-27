@@ -2103,6 +2103,10 @@ def test_a3_a_registered_writer_that_dies_releases_every_waiter(monkeypatch):
     session_host.log.warning("the writer dies on this one")
     assert _time.monotonic() - t0 < 1.0, "the waiter was released by the death"
     assert _wait(lambda: not writer.is_alive()) and hostlog._writer[0] is None
+    # (no start is left pending by the registration that the death undid: the final wait is writer-less at once)
+    assert hostlog._state["token"] is None
+    t0 = _time.monotonic()
+    assert hostlog.final_flush(1.0) is True and _time.monotonic() - t0 < 0.3
 
 
 def test_r15_the_final_wait_starts_nothing_and_returns_within_its_bound(monkeypatch):
