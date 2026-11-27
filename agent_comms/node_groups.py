@@ -35,11 +35,12 @@ class Groups:
         self.lock = threading.RLock()
         self.entries: dict[Hashable, dict[Hashable, list]] = {}     # dir key -> group token -> [state, cwd]
 
-    def start(self, cwd: Any, token: Hashable, spawn: Callable[[], Any]) -> tuple[bool, Any]:
+    def start(self, cwd: Any, token: Hashable, spawn: Callable[[], Any], k: Hashable | None = None) -> tuple[bool, Any]:
         """Start a process group in `cwd` unless one being stopped is there: (False, None) and nothing is spawned;
         else the group is recorded live and `spawn()` runs under the lock: (True, what it returned). A spawn that
-        raises records nothing."""
-        k = key(cwd)
+        raises records nothing. `k`: the directory's key, computed once by the caller (who keeps it with the process:
+        session_host `_spawn`, review round 1 of the enabling PR, A3); else computed here."""
+        k = key(cwd) if k is None else k
         with self.lock:
             if any(state == self.STOPPING for state, _ in self.entries.get(k, {}).values()):
                 return False, None
