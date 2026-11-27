@@ -16078,3 +16078,29 @@ Machine load averages were 5.3 to 5.5 throughout.
   runs, between the two real runs, and after. That is the baseline.
 - Before the commit, the steering, tripwire, Codex, host, correlation, hosted, structured-result, restart, node,
   spawn and tree suites: 2094 passed, 10 skipped.
+
+#### After round 11: the gate's finding (script only)
+
+- **Sol's verdict.** Sol APPROVED 48bcd5c for the off configuration. The gate then found one real failure, in
+  scripts/session-host-e2e.py.
+- **The failure.** With the real Claude Code 2.1.330, `--only steer` failed at S1, the step-2 check that a steer for a
+  running Claude turn is refused. Since round 9 the script's node configuration had set `claude_steer = true` for
+  every run, so the real CLI accepted the steer. The stand-ins passed because the stand-in's version takes no steer.
+- **The fix (d38fdb6; backup branch `backup/claude-steering-48bcd5c`).** Every node of the script now runs with the
+  shipped default, with no `claude_steer` key: codex, claude, steer S1–S6, correlation, structured, check, tree and
+  board. Only the steering section's own node (Q1–Q8 and Z0–Z4, `--only steering`) writes `claude_steer = true`.
+  - Z1–Z3 steer, so they need the switch on.
+  - Q3's real-CLI branch also needs it: it expects a version that passed gate M8 to steer.
+  - No change to agent_comms/ or tests/.
+- **What S1 shows now.** With `--claude-bin`, it proves the shipped configuration on the real CLI: the steer is
+  refused as on main, nothing is sent, and the turn runs to its end.
+- **Runs on d38fdb6.**
+  - Real CLIs (Claude Code 2.1.330, codex-cli 0.172.0), all PASS:
+    - `--only steer`: 28 checks, S1 ok;
+    - `--only steering`: 54;
+    - `--only correlation`: 23;
+    - `--only structured`: 30;
+    - `--only tree`: 101.
+  - Stand-ins, all PASS: steer 27, steering 115, correlation 24, structured 36, tree 143; the full stand-in e2e 395.
+  - The full suite: 5277 passed, 10 skipped, in 11 min 37 s. Its stand-in e2e test passed.
+  - The `~/.codex/config.toml` hash was 18fcebe0d94018f8 before, after each real run and at the end.
