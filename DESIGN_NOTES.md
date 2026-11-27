@@ -15552,3 +15552,133 @@ Earlier in the round, while another program kept this machine busy (load average
 the stand-in e2e (tests/test_hosted_sessions.py, a 300-second limit) ran out of time. That happened on this branch
 and on 072b20f alike: the e2e took 353 s and 366 s when timed directly, and passed both times. It is not a change of
 this round. The final runs above were made once the machine was quieter.
+
+### Review round 7 (on 1a0c822: CHANGES, two regressions against main; M8 evidence sufficient) and what changed
+
+Backup branch `backup/claude-steering-1a0c822`. Sol found two blockers, both regressions of this branch against
+main e6b421f, and two [should] items. Sol's pre-check of the rulings added three amendments (A1 to A3). Each of Sol's
+sequences is a test written first: on an export of 1a0c822, 9 of round 7's 12 tests fail. The 3 that pass there are
+pins: the shutdown entry point that signals first, the caller's prior diversion, and no I/O in a held publication.
+The tests the mutation check called for are listed with it.
+
+#### R7-1 and A1. The watchdog's pass has one critical section, as main (the node and the host)
+
+- **The class.** Any lock structure in the watchdog's pass that differs from main's, and any wait inside its one
+  section that main does not have. On 1a0c822 the steer deadlines took the runner lock a second time, with a timeout.
+  After the kill scan the loop could take the lock and keep it through that timeout, and the next pass then started
+  a watch interval later. A kill that came due after the scan went that much later than on main.
+- **Owner: `SessionRunner.enforce_deadlines`.** It takes the runner lock once per pass, with main's unbounded wait,
+  and runs main's order inside: the self-stop, the due SIGKILLs, the steer deadlines. The bounded second section is
+  removed. The lock structure is now identical to e6b421f's, so a kill's time can differ from main's only by how long
+  the work inside the section takes.
+- **The Claude steer-deadline step waits for nothing.** It calls:
+  - `_steer_watch`: memory and the slots' locks.
+  - `SessionHost.steer_deadlines(watchdog=True)`: an outbox swap in memory and one drain budget. Per session:
+    - A Claude frame taken in part is not cut on this thread (round 5).
+    - A held end's cut (`_hold_cut(drain=False)`) takes the cutoff lock. Every holder of that lock does in-memory
+      work only, its log lines deferred. It then makes the claim (`_fail` → `_finalize_hold`: in memory) and
+      `_stop(wait_registry=False)`.
+    - The fence (`_hold_deadline` → `_publish_hold`): the adapter's retirement and the outbox append, both in memory.
+  - On this thread every save, transcript line and log line is deferred (rounds 5 and 6).
+  - A1: `_stop(wait_registry=False)` takes the group registry only if it is free at once (`Groups.try_stopping`, a
+    non-blocking acquire). If the registry is busy (a spawn holds it across process creation), the hold is already
+    fenced and its decision recorded by the claim. The stop is left for a later pass (`Session.stop_due`), with no
+    `stopping_since` and no SIGTERM, so no kill clock runs. It is retried every pass: on the watchdog's thread,
+    non-blocking again; in the loop's tick, with main's blocking wait. The real SIGTERM dates it (R8-01).
+  - What remains: `poll` (WNOHANG), the group probe (`killpg(pgid, 0)`) and the SIGTERM. These are signals and
+    memory.
+
+  Nothing on the path can block. Main's own self-stop registry wait is inherited and stays as it is (round 6's N4
+  pin).
+- **Tests.**
+  - `test_r7_1_a_kill_due_after_the_scan_goes_when_main_would` (Sol's sequence, with the real watchdog thread).
+  - `test_r7_1_the_watchdogs_pass_takes_the_runner_lock_once`, which replaces round 6's bounded-wait test.
+  - `test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry`: a spawn holds the registry while a
+    held end's contact runs out and another session's kill comes due. The kill goes on the watchdog's cadence. The
+    hold is fenced with no SIGTERM and no kill clock. Its stop goes once the registry is free, and its SIGKILL is not
+    before its real SIGTERM plus the grace.
+  - S36 and R8-01c pass unchanged.
+- **Residual.** If the registry stays busy for more than twice the grace after the claim, the fence can publish N's
+  end before the deferred SIGTERM goes. The decision is already made and the publication is bounded; the SIGTERM
+  still follows on the next pass that can take the registry.
+
+#### R7-2 and A2. At shutdown, no log handler runs ahead of a signal (the host)
+
+- **The class.** Anything logged on the thread running `stop_all` between its entry and the last SIGKILL attempt:
+  - a held end's diagnostic in `_fail`, also with S's own turn open;
+  - a raising SIGTERM's or SIGKILL's line;
+  - anything else.
+
+  On 1a0c822 a stalling handler there held up the SIGTERMs of every later group and the whole bulk SIGKILL pass.
+- **Owner: `SessionHost.stop_all`.** The thread is put into `WATCH_THREADS` for the whole span, the same mechanism
+  the watchdog uses. It is taken out once the bulk SIGKILL pass is done, or in a `finally` if the span raised. The
+  thread's PRIOR state is restored (a thread that was already diverting still is) before the lines are replayed.
+  The final save runs after that restoration, so it is a real save.
+- **What else on this branch, and not on main, sits in that span.** The publication of a held end's result in
+  `_fail` (`_finalize_hold` → `_publish_hold` at `_at_once`) is new here; main has no held ends. It stays where it
+  is, to keep event order:
+  - its outbox append is in memory;
+  - its save is suppressed by `_defer_save` and made by `stop_all` at its end;
+  - its diagnostic is deferred.
+
+  `_steer_end`'s decision is in memory too. Everything else in the span is main's: `_fail`'s ordinary end,
+  `_stop`'s registry, probe and SIGTERM, the wait, and the SIGKILLs.
+- **Tests.**
+  - `test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[held|s_turn]`.
+  - `test_r7_2_a_raising_kill_with_a_stalling_handler_still_kills_the_siblings`.
+  - `test_r7_2_both_shutdown_entry_points_signal_every_group_with_a_stalling_handler[shutdown|signal_then_shutdown]`:
+    the loop-exit cleanup calling `sessions.shutdown()` directly (node.py), and the node's shutdown, which signals
+    first. `[signal_then_shutdown]` is a pin.
+  - `test_r7_a2_stop_all_restores_the_callers_prior_diversion` (pin).
+  - `test_r7_a2_a_held_publication_at_shutdown_does_no_io` (pin).
+
+#### A3 and R7-3. What a deferred line carries (the host)
+
+- **A3.** A deferred line carries the exception's TYPE only, never its text: arbitrary exception text gives no
+  guarantee against steer or message text. Compared with main's immediate line, a deferred line loses the
+  exception's text and its traceback. Test: `test_r7_a3_a_deferred_line_carries_the_exception_type_only`, with an
+  exception whose text carries a steer-like marker.
+- **R7-3.** The queue counts what it drops when full, and the replay writes one line with the count. Test:
+  `test_r7_3_the_deferred_queue_counts_what_it_drops`.
+
+#### Known limits, stated precisely (R7-3)
+
+- **The transcript guarantee at shutdown.**
+  - What it keeps: lines already buffered (the watchdog's `tee_pending`) and what each process wrote before its
+    group's SIGKILL. Both are written in the per-session cleanup after the bulk SIGKILL pass.
+  - What it does not keep: output a sibling would have produced while main was still cleaning up another session.
+    That sibling's SIGKILL now comes before that cleanup (round 6, N2).
+- **The `_log` hook's scope.**
+  - It replaces a private method of `logging.Logger` for the whole process.
+  - It forwards other threads and other packages unchanged (keeping `isEnabledFor`).
+  - A replayed line has the replay's call site and no `extra` or stack information.
+  - It keeps the message's raw arguments until the replay (A3 now drops the exception object).
+  - A patch of `_log`, or of a method above it, can go around it.
+
+  The package-owned logger adapter (each package logger, providers included, queuing reviewed fields only) is listed
+  for the hardening PR. This PR does not rework the hook.
+
+#### Mutation check, review round 7
+
+Only round 7's rows ran, as the round asked: R7-1, A1 (three rows), R7-2 and A2 (four rows), A3 and R7-3, plus round
+4's "stop_all's final save in a finally", re-anchored on its new line. The whole set (130 rows now) last ran in round
+6. The output is in `scripts/steering-mutation-results.txt`.
+- **Run 1** (a946a1b, 11 rows): 8 caught, 3 missed. Each miss got a test (85e13d7):
+  - "A1 a deferred stop is retried" (the loop's retry): `test_r7_a1_the_loop_sends_a_deferred_stop_by_itself`. The
+    watchdog's own retry had stood in for it.
+  - "R7-2 the replay after the last SIGKILL, not before": `test_r7_2_what_a_process_wrote_last_reaches_its_transcript_at_shutdown`.
+    Ending the deferral only at the very end would hold the cleanup's transcript lines back too, and lose them when
+    the fd closes.
+  - "R7-2 the final save made with logging restored": `test_r7_2_a_stop_all_that_raises_still_saves_for_real`. On a
+    raise, a save made before the restoration would be left deferred, and the state file would not be written.
+- **Run 2** (85e13d7): all 3 caught.
+
+All 11 caught.
+
+#### Runs
+
+After the last code commit (a946a1b; 85e13d7 and later add tests and results only), on 26 November, as the round
+asked (the coordinator's gate runs every e2e set):
+- `uv run pytest -q -p no:cacheprovider`: 4855 passed, 10 skipped, 0 failed.
+- `--only steering` with stand-ins: PASS (115 checks).
+- No real CLI was run, so `~/.codex/config.toml` was not touched or read.
