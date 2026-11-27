@@ -44,22 +44,39 @@ def _libproc():
     return _LIBPROC[0]
 
 
+def _listpids(lib, pgid: int, buf, size: int) -> int | None:
+    """(C1, review round 4) ONE `proc_listpids(PROC_PGRP_ONLY, pgid, buf, size)` call: its byte count, or None when it
+    failed. Apple's libproc wrapper returns 0, NOT -1, when the underlying `__proc_info` syscall fails, and leaves the
+    cause in errno, which the syscall stub sets on every failure (and it returns 0 with errno EINVAL for a type it does
+    not take). So errno is cleared before the call and read after it (ctypes' copy: the library is loaded with
+    `use_errno`): a result of 0 or less with errno set is a failure, and so is any negative result; 0 with errno 0 is
+    the only "nothing" answer. What is relied on: that a failed syscall always sets errno. Nothing distinguishes
+    further a 0 with errno 0, and no signal is used to probe it."""
+    ctypes.set_errno(0)
+    n = lib.proc_listpids(PROC_PGRP_ONLY, pgid, buf, size)
+    err = ctypes.get_errno()
+    if n < 0 or (n <= 0 and err != 0):
+        return None
+    return n
+
+
 def group_members(pgid: int) -> tuple[int, ...] | None:
     """(Ownership until verified exit, C1) A COMPLETE listing of the processes in process group `pgid`, zombies
     included: macOS libproc's `proc_listpids(PROC_PGRP_ONLY)`, one call that the kernel answers from its process lists
-    under their lock, so a coherent snapshot. None when no complete listing could be made: no libproc, an error, or a
-    buffer the listing filled (it may have been truncated: a larger one is tried, a few times)."""
+    under their lock, so a coherent snapshot. None when no complete listing could be made: no libproc, a failed call
+    (review round 4: 0 with errno set, `_listpids`), or a buffer the listing filled (it may have been truncated: a
+    larger one is tried, a few times)."""
     lib = _libproc()
     if lib is None or isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1:
         return None
     for extra in _LISTING_ROOM:
-        need = lib.proc_listpids(PROC_PGRP_ONLY, pgid, None, 0)     # (an estimate, in bytes: every process's room)
-        if need < 0:
+        need = _listpids(lib, pgid, None, 0)        # (an estimate, in bytes: every process's room)
+        if need is None:
             return None
         n = need // ctypes.sizeof(ctypes.c_int) + extra
         buf = (ctypes.c_int * n)()
-        got = lib.proc_listpids(PROC_PGRP_ONLY, pgid, buf, ctypes.sizeof(buf))
-        if got < 0:
+        got = _listpids(lib, pgid, buf, ctypes.sizeof(buf))
+        if got is None:
             return None
         if got < ctypes.sizeof(buf):        # (room was left: the listing is complete)
             return tuple(p for p in buf[:got // ctypes.sizeof(ctypes.c_int)] if p)

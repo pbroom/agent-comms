@@ -917,3 +917,71 @@ def test_s2_a_failed_final_read_still_says_the_hold_once(henv, caplog):
     lines = [r for r in caplog.records if "could not be proved gone" in r.getMessage()]
     assert len(lines) == 1, caplog.text
     assert henv.host.groups.state(token) == henv.host.groups.HELD and henv.host.groups.blocked(s.cwd)
+
+
+# ---------------------------------------------------------------- review round 4: libproc's failure is 0 with errno set
+
+
+class _ErrnoLib:
+    """A stand-in libproc whose `proc_listpids` answers (estimate, listing) as told: an int, or ("fail", errno) for a
+    failed call as Apple's wrapper reports it (0, with the cause left in errno)."""
+
+    def __init__(self, estimate, listing):
+        self.estimate, self.listing = estimate, listing
+
+    def proc_listpids(self, kind, pgid, buf, size):
+        import ctypes
+        what = self.estimate if buf is None else self.listing
+        if isinstance(what, tuple):
+            ctypes.set_errno(what[1])
+            return 0
+        return what
+
+
+@pytest.mark.parametrize("failing", ["estimate", "listing", "both"])
+def test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof(monkeypatch, failing):
+    """Review round 4: Apple's `proc_listpids` returns 0, not -1, when its syscall fails, and leaves the cause in
+    errno. A 0 with errno set, on the estimate call or the listing call, is a FAILURE: no listing (None), not
+    absent; and a release whose proof rests on it retains, HELD (e500549 took it for an empty group)."""
+    fail = ("fail", 14)
+    lib = _ErrnoLib(fail if failing in ("estimate", "both") else 64, fail if failing in ("listing", "both") else 0)
+    monkeypatch.setattr(node_groups, "_LIBPROC", [lib])
+    assert node_groups.group_members(4242) is None and node_groups.group_absent(4242) is False
+    g = node_groups.Groups()
+    g.start("/w", "t1", lambda: object())
+    assert g.release("t1", lambda: node_groups.group_absent(4242), lambda: None) is False
+    assert g.state("t1") == g.HELD
+
+
+def test_r4_zero_with_errno_clear_is_an_empty_group(monkeypatch):
+    """Review round 4: a 0 with errno 0 is the only "no member" answer: () and absent."""
+    monkeypatch.setattr(node_groups, "_LIBPROC", [_ErrnoLib(64, 0)])
+    assert node_groups.group_members(4242) == () and node_groups.group_absent(4242) is True
+
+
+def test_r4_an_errno_left_by_an_earlier_call_does_not_fail_a_clean_answer(monkeypatch):
+    """Review round 4: errno is cleared before each call: a non-zero errno left by an earlier, unrelated call does
+    not turn a clean empty answer into a failure."""
+    import ctypes
+    monkeypatch.setattr(node_groups, "_LIBPROC", [_ErrnoLib(64, 0)])
+    ctypes.set_errno(22)
+    assert node_groups.group_members(4242) == ()
+
+
+@pytest.mark.skipif(__import__("sys").platform != "darwin", reason="macOS libproc only")
+def test_r4_a_real_failed_listing_is_no_proof(monkeypatch):
+    """Review round 4, against the REAL libproc: the listing call is made with an invalid buffer address (inside
+    this process only), so the real syscall fails with EFAULT and the real wrapper returns 0 with errno set:
+    `group_members` is None and `group_absent` False, for this process's own group."""
+    import ctypes
+    import os
+    real = node_groups._libproc()
+
+    class BadBuffer:
+        def proc_listpids(self, kind, pgid, buf, size):
+            if buf is None:
+                return real.proc_listpids(kind, pgid, buf, size)
+            return real.proc_listpids(kind, pgid, ctypes.c_void_p(1), size)    # (an address nothing maps)
+    monkeypatch.setattr(node_groups, "_LIBPROC", [BadBuffer()])
+    pg = os.getpgrp()
+    assert node_groups.group_members(pg) is None and node_groups.group_absent(pg) is False
