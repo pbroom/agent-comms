@@ -16188,8 +16188,9 @@ for the hardening PR.
 ### S2. Preparation has no side effects, and escalation comes first (the host, the registry)
 
 - **Owner.** `SessionHost._reserved_stop(s, now, commit)`, THE reserved stop.
-- **Before the cutoff lock:** the group's probe, and the checkout's registry key, made with `node_groups.key`, which
-  stats the directory.
+- **Before the cutoff lock:** the group's probe. The checkout's registry key is the one `_spawn` cached with the
+  process (`group_key`), so the reserved path makes no filesystem call. (Corrected after #119: the first build
+  computed the key here with `node_groups.key`, a stat; "Enabling: review round 1", R2 and A3, replaced that.)
 - **Under the cutoff lock, in order:**
   1. The claim is confirmed available (the latch). Preparing changes nothing: the buffer, the slot, the hold and the
      adapter are as they were.

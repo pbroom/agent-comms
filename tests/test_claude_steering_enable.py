@@ -168,7 +168,23 @@ def r_cancel_held(henv, monkeypatch):
             lambda: henv.host.cancel(SID, "1", "cancelled"))
 
 
-RESERVED = [r_hold_cut, r_held_timeout, r_partial_write, r_steer_pipe, r_cancel_held]
+def r_partial_write_unverified(henv, monkeypatch):
+    """(After #119, A2) The partial frame of an attempt whose adapter then lost its verification (it no longer
+    advertises `holds`): the gate closes and the frame is cut; the attempt's recorded Claude identity (`slot.holds`)
+    still takes the reserved path (round 10, H2, as behaviour, not only the predicate)."""
+    s, child = _attempt(henv, monkeypatch)
+    child.accept = 7
+    henv.host.tick()
+    child.accept = 0
+    assert s.steer is not None and 0 < s.steer.sent < s.steer.length
+
+    def arm():
+        s.provider._verified = False        # (verification lost: the adapter no longer says `holds`)
+        assert not s.provider.holds and s.steer.holds
+    return s, child, arm, lambda: henv.host.tick(), lambda: henv.host.tick()
+
+
+RESERVED = [r_hold_cut, r_held_timeout, r_partial_write, r_steer_pipe, r_cancel_held, r_partial_write_unverified]
 
 
 def m_close_live(henv, monkeypatch):

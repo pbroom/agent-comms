@@ -506,7 +506,11 @@ class SessionRunner:
         watchdog's `watched_steer` and (`late`: after the listing is reconciled, as on main) its `watched`. Always
         the event published first, whatever its lane; each is put (`_put`, by its identity: a second put is a
         no-op), then removed from its source, then its receipt is forgotten. An exception anywhere leaves the event
-        in its source, in its lane; a retry puts nothing twice."""
+        in its source, in its lane; a retry puts nothing twice. (After #119, ruling A1) While `watched` waits (during
+        a reconciliation), a session's `ended` about to be handed off makes THAT session incarnation's earlier
+        `watched` events eligible first, by publication sequence: an explicit close follows the turn end the
+        watchdog's self-stop published before it, as on main. Other sessions' watched events stay where they are (a
+        LOST the reconciliation reports keeps its precedence over them)."""
         while True:
             heads = []
             e = self.host.outbox_head()
@@ -520,13 +524,21 @@ class SessionRunner:
             if not heads:
                 return
             _, src, e = min(heads, key=lambda h: (h[0], h[1]))
+            at = None
+            if not late and e.kind == "ended" and e.ident is not None:
+                at = next((i for i, w in enumerate(self.watched) if w.ident is not None
+                           and w.ident[:2] == e.ident[:2] and w.ident[2] < e.ident[2]), None)
+                if at is not None:
+                    src, e = 3, self.watched[at]    # (A1: that session's earlier watched event, first)
             self._put(e)
             if src == 0:
                 self.host.ack(e)
             elif src == 1:
                 self.watched_steer.pop(0)
-            else:
+            elif src == 2:
                 self.watched.pop(0)
+            else:
+                self.watched.pop(at)
             if e.ident is not None:
                 self.receipts.discard(e.ident)
 

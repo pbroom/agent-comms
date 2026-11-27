@@ -1788,8 +1788,14 @@ class SessionHost:
             self._correct_start_mode(s)
         was_ready, was_checking = s.ready, s.checking
         child, s.child, s.proc_start, s.ready = s.child, None, None, False
-        if s.held is not None and s.held.fenced_at is not None:
-            self._publish_hold(s, out, s.held.decided)     # its group is gone: published before any cleanup (B)
+        if s.held is not None and (s.held.fenced_at is not None or s.stopping_since is not None):
+            # Its group is gone: published before any cleanup (B). (After #119, ruling A3) Also a held end whose stop
+            # was armed but whose decision never ran (a reserved stop's commit, or a claim's decision, that raised
+            # after escalation): settled here as the finalizer settles it, the process being gone.
+            if s.held.decided is None:
+                self._finalize_hold(s, "the process was stopped", out)     # (no process: published at once)
+            else:
+                self._publish_hold(s, out, s.held.decided)
         self.groups.gone(s.group_token)      # the whole group is gone
         s.group_token = s.group_key = None
         s.sealed_by = s.confirmed_by = None     # what that process said went with it
@@ -2782,7 +2788,9 @@ class SessionHost:
             passed in by the caller and run by identity (`_stop_from`, or what that route runs on main, with main's
             registry wait) whatever `decide` raised;
         (c) only then the deferred lines, handed to the deferred queue the loop writes (`_keep_line`): no log handler
-            is called here at all.
+            is called by the claim itself or for its deferred lines. (After #119, A2) A route's own main stop logs
+            as main does: the survivor reap's stop writes main's "left members of its group" warning before its
+            SIGTERM, as main e6b421f does (inherited; for the logging PR).
         The exception that propagates is the first: `decide`'s if it raised, else the stop's; the lines never
         replace it. A steering-only stop never comes here: `_reserved_stop`."""
         lines: list = []
