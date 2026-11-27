@@ -17421,3 +17421,36 @@ Each test below fails on 5f90d53, except the pins listed last.
   (test_hosted_sessions.py). Its stand-in for the sessions now takes `shutdown(watched_until=...)` and answers
   `unproved`.
 
+#### Mutation check (review round 5)
+
+24 rows, on 52184bb: all caught.
+- **R13 (9):** the selection, reverted both to the killed runs and to a live leader; the sessions' and the host's
+  selections; each of the three watch sites (`shut_down`, `Node.stop_all`, the host); the shared deadline, on both
+  of its sides.
+- **R14 (4):** the lock taken with the budget; one non-blocking attempt when none is left; contention as still
+  unproved; the remaining budget handed on.
+- **R15 (4):** the installation inside the protected region; a cut installation; an interrupt before the
+  installation; the cleanup after `forget()`.
+- **7 re-anchored round-4 rows** whose lines this round rewrote.
+
+The script now has 239 rows. The results are in scripts/steering-mutation-results.txt.
+
+#### Runs (C1 review round 5, on 52184bb)
+
+Run 17:16 to 17:46, with load averages of 4.0 to 7.2. Claude Code 2.1.330 and codex-cli 0.172.0, run the way
+scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 55 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- **The parallel inner-loop suite:** 5456 passed, 10 skipped, in 4 min 14 s.
+- **The full suite, serial:** 5456 passed, 10 skipped, in 12 min 54 s, the in-suite e2e test included.
+- **The `~/.codex/config.toml` hash** was be07f3845d522521 (the baseline since 12:37) before, after each real run and
+  at the end. There was no further change.
+- The protected files are unchanged.
+

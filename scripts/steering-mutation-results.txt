@@ -194,3 +194,36 @@ rows: 7
 stale or broken: []
 missed: []
 exit 0
+
+# Review round 5 of C1: R13 (the watch's selection and its three sites, the shared deadline), R14 (the lock's bound,
+# the budget), R15 (the protected release), and 7 re-anchored round-4 rows, on 52184bb: all 24 caught.
+
+commit 52184bb
+CAUGHT  C1R6 R13 the node watches every run not yet proved gone (not only the killed ones)  test_r13_a_run_that_ended_on_its_sigterm_is_watched_at_shutdown
+CAUGHT  C1R6 R13 the node watches a run whose leader is already reaped  test_r9_a_run_whose_group_keeps_a_member_is_retained_past_the_bounded_wait
+CAUGHT  C1R6 R13 the sessions' watch selects every session with a handle  test_r13_the_runners_watch_selects_every_session_not_yet_proved_gone
+CAUGHT  C1R6 R13 the host's watch selects every live session, not only this pass's kills  test_r13_a_hosted_session_vetoed_by_an_earlier_kill_is_watched_at_shutdown
+CAUGHT  C1R6 R13 shut_down watches  test_r9_a_run_killed_at_shutdown_is_reported_ended_when_nothing_survives
+CAUGHT  C1R6 R13 Node.stop_all watches  test_r9_the_stop_all_fallback_waits_for_its_kill_too
+CAUGHT  C1R6 R13 the host watches  test_r9_a_hosted_session_killed_at_shutdown_is_released_when_nothing_survives
+CAUGHT  C1R6 R13 the host shares the node's deadline  test_r14_a_session_group_that_never_clears_costs_the_shared_window_once
+CAUGHT  C1R6 R13 the node hands its deadline to the host  test_r14_a_session_group_that_never_clears_costs_the_shared_window_once
+CAUGHT  C1R6 R14 the runner lock is taken with the watch's budget  test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock
+CAUGHT  C1R6 R14 no budget left: one non-blocking attempt  test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock
+CAUGHT  C1R6 R14 contention counts as still unproved  test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock
+CAUGHT  C1R6 R14 the sessions are given what is left of the window  test_r14_the_watch_hands_the_sessions_its_remaining_budget
+CAUGHT  C1R6 R15 the installation is inside the protected region  test_r15_an_interrupt_after_the_fence_is_installed_never_leaves_it_fenced[inside-the-installation]
+CAUGHT  C1R6 R15 a cut installation leaves no FENCED entry  test_r15_an_interrupt_after_the_fence_is_installed_never_leaves_it_fenced[inside-the-installation]
+CAUGHT  C1R6 R15 an interrupt before the installation leaves the token as it was  test_r15_an_interrupt_before_the_fence_is_installed_leaves_the_token_as_it_was
+CAUGHT  C1R6 R15 a proved release completes its cleanup  test_r15_an_interrupt_after_forget_still_completes_the_registry_cleanup
+CAUGHT  C1R6 the release fence is not HELD (re-anchored)  test_r10_a_start_failed_read_at_the_reap_fails_only_its_own_message
+CAUGHT  C1R6 the rule fences admission before the final reads (re-anchored)  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+CAUGHT  C1R6 a refused proof makes it HELD (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1R6 the rule releases only on proof (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1R6 the deadline ends the watch (re-anchored)  test_r9_one_shared_post_kill_deadline_for_every_killed_run
+CAUGHT  C1R6 the node's watch covers the sessions (re-anchored)  test_r9_the_nodes_watch_covers_the_sessions_it_killed
+CAUGHT  C1R6 R7-2 the replay after the last SIGKILL, not before (re-anchored)  test_r7_2_what_a_process_wrote_last_reaches_its_transcript_at_shutdown
+rows: 24
+stale or broken: []
+missed: []
+exit 0
