@@ -15682,3 +15682,109 @@ asked (the coordinator's gate runs every e2e set):
 - `uv run pytest -q -p no:cacheprovider`: 4855 passed, 10 skipped, 0 failed.
 - `--only steering` with stand-ins: PASS (115 checks).
 - No real CLI was run, so `~/.codex/config.toml` was not touched or read.
+
+### Review round 8 (on 97ea8c4: CHANGES, two blockers in round 7's deferred stop; M8 evidence sufficient) and what changed
+
+Backup branch `backup/claude-steering-97ea8c4`. Sol's two blockers were both in the state A1 introduced, a held end
+whose deadline passed while the registry was busy (`stop_due`):
+- the loop's retry of it waited on the registry while holding the runner lock;
+- its fence could publish N's end before any checkout barrier existed.
+
+The first rulings (R8-1, R8-2) fenced that state. Sol's pre-check found that insufficient: `Groups.start` checks only
+for STOPPING, and several readers could bypass a pending stop. The amended ruling (C1 to C3) removes the state
+instead. Each sequence is a test written first. On an export of 97ea8c4, 6 of round 8's 8 tests fail (round 7's two
+A1 tests, rewritten to this rule, among them). The 2 that pass there are pins: a lost claim, and shutdown.
+
+#### C1. Reserve first, commit second; no `stop_due` (the host)
+
+- **The class.** Any state between "a held end's deadline passed" and "its stop is registered and signalled" that
+  some reader could see differently from an ordinary held end, and any wait on the registry to leave it. Removing
+  the state closes the class.
+- **Removed.** `Session.stop_due`, `_stop_due`, `_stop`'s `wait_registry` and its deferred branch, and both retry
+  sites (the watchdog's boundary and the loop's tick).
+- **Owner: `SessionHost._claim(s, decide, reserve=True)`.** It is called through `_cutoff_stop(reserve=True)` from
+  `_hold_cut`, the cut of an expired hold. That is the same code on the watchdog's thread (`steer_deadlines`) and in
+  the loop's tick (`_hold_pass`). Under the cutoff lock:
+  - the claim is confirmed available (the latch, the slot's stopping);
+  - then the checkout is reserved with `Groups.try_stopping`, a non-blocking acquire.
+  - **Registry busy:** `_claim` returns False and nothing changes: no claim, no fence, no publication, no SIGTERM, no
+    `stopping_since`. The hold stays exactly as a hold before its deadline, and the next pass or tick tries again.
+  - **Registry taken** (the group is STOPPING): the claim (`_fail` → `_finalize_hold`: S decided, the hold fenced),
+    then `_stop(reserved=True)`: the real SIGTERM, dated immediately before the signal (R8-01), which starts the kill
+    clock. Then the fence's publication as before A1: once the group is gone, or twice the grace after that SIGTERM.
+- **No stale barrier, no deadlock.** The reservation is made only after the claim is confirmed, under the same lock,
+  and `decide` is in-memory work. A claim that is lost (the latch came, or the end resolved another way) returns
+  before the reservation. Lock order is fixed: the cutoff lock, then the registry's non-blocking attempt. Nothing
+  that holds the registry waits for the cutoff lock (a spawn holds only the registry), so there is no deadlock route.
+- **A SIGTERM that fails starts no kill clock.** In the reserved path `_stop` puts `stopping_since` back to None if
+  `terminate` raises. A group verified gone (`poll` and the group probe) gets no SIGTERM, as before A1.
+- **Tests:**
+  - `test_r8_c1_the_loops_tick_never_waits_on_the_registry`: Sol's sequence. The loop's tick returns at once; B's
+    SIGKILL goes from the watchdog.
+  - `test_r8_c1_during_the_stall_the_checkout_is_as_for_a_hold_before_its_deadline`.
+  - `test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order`: once each, in that order, and no SIGKILL
+    before SIGTERM plus the grace.
+  - `test_r8_c1_a_failed_sigterm_starts_no_kill_clock`.
+  - `test_r8_c1_a_lost_claim_leaves_no_stopping_barrier` (pin).
+  - `test_r8_c1_an_expired_hold_at_shutdown_gets_the_real_sigterm` (pin).
+  - Round 7's two A1 tests, rewritten to this rule: `test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry`
+    and `test_r7_a1_the_loop_stops_an_expired_hold_by_itself`.
+
+#### C2. No reader tells an expired, still-held hold from a hold before its deadline
+
+Against 1a0c822, the only new condition is "a hold past its deadline, still held". While the registry is busy,
+nothing of the session changes: no claim, no fence, no flag. Every reader therefore sees what it sees for any held
+end. Only the two deadline enforcers compare against the deadline.
+
+| reader | what it reads | the same as for a hold before its deadline because |
+| --- | --- | --- |
+| checkout admission (`Groups.start`: a session's spawn, an ordinary run in node.py) | STOPPING entries in that directory | the group stays LIVE: no reservation is made while the registry is busy, and none is taken away |
+| the hub's dispatcher (`Dispatcher._busy_dirs` via `hosted_wake.turn_projects`) | a session whose turn the hub saw start and not end | N's end is not published, so N's turn still holds the checkout on the hub |
+| `_hand_over`, ordinary writes | `busy` (N in flight) | `s.in_flight` stays set until N's end is published |
+| idle eviction and parking (`_park_idle`, `park`) | `busy`, `inbox`, `stopping_since` | busy; no `stopping_since` |
+| close, cancel (`_end`, `cancel`, through `_claim`) | the held end | unchanged: they claim and stop by their own reason, as for any held end |
+| reap (`_reap`) | the process and its group | unchanged: the process's own exit is handled as for any held end |
+| the fence (`_hold_fence`, `_hold_deadline`) | `held.fenced_at` | not set: nothing to publish |
+| frames read (`_steer_event`) | `held.fenced_at` | not set: S's evidence still counts, as before the deadline |
+| the contact latch (`SteerSlot.expired`, set by `_steer_watch` every pass anyway) | `ack`, the write gate | before C1 the same: no contact extension after expiry, and S is fully written, so nothing is gated |
+| shutdown (`stop_all`, `stop_turns`) | the held end | published at main's point, and the real SIGTERM; its kill clock starts there |
+| the deadline enforcers (the watchdog's `steer_deadlines`, the loop's `_hold_pass`, both via `_hold_cut`) | the contact clock, `lost`, the node's authority | the only readers of the deadline: each tries the reservation and changes nothing if it fails |
+
+#### C3. Known limit, pinned
+
+An expired hold stays held while the registry is busy, bounded by the spawn that holds the registry. A stalled spawn
+leaves N unsettled and S's process running. Pinned by `test_r8_c3_known_limit_a_registry_stall_past_two_graces`:
+- across a stall past two grace periods, nothing is published, the hold is intact and no kill clock runs;
+- a hub listing during the stall changes nothing;
+- once the registry frees, the hold is stopped and N's settlement is taken by the hub (N's own reply).
+
+This replaces round 7's "2x grace" residual: no publication can come before the reservation.
+
+#### R8-3. Notes corrections
+
+- The dropped-line count (round 7, R7-3) is best-effort under concurrency. The full check, the increment, the
+  append and the replay's reset are separate operations on shared state, so concurrent lines can miscount.
+- "Every `stop_all` gets a real final save" holds for the two production entry points, whose callers are ordinary
+  threads. A caller that was already diverting (a watchdog's thread) keeps deferring, and its save waits for the loop
+  as any save on such a thread. Separating shutdown's log diversion from the watchdog's I/O suppression is listed
+  for the hardening PR.
+
+#### Mutation check, review round 8
+
+Only C1's rows ran, as the round asked, plus round 4's "the claim checks the latch", re-anchored on its new line (the
+reservation now follows it). The rows are:
+- the reservation before the claim;
+- registry busy: nothing changes;
+- the same code in the loop's tick;
+- a failed SIGTERM starts no kill clock.
+
+Round 7's three A1 rows are gone with the code they changed. All 5 rows run were caught (on 7c059d7). The output is
+in `scripts/steering-mutation-results.txt`; the whole set (131 rows now) last ran in round 6.
+
+#### Runs
+
+After the last code commit (9dad446; 7c059d7 and later add a test, rows, results and notes only), on 26 November, as
+the round asked (the coordinator's gate runs every e2e set):
+- `uv run pytest -q -p no:cacheprovider`: 4862 passed, 10 skipped, 0 failed.
+- `--only steering` with stand-ins: PASS (115 checks).
+- No real CLI was run.
