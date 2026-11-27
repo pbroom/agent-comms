@@ -18427,3 +18427,243 @@ Each cell a mutation can reach is pinned. The rows are below.
   | `--only tree` | 11c7717 | PASS, 143 |
 
   A serial run on 6c510b3 also passed (5502 passed, 0 failed, 13 min 11 s).
+
+## Host-side logging: one writer, review round 3 (the PR's reviews)
+
+This round covers the two reviews of PR #123 on fbec9fa:
+- the automated review: R17, the one-key mapping;
+- the independent pre-merge review: R18 to R22.
+
+The rulings are rulings-b-r7.md with the amendment A1 to A7, which overrides them where they differ, plus the
+owner's decision on exception text. No stop decision, signal, signal order or save changed. No lock changed its
+type (the runner and report locks are plain Locks, the others RLocks, as on main) and no lock order changed.
+
+R17 is "After the PR's automated review" in "Host-side logging: one writer".
+
+### R18. No lock is left held by an interrupt
+
+**The finding.** `HostLock`'s `__enter__`/`__exit__`/`acquire`/`release` and `threading.Condition.__exit__` are
+Python functions. CPython handles a pending signal at the next check in the main thread's bytecode, and a Python
+function's entry is such a check. So the node's SIGTERM handler, which raises `KeyboardInterrupt` as `node._run`'s
+`on_term` does, could raise at the entry of the lock's `__exit__`, before the native release. The lock then stayed
+held. On main these were plain `threading` locks, whose `with` is C code and has no such window.
+
+**The form now** (A1):
+- Every host lock is a NATIVE lock, `threading.RLock()` or `threading.Lock()` as on main, entered as
+  `with hostlog.BOUNDARY, lock:`, with the boundary FIRST. Both the native acquire and the release are the `with`
+  statement's own C calls, made inside the boundary. So the release always comes before the boundary's Python exit,
+  and no acknowledgement is ever made while the lock is held.
+- The sites, after the merge of C1 (#122, below): node_groups 9, node_sessions 14, session_host 22. They include C1's
+  new ones in `Groups` (`release`, both of its sections, `_gone`, `unproved_line`, `state`) and in the shutdown.
+  The host locks are:
+  - the registry lock;
+  - the ack, runner and report locks;
+  - a steer attempt's record lock;
+  - the cutoff lock.
+- `HostLock` is gone.
+- hostlog's own lock is a raw `_LOCK = threading.Lock()`, entered only as `with _LOCK:`. `_cond` is built on it
+  for the writer's own idle wait and for the notifies.
+
+**The audit** (A2):
+- `received_under`, a `@contextmanager` that took the lock before its `yield`. It was the same on main. It is gone:
+  its two sites read the clock right after `with hostlog.BOUNDARY, lock:`. No generator in the host-side modules
+  holds a lock; the pin checks this.
+- **Explicit acquisitions.** There are three, all native methods in main's own shape, each inside a
+  `with hostlog.BOUNDARY:`:
+  - `Groups.try_stopping`'s `acquire(blocking=False)` with its `release` in a `finally`;
+  - `SessionRunner.shutdown`'s `report_lock.acquire(timeout=REPORT_WAIT_SECONDS)`, released at once;
+  - (C1) `SessionRunner.unproved(budget)`'s TIMED acquisition of the runner's lock (`acquire(timeout=budget)`, or
+    one non-blocking attempt), with its `release` in a `finally`.
+
+  Their one window, between a successful native acquire and the `try`, is main's own and is not changed here.
+- **`Condition.wait`'s release and re-acquire path** (Python code in the stdlib):
+  - Only the writer waits on `_cond`, and the writer is not the main thread, where no signal is ever handled.
+  - The main thread never calls `Condition.wait` on hostlog's lock. Its waits (the final wait, a standalone
+    acknowledgement, `flush`) poll outside the lock (A3, below).
+  - `checkpoint_cond.wait` is made only by the checkpoint sender.
+- **What is still entered through the stdlib's Python code**, unchanged from main:
+  - `checkpoint_cond`, a `threading.Condition`. In production it is entered by the session loop and the checkpoint
+    sender only. Its one main-thread path, `_flush(final=True)` at shutdown, skips it, because `stopping` is set by
+    then.
+  - The internals of `threading.Event` (`_Stopping.set()` is called on the main thread at shutdown). An interrupt
+    landing inside them could strand that Event's own lock, as on main.
+
+**The tests** (A7a):
+- `test_r18_a_real_sigterm_at_the_end_of_a_locked_body_leaves_the_lock_free`, one per lock kind:
+  - [rlock]: the registry lock, built by `Groups()`;
+  - [lock]: the runner lock, built by `SessionRunner(...)`;
+  - [hostlog]: hostlog's own lock.
+
+  Each is a subprocess. In the production form, the child's main thread holds the lock while it runs a long C call
+  (`sum(range(...))`) inside a Python function. A real SIGTERM is sent by the child's own timer thread. That thread
+  can run only when the main thread next lets go of the GIL, so the signal is handled at the main thread's first
+  check after the C call. That check is inside the lock's exit when the exit is Python code: the reviewer's probe.
+  The child reports whether another thread can take the lock, and the test checks that it exits.
+  - A SIGTERM sent by the PARENT did not hit the window in my runs. The main thread handled it right after the C
+    call returned, before reaching the lock's exit, so the lock came back free even on fbec9fa. That is why the
+    child signals itself.
+  - All three fail on fbec9fa with "held". In the hostlog case that process also never exits. All three pass now.
+- `_r18_problems`, extending the construction checker. The pin refuses each of these:
+  - a host-lock `with` without `hostlog.BOUNDARY` first;
+  - an explicit host-lock `acquire` outside a boundary;
+  - a host lock built as anything but the native call itself;
+  - `with _cond` in hostlog;
+  - a generator that enters a host lock or `_LOCK`;
+  - any `HostLock`.
+
+  Each form has its own refusal fixture.
+
+**Stale bookkeeping** (A4):
+- A signal is handled only on the main thread. So only there can an interrupt land in `BOUNDARY`'s Python enter or
+  exit, or in `enqueue_only()`'s cleanup.
+- The depth can then be left one too HIGH, never too low, since the decrement is the last step before the
+  acknowledgement; or the thread can stay registered as enqueue-only. Both fail closed: such a thread never waits.
+- Production never resets either, because the node's main thread is enqueue-only for the rest of its process. The
+  tests' `_reset`, run between tests with no lock held, is the one reset. Pinned by
+  `test_a4_stale_bookkeeping_fails_closed_and_only_the_reset_clears_it`.
+
+**The main thread's waits** (A3): `_wait_for`. On the main thread it polls: a short C-level `with _LOCK:` per
+look, then a sleep from 0.5 ms growing to 10 ms. It never uses `Condition.wait`, so an interrupt there can neither
+strand the queue's lock nor be masked before R21 handles it. On any other thread it uses `Condition.wait`. Pinned
+by `test_r21_the_main_threads_final_wait_holds_the_queues_lock_only_briefly`.
+
+**C1's own release fence.** `Groups.release` installs its fence as `with hostlog.BOUNDARY, self.lock:`, and its
+three end states hold under R18's form. An interrupt in the boundary's Python exit comes after the native release
+and before `begun = True`, which is the "cut at the installation" path: `_held_if_fenced` turns the FENCED entry
+HELD.
+
+### The merge of origin/main (C1, #122) into this branch
+
+The merge commit takes both changes:
+- **node_groups.py** is main's file, with:
+  - R18's form at all 9 `with` sites;
+  - `try_stopping`'s native acquire inside a boundary;
+  - the libproc load-failure warning through a hostlog logger (`agent_comms.node_groups`). Its one argument is a
+    constant text.
+- **node_sessions.py:** `unproved` is as above.
+- **session_host.py:** `stop_all` keeps this branch's shape, with no `WATCH_THREADS` diversion (every line is a
+  deferred record), and takes C1's `watched_until` and its post-KILL watch.
+- **C1's other lines** (the retention WARNINGs in node.py and session_host.py) were already on hostlog loggers. Their
+  arguments are a run id or a session id, both str.
+- **C1's shutdown watches** (`Node.await_kills`, the host's watch in `stop_all`, `SessionRunner.unproved`) run on the
+  node's main thread, which is enqueue-only: they never wait for the writer or enter a handler. This is pinned by
+  `test_nothing_in_the_host_side_modules_waits_for_the_writer_but_the_final_wait`: the only calls of hostlog's
+  waiting or starting functions are `node.run`'s eager start and the final wait.
+- **The mutation script** has both sets of rows. Main's rows for the logging diversion, whose code is gone here,
+  are dropped:
+  - N3 (every package logger diverted);
+  - R7-2 (shutdown's logging deferred; the final save made with logging restored);
+  - A2 (the caller's prior diversion);
+  - A3 (the exception's type only, main's form);
+  - C1R6 R7-2 (the replay after the last SIGKILL).
+
+  Ten rows were re-anchored where the merge moved them, and none is stale.
+- **C1's tests** (tests/test_ownership_c1.py and the changed FakeChild in tests/test_dispatch.py) assert on log lines
+  with caplog. They pass unchanged in the acknowledged mode: every assertion is as main has it.
+
+### R19 and A5. The guarantee's scope, exactly
+
+- The guarantee covers lines logged through hostlog's loggers (`hostlog.get`). It is stated so in hostlog's
+  module text and here.
+- **Outside it:**
+  - lines logged through plain `logging`: the rest of `agent_comms.dispatch`, and every module not converted here;
+  - third-party libraries' own loggers (httpx and the like), which still reach `logging`'s handlers on the calling
+    thread.
+- **The node's two direct calls.** `remove_browser_output` and `with_managed_env` take a `logger`. The node passes
+  `DISPATCH_LOG = hostlog.get("agent_comms.dispatch")` at every call: one site each, `_remove_browser_output` and
+  `_start`. Called without one (`board dispatch`, a standalone caller), they keep dispatch's own plain logger, so
+  their CLI behaviour is unchanged.
+- Their arguments now reduce to something useful: the symlinked path is passed as `str(path)`, which prints the
+  same through plain logging, and `CODEX_SERVER` is a str.
+- There is no import cycle: node already imports dispatch, and dispatch does not import hostlog.
+- **The pins:**
+  - `test_r19_the_node_passes_its_hostlog_logger_at_every_call_of_the_two_helpers` checks every such call in
+    node.py;
+  - `test_r19_the_nodes_dispatch_helpers_log_through_hostlog` checks that the node's line is written by the writer
+    and the standalone one synchronously.
+  - The pin does NOT check other node-main-thread calls into unconverted modules.
+
+### R20 and A6. Chained exceptions keep their types and frames, and no text
+
+- `_exception` walks `__cause__`, and `__context__` unless `__suppress_context__` is set.
+  - It reads only BaseException's own descriptors, so no code of the exception's own runs. A subclass's
+    `__cause__` property is pinned as never run.
+  - It finds a cycle by identity.
+  - It keeps at most `CHAIN_MAX` = 8 exceptions and `FRAMES_MAX` = 200 frames in all.
+  - A cut says why: "a cycle", "more than 8 exceptions" or "more than 200 frames".
+- `_exc_text` renders the chain in stock `logging`'s order, the innermost first, with stock's separators ("The above
+  exception was the direct cause...", "During handling of the above exception..."). Each exception appears as its
+  frames and its type's name.
+- `rec.hostlog_exc` is now (name, frames, chain, cut). The first two are as before.
+
+**Operator note: host-side lines carry no exception message. This is the owner's decision (Peter, 2026-11-27).**
+- **The reason:** an exception message can quote message or steer content, and no log line may carry that.
+- **The cost:** these lines show the exception's type, the types and locations of its chain, and reviewed numbers
+  (`facts`) only.
+- **Where the full text still goes:** the hub, in the run's or session's report.
+  - "could not start session": errno kept; the full text is in `_end`'s detail.
+  - "cannot host session": the full text is in `_ended_without_process`.
+  - "could not start run": the full text is in `_report(error=...)`.
+  - "hub unreachable": `ConnectError` and `ReadTimeout` keep their type names only; the reason and the URL go.
+- **Where it goes nowhere**, the log being the only record (the review's list):
+  - "hosted sessions: a pass failed" and "hosted sessions: the deadline watchdog failed a pass" (node_sessions);
+  - "session %s failed", at two sites (session_host);
+  - "could not stop the session processes an earlier node process left" and "hosted sessions: a shutdown step
+    failed" (node.py: recovery and shutdown);
+  - "could not report run %s as %s" (node.py).
+
+### R21. An interrupt during the final wait
+
+`_exit_if_stalled` catches `KeyboardInterrupt` around `final_flush` and treats it as stalled: `os._exit(status)`
+with the status already selected. Every signal, report and save is done by then. Because the main thread's final
+wait polls outside the queue's lock (A3), the interrupt leaves no lock held.
+
+Pinned by `test_r21_an_interrupt_during_the_final_wait_takes_the_stalled_exit`. A real SIGTERM, sent by the test
+to its own child during the final wait with the writer stuck, ends the child with status 3 at once. On fbec9fa it
+escaped into `logging.shutdown()` and the child never ended.
+
+### R22. Only `later()` and `facts()` make a value the writer renders
+
+- A `_Later` carries `minted`, set only when it is made with the private `_MINT` sentinel, which only `later()` and
+  `facts()` hold. `_reduce` reduces any other `_Later` to its type's name. This is a construction guard, nothing
+  more.
+- `isinstance` in `_reduce` is left as it is. Its limit, as the review names it: an object's own `__class__`
+  property runs at the call. That is contained, and the result is "a log line could not be kept".
+
+### Not fixed here
+
+- **Test fidelity:**
+  - Most of the suite runs the host in the acknowledged mode (conftest raises `ACK_SECONDS` to 30 s, and test
+    threads are standalone), not production's enqueue-only mode. Only tests through `run_forever`, `_watch`,
+    `_on_watchdog` or `enqueue_only` run the production mode.
+  - The R13 child hosts no session, so no session process or session thread sees a real signal.
+- **The exit status on the stalled path** (already stated in round 1). One case is added: a `KeyboardInterrupt`
+  that escapes before `_run`'s `try` (during recovery or the hello).
+  - On main, the process dies by SIGINT re-raise.
+  - On the stalled path, it exits with status 130, and the traceback and the CLI's `error:` message are not
+    printed.
+
+### Reproduction, mutation check and runs
+
+- **Reproduction.** This round's tests (tests/test_hostlog.py, final form) were copied onto fbec9fa, each run alone
+  with a 90 s bound:
+
+  | Test | Result on fbec9fa |
+  | --- | --- |
+  | R18 real SIGTERM, [rlock], [lock] and [hostlog] | FAILS: the lock is still held after the interrupt (all three) |
+  | R18 static pin | FAILS: the host locks are built as `HostLock(...)` |
+  | R21 real SIGTERM during the final wait | FAILS: the child never ends (the interrupt escapes into `logging.shutdown()`) |
+  | A3 the main thread's final wait | FAILS: no raw lock, and `Condition.wait` on the main thread |
+  | R20 a chain; a cycle and an over-long chain; the frame cap | FAIL: the root is missing; nothing is cut; no `FRAMES_MAX` |
+  | A4 stale bookkeeping | FAILS: a stale registration survives the reset |
+  | R22 a direct `_Later` | FAILS: it is rendered, and its text gets through |
+  | R19 the dispatch helpers, dynamically and statically | FAIL: no `DISPATCH_LOG`; the node passes no logger |
+  | the seal before the final wait's first look | FAILS: there is no `_wait_for` |
+  | the R18 pin's refusal fixtures | pass: they test the checker itself |
+
+  R17's tests also failed on fbec9fa:
+  - the one-key and "0"-key lines, and a one-key line missing its key, vanished;
+  - no notice counted the records that `makeRecord` or a filter refused.
+
+  On 9dcef28 R17's rows were CAUGHT: the mapping handed over as logging does, and a lost record counted. The
+  parallel suite passed (5505 passed), as did `--only structured` (36) and `--only steer` (27).
