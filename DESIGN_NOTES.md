@@ -16555,3 +16555,102 @@ tests/test_claude_steering_enable.py.
   turn was proved before the cut. At the verified reap, N settles once with S `next_turn` failed (`own_turn_cut`), and
   its detail is the cut's.
 - **No defect was found, and no product code changed.**
+
+## Ownership until verified exit (C1)
+
+This is the first of PR-C, with the order C1 → C3 → C2 (design: "kills and ownership"). The human has chosen the
+per-group supervisor (shim), which C3 builds. C1 does not depend on it.
+
+**The invariant:** no checkout or tracking record is released while the existing group may still have a live member.
+
+### The one release rule
+
+- **`Groups.release(token, proof, forget)`** is the only way a registry entry goes. The old public `gone` is now the
+  private `_gone`, and only `release` calls it.
+- **The order:**
+  1. `proof()` answers whether the group is proved gone. False, `None` or an exception means nothing is released and
+     the call returns False.
+  2. If it is proved, `forget()` drops the owner's tracking record, then the registry entry goes.
+- **The durable entry is the tracking record's projection:** `node-sessions.json` lists the sessions with a child, and
+  the node's state lists its `running` runs. So it goes at the owner's next save, and only after `forget`.
+- **The interface does not depend on how absence is proved.** C3 passes the shim's proof (its `EMPTY`, or its
+  `.empty` file) to the same rule, and no caller changes.
+
+### The proof in C1 (no anchor)
+
+- **The leader's exit, OBSERVED by its own handle:** `poll()` returned.
+- **AND a complete, successful listing of the group's members showing none:** `node_groups.group_absent`.
+  - It uses macOS libproc's `proc_listpids(PROC_PGRP_ONLY, pgid)`: one call, which the kernel answers from its
+    process lists under their lock, so the snapshot is coherent.
+  - **Complete** means the filled call returned fewer bytes than its buffer. A filled buffer may be truncated: a larger
+    one is tried, three sizes in all, and otherwise there is no proof.
+  - **An error, or no libproc,** means no proof.
+  - **Any member at all is not proof,** a zombie included.
+  - **Checked on this Mac** (scratch, on this script's own children): a zombie leader IS listed; a missing group
+    gives 0 bytes; a buffer of one slot for a group of two returns exactly the buffer's size.
+- **Why not `killpg(pgid, 0)`.** Its ESRCH also answers for a group whose only members are zombies. Its EPERM answers
+  for members this user may not signal, and briefly on macOS for a group that is exiting. So it answers about
+  permission, not membership.
+- **The existing `group_alive` (killpg) is kept** for the stop decisions, which are unchanged.
+- **Tests' fake processes** prove absence by the injected group probe (`group_absent` derived from it).
+
+### The callers (before / after)
+
+| Caller | e6ebf95 | C1 |
+| --- | --- | --- |
+| `SessionHost._reap` (session_host.py) | `poll()` and `group_alive` false, then `groups.gone` | `_release(s, child)`: kept unless proved; the pass looks again |
+| `SessionHost._stop_all` | released after its SIGKILL unless a shutdown step failed (**survivors released**) | released only if proved; else it keeps the handle, the exact token, the STOPPING entry and the durable entry |
+| `Node._reap` (node.py) | `poll()` and `group_alive` false, then `gone` and drop | `Node._release(rid, local)`, the same rule |
+| `Node.report_stopped` | **released every run and dropped it from the state file** | releases only on proof. A retained run keeps its registry entry, its handle and its state entry, and is not reported ended: the next node process reports it from its record (`recover`) |
+
+### What C1 does not do
+
+- **It adds no signal.** There is no new `killpg` site and no KILL retry (that is C2), no thread, and no restart
+  guarantee (that is C3, with the shim).
+- **It changes no stop decision**, and keeps main's latch, signal order and registry wait.
+- **A retained group is re-checked** by the existing reap in every pass (`_steps`, then `_reap`, for a session;
+  `Node._reap` in `tick` for a run).
+- **One guard keeps a retained session inert.** A session whose leader exited, and whose group is neither seen alive
+  nor proved gone, takes no further step in that pass: nothing is written to it and nothing stops it, until a pass
+  proves it gone. Main never reaches that state, because its reap let the group go in the same call.
+- **Shutdown** waits as long as before, then returns with survivors still reserved and durable.
+
+### Visibility, and a gap
+
+- A held checkout shows in the node's log: `_lingering` for a session that outlived its SIGKILL, and the run's "waits
+  for a stopping process group" line.
+- **Gap:** `SessionRunner.stopping_checkouts` (node_sessions.py) exists, but nothing reports it to the hub, so there is
+  no held checkout in the node's STATUS today. Proposed for C3, with the shim's own states. Nothing asks the human.
+
+### Tests (tests/test_ownership_c1.py)
+
+- **Reproductions.** On e6ebf95, with this tree's test file, both fail because the release happened (the handle and the
+  run were gone):
+  - `test_c1_shutdown_keeps_a_group_that_survived_its_sigkill`;
+  - `test_c1_report_stopped_keeps_a_run_whose_group_survived_its_kill`.
+
+  Each also shows that a new group is refused on that checkout.
+- **Sol's pin:** `test_c1_a_kill_that_returns_with_a_survivor_then_exit_releases_exactly_that_reservation`. Main's
+  reap already retains while the group is alive, so this one is a pin, not a reproduction.
+- `test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone`.
+- **The proof's negative cases**, through a fake libproc: a truncated listing, a failed or refused listing, no
+  libproc, a listing with a member, a proof that raises, says no or answers `None`, and the leader's exit not
+  observed.
+- `test_c1_release_is_the_only_way_out_of_the_registry`: the registry has no public `gone`.
+- **A scratch-only REAL macOS test** (`c1_real_macos.py`, in the scratchpad, never committed). It uses its own temp
+  directory and its own children: a leader that exits on SIGTERM, and a member that ignores SIGTERM, whose "SIGKILL"
+  reaches the leader only. For a session (`stop_all`) and a dispatched run (`Node._release`): kept, the checkout
+  refused while the member lives, and released by the real listing once it is gone. PASS.
+- **An older pin inverted on purpose:** `test_r6_n4_known_limit_a_kill_that_returns_with_survivors_releases_ownership`
+  (round 6, N4). It pinned main's release of a group whose KILL returned with survivors, the known limit C1 closes. Its
+  name is kept for the record, and it now asserts that the group is kept.
+
+### Mutation check
+
+12 rows: the rule (2), the proof (2), the session's proof (2), and each caller: the reap, `_stop_all`, the inert
+guard, the run's proof, the run's reap and `report_stopped`.
+- On 59cace3, 11 of 12 are caught. The miss was "a retained process is left alone": the test's turn was in flight,
+  so nothing was written anyway.
+- 16a641e's pin also lets the turn's timeout and a kill grace pass. Without the guard, main's timeout would arm a stop
+  and the kill scan would send SIGKILL; with it, the row is caught.
+- The results are in scripts/steering-mutation-results.txt.

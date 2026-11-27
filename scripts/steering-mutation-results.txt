@@ -1,25 +1,29 @@
-# The output of scripts/steering-mutation-check.py for the follow-ups after #119 (DESIGN_NOTES "After #119: follow-ups"):
-# only the rows for the product code this PR changed (A1, A3), then A1's two edge rows (Sol's should). The whole set (162
-# rows) last ran in round 6. The enabling PR's runs: 21 rows on d704cbf and 14 on 1a37582, all caught. Run on ae147aa: all
-# 4 caught. Run on fdad401 (the edge pins): all 3 caught. The existing row "A1 only that session incarnation's" is caught
-# first by test_s5c_...; it is also caught by the new other-generation pin alone.
+# The output of scripts/steering-mutation-check.py for "Ownership until verified exit (C1)" (DESIGN_NOTES): the rows for
+# the release rule, its proof and each of its callers. The whole set (172 rows) last ran in round 6. Run on 59cace3: 11 of
+# 12 caught. "C1 a retained process is left alone" was missed: the test's turn was in flight, so nothing was written
+# anyway. 16a641e's pin also lets the turn's timeout and a kill grace pass, and catches that row.
 
-commit ae147aa
-CAUGHT  A1 a close's session's earlier watched events go first  test_a1_a_close_of_the_self_stopped_session_follows_its_watched_turn_end[codex]
-CAUGHT  A1 only that session incarnation's  test_s5c_a_handoff_inside_reconciliation_keeps_lost_ahead_of_a_watched_terminal[True]
-CAUGHT  A3 the reap settles an armed hold whose decision never ran  test_a3_after_a_raising_commit_the_verified_reap_settles_the_held_end
-CAUGHT  A3 an undecided hold is finalized at the reap  test_a3_after_a_raising_commit_the_verified_reap_settles_the_held_end
-rows: 4
+commit 59cace3
+CAUGHT  C1 the rule releases only on proof  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1 a proof that raises retains  test_c1_the_rule_releases_nothing_without_proof[raises]
+CAUGHT  C1 only a complete empty listing is absence  test_c1_a_truncated_listing_is_not_proof
+CAUGHT  C1 a filled buffer is not a complete listing  test_c1_a_truncated_listing_is_not_proof
+CAUGHT  C1 the session's proof needs the leader's exit observed  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1 the session's proof needs the group's absence  test_c1_shutdown_keeps_a_group_that_survived_its_sigkill
+CAUGHT  C1 the reap keeps what is not proved gone  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+CAUGHT  C1 shutdown keeps what is not proved gone  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+MISSED  C1 a retained process is left alone
+CAUGHT  C1 the run's proof needs the group's absence  test_c1_report_stopped_keeps_a_run_whose_group_survived_its_kill
+CAUGHT  C1 the run's reap keeps what is not proved gone  test_a_fake_childs_pid_that_names_a_live_process_group_on_the_machine_does_not_fool_the_node
+CAUGHT  C1 report_stopped keeps what is not proved gone  test_c1_report_stopped_keeps_a_run_whose_group_survived_its_kill
+rows: 12
+stale or broken: []
+missed: ['C1 a retained process is left alone']
+exit 0
+
+commit 16a641e
+CAUGHT  C1 a retained process is left alone  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+rows: 1
 stale or broken: []
 missed: []
 exit 0
-
-commit fdad401
-CAUGHT  A1 only that session incarnation's  test_s5c_a_handoff_inside_reconciliation_keeps_lost_ahead_of_a_watched_terminal[True]
-CAUGHT  A1 only earlier watched events  test_a1_a_watched_event_published_after_the_ended_is_not_promoted
-CAUGHT  A1 the generation counts  test_a1_a_watched_event_of_another_generation_is_not_promoted
-rows: 3
-stale or broken: []
-missed: []
-exit 0
-existing row 'A1 only that session incarnation's' against pin 2 alone: FAILS (caught)
