@@ -16318,3 +16318,142 @@ for the hardening PR.
 Kill records; a verified exit for main's own stops; reservations retained across a restart; restart identity; the
 package-owned logger adapter; general outbox failure recovery; the parallel test suite. For the hardening PR: main's
 inherited registry wait on main's routes (S1.3), and (d) above.
+
+### Enabling: review round 1 (on f276e2b; Sol: CHANGES, 2 blockers, 2 shoulds; rulings R1 to R5 and the amendment A1 to A3)
+
+Backup branch `backup/claude-steering-on-f276e2b`. Both judgment calls of the first build stand: main's registry wait
+for a live attempt's timeout and an ordinary reply's broken pipe (J1), and `SessionRunner.reconciling` (J2). The off
+configuration was found no worse than main. Both blockers need Claude steering on. The reproduction tests below fail on
+f276e2b.
+
+#### R1, A1 and A2. On a claimed main route nothing is logged before escalation, and nothing under the runner lock (the host)
+
+- **The defect.** `_claim` replayed its deferred steer diagnostics after letting go of the cutoff lock but before the
+  caller's `_stop_from`. A stalled log sink there held the runner lock and left the group unsignalled, and a raising
+  handler skipped the stop.
+- **Owner.** `SessionHost._claim(s, decide, stop)` owns the whole order, for every claimed main route:
+  1. Under the cutoff lock, the latch is checked and `decide` runs, in memory only, with its lines deferred.
+  2. The cutoff lock is let go; the caller's runner lock stays held.
+  3. The route's OWN main stop runs, passed in by the caller and run by identity, whatever `decide` raised (A1).
+  4. Only then the lines, handed to the existing deferred queue (`_keep_line`, the queue `flush_watch_logs` writes,
+     bounded, with its count of dropped lines). No log handler is called in the claim at all (A2).
+  - **The exception** that propagates is the first: `decide`'s if it raised, else the stop's.
+  - **The reserved stop** queues its commit's lines the same way, after escalation.
+- **The callers of `_claim`, with each one's stop:**
+  - `_end` (a close, a fatal frame, a host error): main's end stop. It clears the inbox, calls `_stop_from`, and
+    publishes `ended` in a `finally`.
+  - `cancel`, before N's native end: `_stop_from(s, now, drained)`.
+  - `_reap`, a leader that went leaving survivors: main's line ("its process exited ... stopping them"), then
+    `_stop_from`. This is main's own order, by identity: main logs that line before its stop, and the steer lines come
+    after it.
+  - `_cutoff_stop`, main's path for a steering session (a live attempt's timeout, an ordinary reply's broken pipe):
+    `_stop_from`.
+  - `_steer_cut`'s claimed branch, which Claude steering on does not reach (it takes the reserved branch): the cut's
+    own `_stop`.
+- **The flush sites.**
+  - `node_sessions.py` `pass_once` (before `with self.lock`): outside the runner lock. This is where a node's lines are
+    written.
+  - `SessionHost.tick` (the start of a tick): under the runner lock when a node drives the host, since `pass_once`
+    holds the lock around `tick`. Main e6b421f writes nothing at that point: the whole deferred mechanism is step 3's.
+    So a node's host (`keep_outbox`) no longer flushes at its tick. A host no node drives still does.
+  - `stop_all`'s undivert, at shutdown: after the last SIGKILL attempt (ruling R7-2).
+- **Known limit.** A deferred line is written with the flush's time and caller, not the claim's.
+- **Tests.**
+  - `test_r1_a_claimed_main_route_signals_before_any_handler_and_writes_its_lines_at_the_flush[route-blocks|raises]`.
+    It runs every claimed main route with a live attempt: close, fatal, host error, reap with survivors, cancel before
+    N's end, an ordinary reply's broken pipe, a live attempt's timeout. Each checks:
+    - the call returns, and no handler is entered during it;
+    - the group is signalled and its kill clock armed before any handler is entered;
+    - a sibling's due SIGKILL goes from another thread meanwhile. The host takes no lock for it. Under the node the
+      watchdog's kill waits for the runner lock as for any loop work, and no claim line holds it now;
+    - the line is written at the flush.
+  - `test_a2_a_reserved_stops_lines_go_to_the_deferred_queue_too[...]`.
+  - `test_a2_under_the_node_a_claims_lines_are_written_outside_the_runner_lock`: under the node, every steer line is
+    written with the runner lock free, and after the signal.
+  - `test_r1_a1_a_decision_that_raises_after_the_latch_still_reaches_the_stop`.
+  - `test_r1_a1_the_first_exception_propagates_when_the_stop_raises_too`.
+  - The older pins that needed the claim stay green, unchanged: `test_r4_t_...` and `test_r5_known_limit_...`. The
+    latter's raising handler is now entered at the next tick's flush.
+
+#### R2 and A3. The reserved path makes no filesystem call (the host, the registry)
+
+- **The defect.** `_reserved_stop` called `node_groups.key(s.cwd)`, which runs `os.stat`, with the runner lock held.
+- **Owner.** `Session.group_key`, the one cached value.
+  - `_spawn` computes the key once and gives it to `Groups.start(cwd, token, spawn, k=key)`, so the entry and the cache
+    cannot differ.
+  - It is set with `group_token` when the process is attached, and cleared with it at the verified reap and at
+    `stop_all`.
+  - `_reserved_stop` uses it on every branch: a valid token, a miss with the probe alive, and a child with no token.
+    It makes no `os.stat`, no `realpath` and no `node_groups.key` call.
+- **Every way a session gets a live child.** `_spawn` is the only one, and it covers a respawn on resume. Restart
+  recovery (`recover`) signals the recorded groups without attaching a child. So a live child without a key is an
+  invariant violation, unreachable in production.
+- **That violation is decided in the one predicate.** `_reserves` is false for a session with no cached key, so it
+  takes main's path: claimed, owned, with main's registry call. No filesystem lookup, and its checkout keeps a STOPPING
+  barrier.
+- **Tests.**
+  - `test_r2_a_reserved_watchdog_cut_makes_no_filesystem_call[token|missing|no_token]`. `os.stat`,
+    `os.path.realpath` and `node_groups.key` raise if called. The stop completes, and a barrier made on a miss is
+    under the very key the group was registered under, so admission is refused.
+  - `test_a3_the_key_is_cached_at_every_attach_and_cleared_at_detach`: the spawn, the detach, and a respawn on resume.
+  - `test_a3_a_live_child_with_no_key_takes_mains_path_without_a_filesystem_call`.
+
+#### R3. What BUSY preserves (the host)
+
+BUSY commits no stop, and leaves the buffer, the slot, the hold and the adapter as they were. It does not mean nothing
+happened:
+- A drain the caller made before the reserved stop (the hold cut, the timeout, the partial cut, the steer frame's
+  broken pipe, a cancel) may already have processed N's native evidence.
+- For a child with no token, the token counter has advanced. Moving that `next()` to the RESERVED branch is not a
+  two-line change, because the barrier needs its token inside `try_stopping`, so it is left.
+
+`_reserved_stop`'s docstring says the same. In S2's tests the contact expiry is latched before the comparison: it is
+the cause, not a preparation.
+
+#### R4. The route table, completed (the host)
+
+These rows are added to the S1 table above (cause; does main have it in this state; path; what "armed" means there):
+
+| Route | Cause | Main has it here? | Path | Armed means |
+| --- | --- | --- | --- | --- |
+| A reap after the stop latch, leader gone with survivors, a steering session (`_reap`) | the latch, then an exit with survivors | no: main has no steering latch | registration only: parked, the group registered STOPPING, no SIGTERM | the STOPPING registration (nothing starts beside it); the bulk stop sends the SIGTERM, and the SIGKILL after the grace from it |
+| A reap whose claim lost to the latch during its drain | the same | no | the same registration | the same |
+| The bulk self-stop (`stop_turns`, the watchdog's or the loop's) | lost hub contact | yes | main's: `_fail`, then `_stop`, for every busy session | main's `_stop` (the clock and the SIGTERM); the kill scan escalates |
+| Shutdown (`stop_all`) | node shutdown | yes | main's: every SIGTERM, the grace, then the SIGKILL pass | the bulk stop's own kill pass; its deferred lines are written after the last SIGKILL attempt |
+
+The tests:
+- `test_r5_a_reap_after_the_latch_registers_its_survivors_and_signals_nothing` pins the first row: STOPPING
+  registered, parked, no SIGTERM, no kill clock.
+- The bulk stops are pinned by the earlier rounds' tests.
+
+#### R5. Contention pins (tests)
+
+`test_s1_a_stop_main_also_performs_is_mains_with_its_registry_wait[...]` now checks, in order:
+1. The call ENTERED main's registry call for A's group: a positive signal from a wrapped `Groups.stopping`.
+2. It waits there.
+3. No sibling SIGKILL is sent from inside that wait.
+4. After the release, the stop commits, and the sibling's SIGKILL goes in the pass after.
+
+The latch-time survivor registration has its own pin (R4 above).
+
+#### Mutation check (the changed code only)
+
+Rows: R1, A1 (2), A2 (3), A3 (3), R2, plus four earlier rows re-anchored on lines this round rewrote. On 1a37582 all
+14 are caught (scripts/steering-mutation-results.txt). The script now has 156 rows.
+
+#### Runs (on 68385be: 1a37582's code, with the mutation results)
+
+Only session_host.py and node_groups.py product code changed, so structured and tree were not re-run. Claude Code
+2.1.330 and codex-cli 0.172.0, run the way scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| Full e2e | not run | PASS, 395 |
+
+- The full suite: 5331 passed, 10 skipped, in 11 min 40 s.
+- The `~/.codex/config.toml` hash was 18fcebe0d94018f8 before, after each real run and at the end.
+- The protected files are unchanged: tests/test_codex_steering.py, tests/test_claude_correlation.py and
+  tests/fixtures/schema_free_main.json.
