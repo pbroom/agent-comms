@@ -907,9 +907,7 @@ def test_s2_a_failed_final_read_still_says_the_hold_once(henv, caplog):
 
     def drain(sess, now, out):
         calls.append(1)
-        if len(calls) == 1:
-            raise OSError("a read failed")
-        return real(sess, now, out)
+        raise OSError("a read failed")      # (every pass: the line can only come from the raising path)
     henv.host._drain_before_stop = drain
     token = s.group_token
     with caplog.at_level(logging.WARNING, logger="agent_comms.session_host"):
@@ -1021,6 +1019,41 @@ def test_a1_a_malformed_byte_count_is_no_proof(monkeypatch, count, pids):
     within it that hold no pid, is malformed: no listing (None), not absent. ("No member" is only a buffered call
     that answered 0 bytes with errno 0; e500549 read 6 bytes, or 8 bytes of zeros, as an empty group.)"""
     monkeypatch.setattr(node_groups, "_LIBPROC", [_Writes(count, pids)])
+    assert node_groups.group_members(4242) is None and node_groups.group_absent(4242) is False
+
+
+def test_a1_a_part_pid_after_a_real_one_is_no_proof(monkeypatch):
+    """A1: 6 bytes, the first 4 a real pid: not a whole number of pids, so malformed (None), not that one member."""
+    monkeypatch.setattr(node_groups, "_LIBPROC", [_Writes(6, (4242, 4243))])
+    assert node_groups.group_members(4242) is None
+
+
+def test_a1_a_malformed_answer_is_not_retried_into_proof(monkeypatch):
+    """A1: a count beyond the buffer is malformed at once (None): it is not retried with a larger buffer until some
+    later call answers 0."""
+    class OverThenEmpty:
+        listings = 0
+
+        def proc_listpids(self, kind, pgid, buf, size):
+            if buf is None:
+                return 64
+            self.listings += 1
+            return size + 4 if self.listings == 1 else 0
+    monkeypatch.setattr(node_groups, "_LIBPROC", [OverThenEmpty()])
+    assert node_groups.group_members(4242) is None
+    monkeypatch.setattr(node_groups, "_LIBPROC", [OverThenEmpty()])     # (a fresh one: its first listing again)
+    assert node_groups.group_absent(4242) is False
+
+
+def test_a1_a_negative_count_is_no_proof_whatever_errno_says(monkeypatch):
+    """R8: a negative result is a failure even with errno clear (here minus the buffer's size, which would otherwise
+    slice the listing to nothing and read as empty)."""
+    class Negative:
+        def proc_listpids(self, kind, pgid, buf, size):
+            import ctypes
+            ctypes.set_errno(0)
+            return 64 if buf is None else -size
+    monkeypatch.setattr(node_groups, "_LIBPROC", [Negative()])
     assert node_groups.group_members(4242) is None and node_groups.group_absent(4242) is False
 
 
@@ -1220,7 +1253,7 @@ def test_r9_one_shared_post_kill_deadline_for_every_killed_run(nenv):
     shut_down(node)
     assert all(c.killed == 1 for c in kids)
     step = getattr(node_groups, "POST_KILL_STEP", 0.05)
-    assert POST_KILL <= marks["report"] - marks["kill"] <= POST_KILL + 2 * step
+    assert POST_KILL <= marks["report"] - marks["kill"] <= POST_KILL + step / 2, "the deadline ends it"
     assert len(node.running) == 3 and all(node.groups.state(("run", r)) == node.groups.HELD for r in node.running)
 
 
@@ -1286,6 +1319,29 @@ def test_r9_a_hosted_session_killed_at_shutdown_is_released_when_nothing_survive
                 c.proc.kill()
             if c.proc.returncode is None:
                 c.proc.wait(timeout=10)
+
+
+def test_r9_the_nodes_watch_covers_the_sessions_it_killed(tmp_path):
+    """A2: the node's one post-KILL watch covers the hosted sessions its `sessions.kill` killed: their exit is seen
+    within it, before the runs' reports, not left to the host's later shutdown."""
+    from agent_comms.node import shut_down
+    from test_hosted_sessions import children, session_env, start, tick
+    senv = session_env(tmp_path)
+    node = senv.node
+    sid = start(senv)["session_id"]
+    tick(senv)
+    [child] = children(senv)
+    child.exits_on_terminate, child.polls_after_kill = False, 3
+    seen = {}
+    real = node.report_stopped
+    node.report_stopped = lambda: (seen.update(code=child.code, at=senv.clock()), real())[1]
+    marks: dict = {}
+    kill = node.sessions.kill
+    node.sessions.kill = lambda: (marks.setdefault("kill", senv.clock()), kill())[1]
+    shut_down(node)
+    assert child.killed == 1 and seen["code"] == -9, "its exit was seen in the node's watch"
+    assert 0 < seen["at"] - marks["kill"] < POST_KILL
+    assert node.sessions.host.sessions[sid].child is None
 
 
 def test_r9_the_sessions_fallback_after_their_kill_raised_still_releases_them(tmp_path, monkeypatch):
