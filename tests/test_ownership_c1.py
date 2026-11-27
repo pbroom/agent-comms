@@ -134,6 +134,12 @@ def test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone(henv
         assert not [e for e in out if e.kind == "turn_ended"]
     assert s.child is child and not child.terminated and not child.killed, "kept, untouched"
     assert child.turns() == ["a long turn"], "nothing more written to it"
+    henv.clock.advance(henv.host.timeout_minutes * 60 + 1)      # (its turn's timeout, then a whole kill grace)
+    henv.host.tick()
+    henv.clock.advance(henv.host.kill_grace + 1)
+    henv.host.tick()
+    assert s.stopping_since is None and not child.terminated and not child.killed, \
+        "no stop is armed and no SIGKILL sent for a process already gone, its group not proved gone"
     henv.host.group_absent = lambda pgid: True
     out = henv.host.tick()
     assert [e.detail for e in out if e.kind == "turn_ended" and e.message_id == "1"] == [
