@@ -612,6 +612,29 @@ def test_r5_the_runners_shutdown_steps_send_nothing_after_the_first_kill(env):
     assert child.terminated + child.killed == before
 
 
+def test_r5_the_runners_kill_step_vetoes_what_follows_it(env):
+    """R5: the node's own shutdown KILL step (`SessionRunner.kill`) is a first KILL attempt: from it on, nothing more
+    is sent by number, `stop_all`'s TERM and KILL included."""
+    from test_hosted_sessions import start, tick
+    from test_hosted_tree import proc_of
+    runner = env.node.sessions
+    host = runner.host
+    sid = start(env, "a turn")["session_id"]
+    tick(env)
+    s = host.sessions[sid]
+    child = proc_of(env, sid)[1]
+    child.exits_on_terminate = False
+    child.kill = lambda: setattr(child, "killed", child.killed + 1)    # (it returns; a member is left)
+    env.groups.add(child.pid)
+    runner.signal()
+    runner.kill()
+    assert child.killed == 1 and not host.groups.may_signal(s.group_token)
+    before = child.terminated + child.killed
+    with runner.lock:
+        host.stop_all()
+    assert child.terminated + child.killed == before, "nothing more after the first KILL attempt"
+
+
 @pytest.mark.parametrize("then", ["reap", "signal_runs", "kill_runs", "report_stopped"])
 def test_r5_after_a_runs_first_kill_nothing_more_is_sent(nenv, then):
     """R5, for a dispatched run: its SIGKILL (the reap's escalation after the grace) leaves a member; a later reap,
@@ -629,6 +652,7 @@ def test_r5_after_a_runs_first_kill_nothing_more_is_sent(nenv, then):
     nenv.clock.advance(nenv.node.running[rid].grace + 1)
     nenv.node.tick()        # (the reap's escalation: its SIGKILL)
     assert child.killed == 1
+    assert not nenv.node.groups.may_signal(("run", rid)), "proof-only from its first KILL attempt"
     child.left_members = True
     before = child.terminated + child.killed
     if then == "reap":
@@ -803,3 +827,31 @@ def test_r6_a4_a_session_refused_by_a_clean_exits_fence_waits_and_starts_next(he
     henv.host.groups.release(("session", "clean", 1), lambda: True, lambda: None)
     henv.host.tick()
     assert s.child is not None
+
+
+def test_r5_shutdowns_kill_pass_vetoes_at_its_attempt(henv):
+    """R5: `_stop_all`'s KILL pass makes each token it signals proof-only at the attempt, before anything else of the
+    shutdown runs (here: the first step of its traversal)."""
+    s, child = _a_turn(henv)
+    child.exits_on_terminate = False
+    henv.groups.add(child.pid)
+    seen = []
+    real = henv.host._flush_tee
+    henv.host._flush_tee = lambda sess: (seen.append(henv.host.groups.may_signal(sess.group_token)), real(sess))[1]
+    henv.host.stop_all()
+    assert child.killed == 1 and seen and seen[0] is False
+
+
+def test_r5_a1_a_killed_group_that_outlives_its_kill_is_still_said_in_the_log(henv, caplog):
+    """Amendment A1: a stopping session whose token the KILL made proof-only keeps main's steps: its group outliving
+    the KILL is still said in the log (`_lingering`), and its registry entry stays STOPPING (main's survivor branch,
+    which signals nothing) while the group is seen alive."""
+    import logging
+    s, child, clock = _killed_with_a_survivor(henv)
+    child.code = -9         # (the leader is gone; a member lives on)
+    henv.clock.advance(2 * henv.host.kill_grace + 1)
+    with caplog.at_level(logging.WARNING, logger="agent_comms.session_host"):
+        henv.host.tick()
+    assert [r for r in caplog.records if "is still there" in r.getMessage()], caplog.text
+    assert henv.host.groups.state(s.group_token) == henv.host.groups.STOPPING, "main's survivor branch"
+    assert s.child is child and s.stopping_since == clock
