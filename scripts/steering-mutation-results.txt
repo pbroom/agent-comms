@@ -106,3 +106,12 @@ rows: 5
 stale or broken: []
 missed: []
 exit 0
+
+# Round 3 of C1's review: the one changed product line (S2), on f3128ff: caught.
+
+commit f3128ff
+CAUGHT  S2 a failed final read still says the hold once  test_s2_a_failed_final_read_still_says_the_hold_once
+rows: 1
+stale or broken: []
+missed: []
+exit 0

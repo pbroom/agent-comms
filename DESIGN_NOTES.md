@@ -16938,3 +16938,54 @@ scripts/session-host-e2e.py runs them.
   coordinator's note: the Codex desktop app's own write). The new baseline is be07f3845d522521, which held before,
   after each real run and at the end.
 - The protected files are unchanged.
+
+### C1: review round 3 (on 2ef2615; Sol: CHANGES, 1 blocker later withdrawn, 2 shoulds; then S3 and S4)
+
+**The blocker was withdrawn.** It said that a run admitted to a still-LIVE checkout before the reap's fence races the
+release decision. Sol confirmed that a LIVE token permits sharing, on main and on C1, and that no locking in the reap is
+warranted. No code changed for it.
+
+#### S4: the boundary, stated exactly
+
+- **Admission is fenced when the release path installs the fence under the registry lock, before the final reads and
+  the membership proof.**
+- **Work admitted while the token was LIVE can coexist with a survivor discovered afterwards.** A LIVE entry never
+  fenced admission on main, and C1 does not change that. Excluding it would need a LIVE entry to fence, which would
+  stop runs sharing an idle session's checkout: not this PR.
+- This is said in `Groups.release`'s docstring and in round 2's notes, where the sentence that claimed more (that the
+  entry is never LIVE while the reads or the proof run) is replaced.
+
+#### S1: the shutdown precondition, said and pinned (the smaller choice)
+
+- **The issue.** `SessionRunner.kill` can veto a token that is still LIVE in the registry, because `signal()` sends
+  its TERM without marking STOPPING.
+- **Why this leaves no admission bypass:** from `stopping` (set by `signal()`) on, nothing starts a group.
+  - The loop's pass and the watchdog return on `stopping` before touching the host.
+  - Dispatched runs are admitted only by `Node.tick`, on the thread that runs `shut_down`.
+- **Why document rather than fence.** Fencing the shutdown TERM path would add a registry wait there and change no
+  outcome. Stating the precondition where the veto is set (`SessionRunner.kill`'s docstring) and pinning it is the
+  smaller change.
+- **Pins:**
+  - `test_s1_after_stopping_no_session_group_is_started`: after `signal()`, the loop's pass and the watchdog's start
+    no group;
+  - `test_s1_shutdown_starts_no_dispatched_run`: a run assigned at shutdown is never started.
+
+  Both held on 2ef2615 too: they pin a precondition, they do not fix one.
+
+#### S2: a failed final read still says the hold
+
+- **The defect.** An exception in `prepare()` (the reap's final reads) after the fence skipped the one-time retention
+  line, and the next pass saw an already-HELD token and stayed silent.
+- **The fix.** The session's release now writes that line in a `finally`, so it is written on this path too. The fence
+  stays.
+- **Pin:** `test_s2_a_failed_final_read_still_says_the_hold_once`: one line across two passes; HELD and fenced.
+
+#### S3: the W pin uses a fresh group
+
+`test_r5_w_kills_and_fences_with_a_drain_pending_and_a_raising_or_stalling_save` now stops a second, fresh group for
+its second due KILL, instead of clearing the first group's veto in the test.
+
+#### Mutation check (review round 3)
+
+One row, for the only changed product line (S2's retention line on a failed final read). On f3128ff it is caught by
+`test_s2_...`. S1 and S4 change text only, and S3 changes a test. The script now has 198 rows.
