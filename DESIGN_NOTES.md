@@ -17350,3 +17350,167 @@ where nothing sealed before it, which in production means a process that is not 
   the start of each test, so it wrote the line before the test attached its handler. That was a race in the test,
   not a product change. The test now attaches the handler first (bed5cf7); it passed 5 of 5 alone and passes in the
   serial run.
+
+## Host-side logging: one writer, review round 2
+
+This round covers review round 2 of the one-writer build: R14 to R16 with the amendment A1 to A3, which overrides
+the rulings where they differ. No stop decision, signal, signal order or save changed. Both blockers were the
+writer's START being accounted for by the thread that starts it. Now the worker accounts for itself.
+
+**Superseded** in "one writer" and "one writer, review round 1":
+- The start policy (A4 of round 1): the retry at the top of `_run`'s pass and `RESTART_SECONDS` are removed (A2).
+- `start_writer(force=...)`: `start_writer()` takes no argument.
+- The final wait's own start attempt (round 1, "The seal accounts for a start"): the final wait starts nothing.
+- "the seal and the idle decision in one step": the final wait now seals FIRST and then waits. This is stronger,
+  since no record is accepted from the moment the final wait begins.
+- The `starting` claim flag, the writer's generation (`gen`) and `start_failed_at` are gone. In their place are the
+  start-attempt token, and the worker's own registration in `_writer[0]`.
+
+### R14 and A1. The worker registers itself; a start-attempt token carries the attempt
+
+- **The token.** `_start_writer` is THE start. Under `_cond` it claims, and the claim is refused in three cases:
+  - after the seal;
+  - while a writer is registered;
+  - while a start is pending, so concurrent claimants return.
+
+  A standalone caller's lazy start claims only when records wait. The one claimant publishes a NEW object, `token`,
+  in `_state["token"]`. It then makes and starts the `Thread` outside `_cond`, passing the token as the worker's
+  argument.
+- **Self-registration.** The worker's FIRST act is `_register(token)`, under `_cond`:
+  - if the queue is sealed, or its token is not the current one (cancelled or superseded), it returns without
+    touching the queue;
+  - otherwise it consumes the token (`token = None`) and sets `_writer[0]` to itself.
+
+  `_writer[0]` is set ONLY there. Nothing the starter does after `Thread.start()` is needed for the worker to be
+  tracked.
+- **Cancellation.** If making the `Thread` or starting it fails (an `Exception`, contained), or an interrupt arrives
+  at any point before `started = True` (it propagates), the starter's `finally` acts under `_cond`. If the token is
+  still current, it cancels it. If the worker has already consumed the token by registering, the cleanup leaves the
+  registration alone. Registration and cancellation race under the one lock, and exactly one of them wins:
+  - registration first: the worker is THE writer;
+  - cancellation first: the worker, if it was launched, leaves without dequeuing.
+- **What "writer-less" means.** "No worker CAN dequeue": no registered writer, and no pending start. A cancelled
+  worker may still wake up, and it leaves. `Thread.is_alive()` is used only on a REGISTERED writer, never to decide
+  whether a start may still run.
+- **One residual, bounded.** An interrupt inside the claim's own statements, before `token` is bound in the
+  starter, or inside the cancellation itself, leaves a start pending that no worker consumes. Until the seal, nobody
+  else may start (production makes no second start anyway). No lifecycle thread waits for it. A standalone thread
+  whose own start it was waits at most ACK_SECONDS, then latches. The final wait's seal cancels it, and the wait is
+  then writer-less. No worker can be untracked in any case.
+
+### R15 and A2. The final wait starts nothing; one production start
+
+- `final_flush` starts nothing. It takes its deadline FIRST. Then, under `_cond`, it seals and waits at most until
+  that deadline for idle or writer-less. After the seal every start claim is refused, by `_start_writer`'s claim
+  for both the eager and the lazy start.
+- `threading.Thread(...)` is made inside the same `try` as `start()`: a construction failure is contained exactly
+  as a start failure (`Exception` only; A5 stands), and it cancels the token.
+- **One production start per node process:** `node.run`'s eager `hostlog.start_writer()`, its first statement
+  inside `enqueue_only()`, before recovery and outside every host lock. Nothing restarts the writer:
+  - **A writer that never started, or that died, is a logging loss for the rest of that node process.** Lines are
+    still queued up to the bound and then dropped, and the final wait is writer-less, so the node exits normally.
+  - When a registered writer dies, it deregisters and wakes every waiter as it goes, so no acknowledgement waits for
+    it.
+- The standalone lazy start stays, for `caplog`. It runs at a standalone caller's depth-0 exit (`_acknowledge`), and
+  production never reaches it: every production thread that logs is a lifecycle thread. There is no cooldown: each
+  standalone exit with records waiting tries once.
+- **The start points, pinned statically** (`test_r15_the_start_points_are_exactly_two`): every call of
+  `start_writer`, `_start_writer` or `_lazy_start` in agent_comms/ is on this list.
+
+  | Caller | Calls |
+  | --- | --- |
+  | `node.run` | `start_writer` (the one production start) |
+  | `_acknowledge` | `_lazy_start` (the standalone start) |
+  | `start_writer`, `_lazy_start` | `_start_writer` |
+  | `_reset` (tests only) | `start_writer` |
+
+### The writer's whole life (A3)
+
+Every transition is made under `_cond`. "Pending" means `token` is set and the queue is not sealed. "Registered"
+means `_writer[0]` is a live thread.
+
+| State | Entered by (thread) | Idle check / `_idle_by` | Standalone acknowledgement | A start claim | The final wait |
+| --- | --- | --- | --- | --- | --- |
+| not started | process start; a cancelled start; a dead writer | not idle while records wait | returns at once | allowed (publishes a token) | writer-less at once: normal exit, queued lines lost |
+| pending | the claimant publishes the token (starter's thread) | not idle while records wait | waits only if the pending start is ITS OWN (bounded) | refused (returns) | seals, which cancels it: writer-less |
+| start failed | starter: an `Exception` making or starting the `Thread`, or an interrupt, with the token still current: cancels it | as not started | as not started | allowed | as not started |
+| registered, idle | the worker: `_register` consumes its current token | idle | returns when its record is attempted | refused | seals; idle: normal exit |
+| registered, busy | the worker: the dequeue and `busy` published in one step (drop notice included); cleared after the last handler returns | not idle | waits, bounded (latch) | refused | seals; waits for the accepted records; busy past the deadline: False, the stalled exit |
+| dead | the worker: its own code failed outside a handler; its `finally` deregisters and wakes all | as not started | released at once | standalone lazy start only; production never | writer-less: normal exit |
+| sealed (from any state) | `final_flush` (the node's main thread, or `atexit`) | as the writer's state | as the writer's state | refused | (it is the final wait) |
+
+- **When sealed:** new records are rejected, counted nowhere. A pending start is cancelled: a worker that wakes later
+  leaves without registering. Only a writer registered before the seal finishes the records accepted before it.
+- **A late worker:** it leaves at `_register` if its token was cancelled, or superseded, or the queue is sealed. It
+  never touches the queue.
+
+Each cell a mutation can reach is pinned. The rows are below.
+
+### R16. Test hygiene
+
+- The real-SIGTERM subprocess test now reads the child's stdout on a reader thread, and waits for the readiness
+  line with a 30 s bound. On a timeout it kills the child through its own handle and fails.
+- The seal's atomicity test asserts that the late enqueue never advances `_state["seq"]`.
+- A new test logs a line on a lifecycle thread during the final wait, while the writer is busy with an earlier one.
+  The line is rejected (the sequence does not advance), and the earlier record is finished.
+- The interrupt injected into `Thread.start()` fires once only, so the teardown's reset starts a writer as ever.
+  On a first run it had escaped into the teardown and stopped the session, which hid the later tests' results.
+- The tests' reset (`_reset`) does not wait while no worker can dequeue, so a test that leaves lines queued with no
+  writer no longer costs 5 s of teardown.
+
+### Reproduction, mutation check and runs
+
+- **Reproduction.** This round's tests (tests/test_hostlog.py, final form) were copied onto 079306b, each run alone
+  with a 60 s bound:
+
+  | Test | Result on 079306b |
+  | --- | --- |
+  | R14: an interrupt after the launch, with the worker gated before it registers | FAILS: the worker the starter lost track of runs on as an untracked writer ("the late worker exits" never holds) |
+  | R14: the worker registered before the interrupt | FAILS: only the starter could register it, so it was never registered |
+  | R14: a worker that registers after the seal | FAILS: the final wait waited out its budget for a worker held before it could run (False) |
+  | A3: a registered writer that dies | FAILS: the waiter stays until ACK_SECONDS |
+  | R15: the final wait with no writer | FAILS: the final wait started a writer |
+  | R15: a start after the seal | FAILS: the start was made |
+  | R15: `Thread(...)` raising on construction | FAILS: `RuntimeError` escaped |
+  | R15: the start points, statically | FAILS: the pass retry and the final wait are start points there |
+  | A3: a line logged during the final wait | FAILS: accepted, so the final wait did not end idle |
+  | R14: concurrent claimants | passes: an acceptance pin (the claim flag already did this) |
+  | the seal's atomicity test (R16 form) | passes: an acceptance pin |
+  | R13 with the bounded handshake | passes: an acceptance pin |
+- **Mutation rows.** The script has 208 rows, none stale:
+  - 11 new: R14 ×5 (self-registration, the seal check in it, the cancelled-token check in it, the token consumed,
+    the cleanup never undoing a registration), A3 ×4 (concurrent claimants, the seal cancelling pending starts, a
+    dead writer deregistering, and waking every waiter), R15 ×2 (the final wait starts nothing, no claim after the
+    seal).
+  - 8 re-anchored or replaced: W1 (the writer is a lifecycle thread), C1, A4 (the eager start), R12 ×3, "R11 the
+    final wait seals first" (was "the seal is one step with the idle decision"), and "R14 a failed or interrupted
+    start cancels its token" (was "A5 the start claim is let go however it ends").
+  - On 11c7717, 44 rows ran (every `hostlog` row, plus C1, A4, the checkpoint sender's, the watchdog's and the session
+    loop's registration rows): 43 CAUGHT. "R14 registration consumes the token" was MISSED: the death test caught it
+    only when run alone.
+  - 6c510b3 added a direct assertion on the token, and the row was still MISSED in the full-file run. The reset
+    clears the token, and a writer that persists across tests is never re-registered, so there was no unconsumed
+    token left to see.
+  - 91c71b6: the death test lets the running writer go, starts a fresh one, and asserts that its registration
+    consumed its token. The row and the two death rows are re-run there (results below).
+  - Not pinned by a row, by statement:
+    - "the deadline is taken first". `_cond` is never held across anything that blocks, so moving the deadline
+      after the lock is an equivalent mutant today.
+    - Construction failures are contained by the same `except` as start failures. The one row for that `except`
+      covers both, and both have tests.
+- **Runs**, stand-ins only; the real CLIs were not run. Product code is unchanged since 11c7717: 6c510b3 and 91c71b6
+  change one test.
+
+  | Run | On | Result |
+  | --- | --- | --- |
+  | full suite, `-n auto` | 11c7717 | 5502 passed, 10 skipped, 0 failed, 4 min 13 s (load about 4.5) |
+  | full suite, `-n auto`, after the last test change | 91c71b6 | 5502 passed, 10 skipped, 0 failed, 4 min 12 s (load 4.2 to 7) |
+  | full suite, serial (the end) | 91c71b6 | 5502 passed, 10 skipped, 0 failed, 12 min 20 s (load 4.9 to 6.7), the end-to-end wrapper included |
+  | full stand-in e2e | 11c7717 | PASS, 395 checks, 238 s |
+  | `--only steer` | 11c7717 | PASS, 27 |
+  | `--only steering` | 11c7717 | PASS, 115 |
+  | `--only correlation` | 11c7717 | PASS, 24 |
+  | `--only structured` | 11c7717 | PASS, 36 |
+  | `--only tree` | 11c7717 | PASS, 143 |
+
+  A serial run on 6c510b3 also passed (5502 passed, 0 failed, 13 min 11 s).

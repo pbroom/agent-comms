@@ -257,3 +257,74 @@ rows: 4
 stale or broken: []
 missed: []
 exit 0
+
+# Host-side logging: one writer, review round 2 (DESIGN_NOTES "Host-side logging: one writer, review round 2").
+# The writer's start is carried by a start-attempt token and the worker registers itself; the final wait starts
+# nothing and seals first; one production start. 11 new rows (R14 x5, A3 x4, R15 x2) and 8 re-anchored or
+# replaced; 208 rows, none stale. On 11c7717, 44 rows (every hostlog row, C1, A4 and the lifecycle registration
+# rows): 43 caught, "R14 registration consumes the token" MISSED (the death test caught it only when run alone).
+# On 6c510b3 (the token asserted directly) it was still MISSED in the full-file run: the reset clears the token and
+# a writer that persists across tests is not re-registered. On 91c71b6 (the death test starts its own writer) it
+# is caught, with the two death rows its test also covers.
+
+commit 11c7717
+CAUGHT  W2 a lifecycle thread never waits (the predicate)  test_r6_n3_no_handler_runs_for_a_provider_logger_on_the_watchdogs_thread
+CAUGHT  R7-2 stop_all is an entry point (successor)  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[held]
+CAUGHT  A3 the exception's type only (successor)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  W3 nobody waits inside a boundary (the predicate)  test_a_thread_holding_a_host_lock_never_waits
+CAUGHT  L the level is checked at the call  test_a_line_the_logger_would_not_emit_is_not_kept
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's caller is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's time is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  R2 the checkpoint sender is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R2 the watchdog is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R3 an errno is read with no code of the exception's  test_facts_never_call_a_hostile_exceptions_own_code
+CAUGHT  R7 a CalledProcessError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  R7 an HTTPStatusError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  W1 the writer is a lifecycle thread (a handler that logs never waits)  test_handlers_are_entered_only_on_the_writer_thread_at_depth_0
+CAUGHT  W1 a dead writer is replaced (re-anchored)  test_a_dead_writer_is_restarted_and_there_is_only_ever_one
+CAUGHT  W1 a handler raising anything is skipped per handler  test_a_handler_that_raises_anything_is_skipped_and_the_writer_goes_on
+CAUGHT  C3 a waiter on an evicted record is released  test_a_waiter_on_a_record_the_bound_evicted_is_released_at_once
+CAUGHT  C3 the stall latch  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  C3 the latch clears on a later completion  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  W5 flush is bounded (re-anchored)  test_flush_is_bounded_with_a_blocked_writer
+CAUGHT  C1 the node's main thread is a lifecycle thread (re-anchored)  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  W2 the session loop is a lifecycle thread  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  R11 the final wait seals first  test_r11_a_line_logged_during_the_final_wait_is_rejected
+CAUGHT  R11 a record after the seal is rejected  test_r11_a_line_queued_after_the_final_wait_is_rejected_and_the_exit_is_normal
+CAUGHT  R12 a failed start is contained (the making and the start)  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  R12 nobody waits for a writer that is not running  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  A4 the writer is started eagerly by node.run  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  A4 an enqueue never starts the writer  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  R14 a failed or interrupted start cancels its token  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  R12 the final wait does not wait for a writer that cannot start  test_r12_the_final_wait_does_not_wait_for_a_writer_that_cannot_start
+CAUGHT  A5 an interrupt in the snapshot propagates  test_a5_an_interrupt_inside_the_snapshot_propagates_and_leaves_nothing_held
+CAUGHT  R14 the worker registers itself  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+CAUGHT  R14 a worker never registers after the seal  test_r14_a_worker_that_registers_after_the_seal_touches_nothing
+CAUGHT  R14 a worker whose token was cancelled never registers  test_r14_an_interrupt_after_the_launch_cancels_the_start_and_the_late_worker_touches_nothing
+MISSED  R14 registration consumes the token  
+CAUGHT  R14 the cancellation never undoes a registration  test_r14_a_registration_the_worker_won_is_never_undone_by_the_starters_cleanup
+CAUGHT  A3 concurrent claimants return while a start is pending  test_r14_a_worker_that_registers_after_the_seal_touches_nothing
+CAUGHT  A3 the seal cancels every pending start  test_r14_a_worker_that_registers_after_the_seal_touches_nothing
+CAUGHT  A3 a dead writer deregisters  test_a3_a_registered_writer_that_dies_releases_every_waiter
+CAUGHT  A3 a dead writer wakes every waiter  test_a3_a_registered_writer_that_dies_releases_every_waiter
+CAUGHT  R15 the final wait starts nothing  test_r12_the_final_wait_does_not_wait_for_a_writer_that_cannot_start
+CAUGHT  R15 no start claim after the seal  test_r15_no_start_after_the_seal
+rows: 44
+stale or broken: []
+missed: ['R14 registration consumes the token']
+exit 0
+
+commit 6c510b3
+MISSED  R14 registration consumes the token  (the same 3 rows: the 2 death rows caught; not kept)
+
+commit 91c71b6
+CAUGHT  R14 registration consumes the token  test_a3_a_registered_writer_that_dies_releases_every_waiter
+CAUGHT  A3 a dead writer deregisters  test_a3_a_registered_writer_that_dies_releases_every_waiter
+CAUGHT  A3 a dead writer wakes every waiter  test_a3_a_registered_writer_that_dies_releases_every_waiter
+rows: 3
+stale or broken: []
+missed: []
+exit 0
