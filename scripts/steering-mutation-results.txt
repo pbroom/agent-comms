@@ -1,30 +1,24 @@
-# The output of scripts/steering-mutation-check.py for the enabling PR (DESIGN_NOTES "Enabling Claude steering"): only the
-# rows for its new and changed code (S1 to S5). The script leaves out, as stale, the rows of earlier rounds whose lines this
-# PR rewrote; a row here stands for each. The whole set (152 rows) last ran in round 6. Run on d704cbf: all 21 caught.
+# Output of scripts/steering-mutation-check.py for the enabling PR, review round 1 (DESIGN_NOTES "Enabling: review round 1").
+# Only the rows for the code this round changed (R1, A1, A2, A3, R2), plus four earlier rows re-anchored on lines it rewrote.
+# The whole set has 156 rows; its last full run was in round 6. Run on 1a37582: 14 of 14 rows caught.
+# The enabling PR's first run, on d704cbf: 21 of 21 rows caught.
 
-commit d704cbf
-CAUGHT  S1 the switch  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
-CAUGHT  S1 the hold's causes reserve only with a held end  test_r10_h2_a_claude_attempt_keeps_its_path_after_the_adapter_stops_advertising
-CAUGHT  S1 steer bytes reserve only for a Claude attempt  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
-CAUGHT  S1 any other cause is main's  test_s1_a_stop_main_also_performs_is_mains_with_its_registry_wait[m_reply_pipe]
-CAUGHT  S1 a held cancel reserves  test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[r_cancel_held]
-CAUGHT  S1 a steer frame's broken pipe reserves  test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[r_steer_pipe]
-CAUGHT  S1 a partial frame's cut reserves  test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[r_partial_write]
-CAUGHT  S1 the held timeout's cause  test_r9_d2_a_held_turns_own_timeout_never_waits_on_the_registry
-CAUGHT  S1 the hold cut's cause  test_r3_n_the_sigterm_is_sent_outside_the_cutoff_lock
-CAUGHT  S1 main's route of a steering session is claimed  test_r5_known_limit_a_raising_log_handler_between_a_claim_and_its_signal
-CAUGHT  S2 busy commits nothing  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
-CAUGHT  S2 escalation armed before the commit  test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order
-CAUGHT  S2 the partial cut clears the buffer only after the reservation  test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[r_partial_write]
-CAUGHT  S2 the steer pipe clears the buffer only after the reservation  test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[r_steer_pipe]
-CAUGHT  S3 a live miss gets a barrier  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[kept]
-CAUGHT  S3 a verified exit needs no entry  test_s3_a_verified_exit_needs_no_entry
-CAUGHT  S3 a live child with no token gets one  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[none]
-CAUGHT  S3 the registry inserts the barrier on a miss  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[kept]
-CAUGHT  S4 on by default  test_r9_f_claude_steering_is_off_by_default
-CAUGHT  S5c the watchdog's lane waits during reconciliation  test_s5c_a_handoff_inside_reconciliation_keeps_lost_ahead_of_a_watched_terminal[True]
-CAUGHT  S5c the phase is marked  test_s5c_a_handoff_inside_reconciliation_keeps_lost_ahead_of_a_watched_terminal[True]
-rows: 21
+commit 1a37582
+CAUGHT  R1 the claim runs the route's own stop  test_the_queued_s_close_finalizer_n_end_then_ended
+CAUGHT  A1 the stop runs whatever the decision raised  test_r1_a1_a_decision_that_raises_after_the_latch_still_reaches_the_stop
+CAUGHT  A1 the first exception propagates  test_r1_a1_the_first_exception_propagates_when_the_stop_raises_too
+CAUGHT  A2 the claim's lines go to the deferred queue  test_r1_a_claimed_main_route_signals_before_any_handler_and_writes_its_lines_at_the_flush[m_close_live-blocks]
+CAUGHT  A2 the reserved stop's lines go to the deferred queue  test_a2_a_reserved_stops_lines_go_to_the_deferred_queue_too[r_partial_write-blocks]
+CAUGHT  A2 a node's host writes no line at its tick  test_a2_under_the_node_a_claims_lines_are_written_outside_the_runner_lock
+CAUGHT  A3 the key cached at spawn  test_r3_n_the_sigterm_is_sent_outside_the_cutoff_lock
+CAUGHT  A3 the key cleared at the detach  test_a3_the_key_is_cached_at_every_attach_and_cleared_at_detach
+CAUGHT  A3 a live child with no key is main's  test_a3_a_live_child_with_no_key_takes_mains_path_without_a_filesystem_call
+CAUGHT  R2 the barrier is under the cached key  test_r2_a_reserved_watchdog_cut_makes_no_filesystem_call[token]
+CAUGHT  S3 a verified exit needs no entry (re-anchored)  test_s3_a_verified_exit_needs_no_entry
+CAUGHT  S3 a live miss gets a barrier (re-anchored)  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[kept]
+CAUGHT  S1 main's route of a steering session is claimed (re-anchored)  test_r5_known_limit_a_raising_log_handler_between_a_claim_and_its_signal
+CAUGHT  S1 the switch (re-anchored)  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
+rows: 14
 stale or broken: []
 missed: []
 exit 0
