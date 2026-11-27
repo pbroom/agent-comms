@@ -116,3 +116,24 @@ rows: 28
 stale or broken: []
 missed: []
 exit 0
+
+# Host-side logging, review round 2 (DESIGN_NOTES "Host-side logging: review round 2"): the 7 new rows (R5's
+# four boundaries, R6's import alias, R7's two exact-type reads), and the rows on code round 2 touched or relies
+# on (facts; the runner and registry locks); on 493bcde (this round's code).
+
+commit 493bcde
+CAUGHT  A2 the runner lock is a host lock (successor)  test_a2_under_the_node_a_claims_lines_are_written_outside_the_runner_lock
+CAUGHT  A2 the registry lock is a host lock (successor)  test_a_registry_callback_line_is_written_after_the_registry_is_let_go
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R3 an errno is read with no code of the exception's  test_facts_never_call_a_hostile_exceptions_own_code
+CAUGHT  R5 shutdown is one signal sequence  test_a_line_queued_before_shutdown_is_written_after_its_last_signal[normal-blocks]
+CAUGHT  R5 the sessions' signal part inside the sequence  test_a_line_queued_before_shutdown_is_written_after_its_last_signal[fallback-blocks]
+CAUGHT  R5 the node's stop_all is one signal sequence  test_the_nodes_own_stop_all_writes_no_line_between_its_signals
+CAUGHT  R5 a node pass is one boundary  test_a_node_pass_writes_no_line_between_the_runs_it_signals
+CAUGHT  R7 a CalledProcessError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  R7 an HTTPStatusError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  R6 no lock through an import alias  test_locks_are_built_only_in_the_reviewed_forms
+rows: 11
+stale or broken: []
+missed: []
+exit 0

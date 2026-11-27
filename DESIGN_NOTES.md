@@ -16998,3 +16998,22 @@ feeds each of these bypasses to the checks as source text.
 - `test_facts_run_no_code_of_a_subclass_of_a_reviewed_class` makes a hostile subclass of each class, with a
   `__dict__` property, `__getattribute__` and `__str__` that record and raise. None is entered. On 654d44c the two
   `__dict__` properties were entered.
+
+### Mutation check and runs
+
+- **Mutation rows.** The script now has 188 rows (7 new: R5's four boundaries, R6's import alias, R7's two
+  exact-type reads). On 493bcde, 11 ran (the 7 new, plus the facts, runner-lock and registry-lock rows this round
+  relies on): all CAUGHT.
+- **Runs** on 493bcde (stand-ins; the real CLIs were not run), with the machine loaded by other agents' runs:
+
+  | Run | Result |
+  | --- | --- |
+  | full suite, serial | 5465 passed, 10 skipped, 1 failed, 23 min 13 s (load about 8 to 11): `test_the_end_to_end_script_passes_with_the_stand_in`, its 300 s limit |
+  | that test alone, rerun twice | at load 8: failed in 33 s, the reason not kept (its output was cut to one line); at load 7: PASSED in 239 s |
+  | full suite, `-n auto` | 5465 passed, 10 skipped, 1 failed (the same test), 6 min 55 s, load 20 |
+  | full stand-in e2e, run directly | PASS, 395 checks, 623 s (load 13 to 18) |
+  | `--only steer` | PASS, 27 |
+  | `--only steering` | PASS, 115 |
+  | `--only correlation` | PASS, 24 |
+  | `--only structured` | PASS, 36 |
+  | `--only tree` | PASS, 143 |
