@@ -16555,3 +16555,183 @@ tests/test_claude_steering_enable.py.
   turn was proved before the cut. At the verified reap, N settles once with S `next_turn` failed (`own_turn_cut`), and
   its detail is the cut's.
 - **No defect was found, and no product code changed.**
+
+## Host-side logging
+
+PR-B of the hardening split, on main e6ebf95 (merged with 03268de, #121, for the parallel test runs). Sol checked its
+structure before the build. Logging only: no stop decision, signal, signal order, persistence, registry or deferred
+state save (`_save_due`) changed.
+
+### The invariant
+
+**No log handler runs, and nothing is formatted, while the calling thread holds a host lock** (the runner lock
+`SessionRunner.lock`, the cutoff lock `SessionHost._steer_stop_lock`, the registry lock `Groups.lock`), on any thread,
+for any host-side line. Nothing process-wide is patched: the `logging.Logger._log` replacement is gone.
+
+### The mechanism (`agent_comms/hostlog.py`)
+
+- **The adapter.** `session_host`, `node_sessions`, `node` and `providers/claude`, `providers/codex` take their logger
+  from `hostlog.get(name)`, under the same names, with `logging`'s own level checks and handlers, so `caplog` and
+  `node.log_to_stderr` (and `cli.py`'s `basicConfig`) work as before. `node_groups` and `providers/__init__` log
+  nothing. The spawn callbacks that run under the registry lock (`SessionHost._spawn`'s and `node.Node`'s:
+  `dispatch.child_env` and `spawn_piped`/`spawn_process`) log nothing today; a line one logs through the adapter is
+  written after the registry is let go (pinned).
+- **The record, made at the call** (B3): the wall time, the thread, the logger name, the level (a line the logger
+  would not emit is not kept: filtering is at the call), the template, the caller as (file, line, function) from its
+  frame (no source lookup), and the arguments reduced there: `str`, `int`, `float`, `bool` and `None` kept (a subclass
+  as its base type's value, read with no code of its own; a lone `dict` is copied for `%(key)s` templates, values
+  reduced), anything else replaced by its type's name. An exception is its type's name and its traceback's (file,
+  line, function) triples, walked by hand (no `traceback` call, no text, no source lines, no locals, no chained
+  exceptions). The writer makes a real `logging.LogRecord` (`created`, `pathname`, `lineno`, `funcName`, `thread` and
+  `threadName` the call's; the frames as `exc_text`, `exc_info` None; `hostlog_exc` and `hostlog_seq` kept on it) and
+  hands it to each handler of the logger and its ancestors, as `Logger.handle` would, each on its own.
+- **The boundary and the per-thread depth** (B4). One counter per thread, kept by `hostlog.BOUNDARY` itself (entered
+  and left in that one place). Three things enter it: every public method of `SessionHost` (`@hostlog.entries`), every
+  host lock as it is taken (`hostlog.HostLock` wraps the three locks: taking it enters, letting it go leaves), and a
+  log call made with no boundary open. Leaving at depth 0 drains, on that thread, on a normal or an exceptional exit.
+  A thread that holds a host lock is always inside a boundary, so the drain never runs under one. Why this and not
+  existing state: none of the locks can say who owns it (`threading.Lock` cannot; asking each lock at each call would
+  be a second decision), and the old per-thread markers (`WATCH_THREADS`, `_claimer`) say what a thread is doing, not
+  how deep it is in host code.
+- **THE drain** (`hostlog.drain`) is the one place that decides whether to drain. Never on a watchdog thread
+  (`WATCH_THREADS`, now defined in hostlog and re-exported by session_host), never inside a boundary, never nested on
+  the active drainer's own thread (a handler that logs or calls back into the host: its records go to that active
+  drainer, which writes until the queue is empty). Leaving a host lock at depth 0 writes everything queued, so the
+  loop writes the watchdog's lines when it lets go of the runner lock; any other exit writes only when the thread has a
+  record of its own pending, so an entry point that logged nothing (`attempts`, called under the node's ack lock)
+  writes and waits for nothing. While another thread drains, a thread with records pending waits (holding no host lock
+  and no lock of hostlog's) until they are written, then returns. The serialization is the drainer's turn, handed over
+  under the queue's own short lock, which is never held across a handler or a wait. The watchdog never drains and so
+  never waits on a drainer: a stalled handler holds only its own thread.
+- **Failure and bounds** (B5). A handler that raises is caught (per handler, so the others still get the record); the
+  drain goes on; nothing reaches host code. A snapshot that fails keeps a line saying so. The queue holds 2000 records
+  (`QUEUE_MAX`): the oldest goes first, and the next drain says once how many went. `atexit` drains with a 2 s bound.
+  The guarantee that a line is with the handlers when the public call returns holds for the records the queue kept.
+
+### The boundary list (where the drain runs)
+
+- **Every public method of `SessionHost`**: `transcript_path`, `keep_provider_ids`, `recover`, `open`,
+  `keep_private_files`, `send`, `interrupt_for`, `steer_offer`, `steer_revoke`, `steer_stopping`, `attempts`,
+  `steer_slot`, `steer_fence`, `steer_live`, `steer_deadlines`, `live_attempt`, `holds`, `claude_steer`, `modes`,
+  `state`, `close`, `forget`, `tick`, `outbox_head`, `ack`, `take_outbox`, `note_usage`, `cancel`, `park`, `kill_due`,
+  `stop_turns`, `stop_all`. Not `one_drain_budget` (a context manager's factory), `sessions_dir` (a property) or
+  `holding` (static). Under the node each is an inner call (the runner lock is held) and drains nothing.
+- **Every release of the runner lock** at depth 0: `pass_once` (right after it lets go, before its last report),
+  `signal`, `alive`, `kill`, `shutdown` (after `stop_all` has returned and the lock is released, and again after the
+  final handoff). `enforce_deadlines` releases it on the watchdog's thread: no drain.
+- **Every release of the registry lock or the cutoff lock** at depth 0: in production only `node.Node`'s use of
+  `Groups` (its dispatched runs' `start`, `stopping`, `gone`, `blocked`); the host's are inside its entry points.
+- **A log call with no boundary open**: the node's own lines (`node.py`), the runner's lines outside its lock (a fetch
+  that failed, the reports, the checkpoint sender's thread), a provider driven directly.
+- **`atexit`**, bounded.
+
+### What was deleted
+
+`_diverting_log`, `_real_log` and the patch of `logging.Logger._log`; `_keep_line`, `_WATCH_LINES`, `_WATCH_DROPPED`,
+`flush_watch_logs` (and its calls in `pass_once` and `tick`, with the `keep_outbox` special case); `_say` and
+`_defer_logs` (and the claim's and the reserved stop's line lists and their `try`/`finally`s); `stop_all`'s own
+registration in `WATCH_THREADS` and its `undivert` (it was there for logging only: in its span nothing saves or tees,
+so saves and transcripts are unchanged). `WATCH_THREADS` stays for saves and transcript lines, and as the drain's "never
+on a watchdog thread".
+
+**Kept, and why.** `_claimer`, the claim's thread marker: `_emit_hold`'s save rule reads it (ruling T: a held end
+published under the cutoff lock saves nothing; the loop's next tick does). Removing it would change the deferred save,
+which this PR may not. It now carries nothing about logging. `stop_all` and `_stop_all` are one method again (the
+wrapper held only the registration).
+
+### Behaviour that changes (logging only)
+
+- Every host-side line is written later than before: at the end of the public call, or when the node lets go of the
+  runner lock, instead of at the call. A watchdog's line is written at the loop's next runner-lock release instead of
+  at the start of its next pass. Its time and caller are now the call's (no longer the flush's: the known limit of
+  "Enabling: review round 1", A2, is gone).
+- An argument that is not a str, int, float, bool or None is written as its type's name. Fifteen call sites passed an
+  exception object (`... (%s)", e`): they now say `OSError`, `ConnectError`, `LookupError` and so on, never the text.
+  No call site passes a path object, a list or any other object.
+- A logged exception's traceback is frames only, ending with the type's name; no exception text, no source lines.
+- The survivor reap's "left members of its group" warning (main's, before its SIGTERM) is queued at the same point and
+  written after the signal and after the lock is let go.
+
+### The string-argument audit
+
+Every call of the five modules' `log.*` was listed with its arguments (an AST listing: 110 calls; script kept in the
+build's scratchpad). Every string argument is a session id, a message id, a uuid, a number, a pid, a checkout path, a
+fixed phrase from the code (`why`, `problem`, `detail`), a provider's escaped and bounded version (`shown_version`) or
+an access word. None is a message's or a steer's text; the one value that could carry text the host did not write (an
+exception's message) is now reduced to its type's name.
+
+### Tests
+
+- **The dynamic guard** (tests/hostlog_guard.py): the three host locks instrumented to know their owner, and a handler
+  on the package logger that records which of them the ENTERING thread holds. Run with a handler that blocks and one
+  that raises:
+  - every route of the two matrices in tests/test_claude_steering_enable.py (`RESERVED`, `MAINS`), each standalone
+    and as the node runs it (under a runner lock), with a sibling's SIGKILL due:
+    `test_hostlog_no_handler_is_entered_under_a_host_lock_on_any_route`;
+  - the node's own routes (a start, a claimed timeout, the watchdog's reserved cut, the self-stop, a close, shutdown):
+    `test_no_handler_is_entered_under_a_host_lock_on_the_nodes_routes`;
+  - a spawn callback under the registry lock, the host's and `node.Node`'s.
+- **On e6ebf95** (an export of e6ebf95 with these test files copied in; the guard runs there with the `hostlog`
+  parts absent), 34 of the 74 guard cases fail:
+  - with the blocking handler, 16: lines written under the runner lock in `n_start` ("started session"),
+    `n_watchdog_hold_cut` and `n_shutdown` (the steer's outcome), and in the node runs of `r_held_timeout`,
+    `r_partial_write`, `r_steer_pipe`, `r_partial_write_unverified`, `m_close_live`, `m_fatal`, `m_host_error`,
+    `m_reap_survivors` (main's survivor warning among them), `m_cancel_live`, `m_reply_pipe`, `m_live_timeout`; and
+    under the registry lock, both spawn callbacks (the host's and `node.Node`'s);
+  - with the raising handler, 18: the same 14 routes, plus 4 standalone routes (`r_held_timeout`, `m_host_error`,
+    `m_reap_survivors`, `m_live_timeout`) where the handler's exception reached host code (main ran handlers at the
+    call: here the deferred flush or a synchronous line).
+  - Passing there: `n_timeout`, `n_self_stop`, `n_close`, every other standalone run (a claim's lines were already
+    deferred), and the node runs of `r_hold_cut`, `r_cancel_held`, `m_close_held`, `m_park`.
+- **tests/test_hostlog.py, the mechanism**: the static check (no `logging.getLogger` or `logging.<level>` in the
+  modules, `node.log_to_stderr` excepted), names and levels, `caplog` sees a line when `tick` returns, call-time level
+  filtering, the snapshot (time, thread, caller triple, exception triples with no text, an object as its type's name,
+  a mapping), enqueue order across threads is the write order, an inner call under the runner lock leaves its lines to
+  the outer boundary on a normal and an exceptional exit, each host lock is a boundary of its own, a raising handler
+  is caught and the next handler still gets the record, a handler that logs and calls back into the host does not
+  deadlock and its records are written by the active drainer before the outer call returns, a blocked drainer does not
+  delay the watchdog's SIGTERM or SIGKILL, a watchdog thread never drains, an entry that logged nothing writes nothing
+  (the watchdog's lines go at the runner lock's release), a drain with another drainer stalled is bounded when asked.
+- **Pins of the old mechanism, rewritten** (each with its successor):
+  - `test_r1_a_claimed_main_route_..._writes_its_lines_at_the_flush` became `..._at_the_calls_drain`: the handler is
+    entered by the call's own drain, after the signal and the kill clock, with no host lock held; while it blocks, a
+    sibling's due SIGKILL goes.
+  - `test_a2_a_reserved_stops_lines_go_to_the_deferred_queue_too` became
+    `test_a2_a_reserved_stops_lines_are_written_by_the_calls_drain_too`, the same assertions.
+  - `test_a2_under_the_node_a_claims_lines_are_written_outside_the_runner_lock`: now in the same pass, with the runner
+    lock instrumented to know its owner (it was the next pass's flush).
+  - `test_r4_t_nothing_logs_or_saves_under_the_cutoff_lock` became
+    `test_r4_t_no_handler_runs_and_nothing_is_saved_under_the_cutoff_lock`: a line may be queued under the cutoff lock,
+    never written there (the guard), and nothing saved there (unchanged).
+  - `test_r5_known_limit_a_raising_log_handler_between_a_claim_and_its_signal` became
+    `test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop`: the known limit is gone (a raising
+    handler no longer ends the pass by the host-error path); N once, the stop went, no host error.
+  - `test_r7_a3_a_deferred_line_carries_the_exception_type_only`: through the adapter (`node_sessions.log`), checked
+    in the formatted record (type and frames, no text).
+  - `test_r7_3_the_deferred_queue_counts_what_it_drops`: `hostlog.QUEUE_MAX`, the drop line first, the kept lines in
+    order.
+  - `test_r7_a2_stop_all_restores_the_callers_prior_diversion` became
+    `test_r7_a2_stop_all_on_a_watchdog_thread_writes_no_line_there`.
+  - Unchanged and green: the stalling-handler shutdown pins (`test_r7_2_...`), `test_r6_n3_...` (no traceback
+    formatted on the watchdog's thread), `test_r6_...` (the provider's watchdog line written by the loop),
+    tests/test_codex_steering.py, tests/test_claude_correlation.py and tests/fixtures/schema_free_main.json
+    (byte-identical).
+- **tests/conftest.py**: each test starts with an empty queue (`hostlog._reset`), so no record a former test's
+  watchdog thread left reaches the next test's handlers.
+
+### Carried from #120's review (B8)
+
+- `test_a1_the_promoted_event_is_taken_from_where_it_is_in_watched`: the promoted event behind another session's
+  watched event; `pop(0)` in place of `pop(at)` fails it.
+- `test_a1_only_an_ended_promotes_the_sessions_watched_events`: a `turn_ended` handed off while `watched` waits
+  promotes nothing.
+- `_deliver`'s docstring: the promotion applies wherever `watched` waits, also at `pass_once`'s handoff before the
+  reconciliation and at `_after_tick`'s. No change to its behaviour.
+
+### Known limits
+
+- A handler that never returns holds its own drainer's thread for good, as it would have held the caller's thread
+  before; a thread with records of its own waits behind it (none holds a host lock), the watchdog never does.
+- The watchdog's lines wait for a runner-lock release, a host lock's release or a line of the waiting thread's own;
+  on a node whose loop has stopped they are written at exit (2 s bound) or not at all.
+- `BaseException` from a handler (KeyboardInterrupt, SystemExit) is not swallowed.

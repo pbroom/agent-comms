@@ -4563,7 +4563,7 @@ def test_r7_a2_stop_all_on_a_watchdog_thread_writes_no_line_there(henv, monkeypa
         assert done.wait(10) and not err, err
         assert seen == [True]
         assert not [th for _, th, _ in h.seen if th == ident[0]], "no handler on the watchdog's thread"
-        hostlog.drain()
+        hostlog.drain(everything=True)
         assert [m for _, th, m in h.seen if "the steer into message" in m and th != ident[0]], "written elsewhere"
 
 
@@ -4614,7 +4614,7 @@ def test_r7_a3_a_deferred_line_carries_the_exception_type_only(env):
     lg = logging.getLogger("agent_comms")
     lg.addHandler(h)
     try:
-        assert hostlog.drain()
+        assert hostlog.drain(everything=True)
     finally:
         lg.removeHandler(h)
     [(msg, text)] = [x for x in got if "something failed" in x[0]]
@@ -4634,7 +4634,7 @@ def test_r7_3_the_deferred_queue_counts_what_it_drops(env):
     t, done, ident, err = _on_watchdog(None, fn=logs)
     assert done.wait(10) and not err, err
     with _StallingHandler(seconds=0) as h:
-        hostlog.drain()
+        hostlog.drain(everything=True)
     lines = [m for _, _, m in h.seen]
     assert lines[0] == "7 deferred log line(s) were dropped: the queue was full", lines[:2]
     assert lines[1] == "line 7" and lines[-1] == f"line {n - 1}" and len(lines) == hostlog.QUEUE_MAX + 1

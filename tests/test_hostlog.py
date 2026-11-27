@@ -287,7 +287,7 @@ def test_a_line_the_logger_would_not_emit_is_not_kept():
         try:
             _on_watch_thread(logs)
             real.setLevel(logging.DEBUG)
-            hostlog.drain()
+            hostlog.drain(everything=True)
         finally:
             real.setLevel(level)
     assert rec.messages() == ["a warning line"]
@@ -333,7 +333,7 @@ def test_a_deferred_record_is_the_calls_snapshot():
         assert rec.records == [], "nothing written on the watchdog's thread, nor before a drain"
         mutable.append("changed")
         _time.sleep(0.05)
-        hostlog.drain()
+        hostlog.drain(everything=True)
     first, mapping, failed = rec.records
     assert at["before"] <= first.created <= at["after"] < _time.time()
     assert first.threadName == at["thread"]
@@ -366,7 +366,7 @@ def test_enqueue_order_across_threads_is_the_write_order():
         b.start()
         a.join(10)
         b.join(10)
-        hostlog.drain()
+        hostlog.drain(everything=True)
     assert rec.messages() == [f"line {i}" for i in range(8)]
     seqs = [r.hostlog_seq for r in rec.records]
     assert seqs == sorted(seqs)
@@ -478,13 +478,29 @@ def test_a_watchdog_thread_never_drains():
         session_host.log.warning("outside")
         with hostlog.BOUNDARY:
             session_host.log.warning("inside")
-        hostlog.drain()
+        hostlog.drain(everything=True)
     with _Records(act=lambda r: written.append(threading.get_ident())) as rec:
         ident = _on_watch_thread(logs)
         assert rec.records == []
-        hostlog.drain()
+        hostlog.drain(everything=True)
     assert rec.messages() == ["outside", "inside"] and all(r.thread == ident for r in rec.records)
     assert written and ident not in written
+
+
+def test_the_watchdogs_lines_are_written_at_the_runner_locks_release_not_by_an_entry_that_logged_nothing(env):
+    """B4: what the watchdog queued is written by the loop when it lets go of the runner lock; an entry point that
+    logged nothing itself (`attempts`, which the node's acknowledgement path calls under its ack lock) writes and
+    waits for nothing."""
+    from agent_comms import node_sessions
+    runner = env.node.sessions
+    with _Records() as rec:
+        _on_watch_thread(lambda: node_sessions.log.warning("the watchdog's line"))
+        with runner.ack_lock:
+            runner.host.attempts()
+        assert rec.records == [], "not by an entry that logged nothing"
+        with runner.lock:
+            pass
+        assert rec.messages() == ["the watchdog's line"], "by the runner lock's release"
 
 
 def test_a_drain_with_another_drainer_stalled_is_bounded_when_asked():

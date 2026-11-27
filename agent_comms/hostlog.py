@@ -21,7 +21,9 @@ lock, the cutoff lock, the registry lock), on any thread, for any host-side line
   decorator: every public method of the session host), entered by every host lock as it is taken (`HostLock`: the
   runner lock, the cutoff lock, the registry lock). A thread that holds a host lock is therefore always inside a
   boundary, and the drain, which runs only at depth 0, never runs under one. A line logged with no boundary open is
-  its own: queued and drained at once.
+  its own: queued and drained at once. Leaving a host lock at depth 0 writes everything queued (so the loop writes
+  the watchdog's lines when it lets go of the runner lock); any other exit writes only when the thread has a record
+  of its own pending (an entry point that logged nothing writes and waits for nothing).
 - A watchdog thread (`WATCH_THREADS`: node_sessions registers its deadline watchdog) never drains: its records wait
   for the loop. A drain on a thread that is already draining (a handler that logs, or that calls back into the host)
   leaves what it adds to that ACTIVE drainer, which writes until the queue is empty: it never waits on itself. A
@@ -73,14 +75,21 @@ class _Boundary:
         return self
 
     def __exit__(self, *exc) -> bool:
+        self.leave()
+        return False
+
+    def leave(self, everything: bool = False) -> None:
+        """The exit: at depth 0 again, the drain (`everything`: a host lock let go, whose holder writes what any
+        thread queued, the watchdog's records included; otherwise the drain writes only when this thread has a record
+        of its own not yet written, so an entry point that logged nothing, such as `attempts` under the node's ack
+        lock, never writes or waits for other threads' lines)."""
         depth = getattr(_local, "depth", 0) - 1
         _local.depth = depth if depth > 0 else 0
         if depth <= 0:
             try:
-                drain()
+                drain(everything=everything)
             except Exception:       # (never into the host's code)
                 pass
-        return False
 
 
 BOUNDARY = _Boundary()
@@ -126,15 +135,15 @@ class HostLock:
         try:
             ok = self._lock.acquire(blocking, timeout)
         except BaseException:
-            BOUNDARY.__exit__(None, None, None)
+            BOUNDARY.leave()
             raise
         if not ok:
-            BOUNDARY.__exit__(None, None, None)
+            BOUNDARY.leave()
         return ok
 
     def release(self) -> None:
         self._lock.release()
-        BOUNDARY.__exit__(None, None, None)
+        BOUNDARY.leave(everything=True)
 
     def __enter__(self) -> bool:
         return self.acquire()
@@ -333,12 +342,12 @@ def _write(r: _Record) -> None:
 
 
 def drain(timeout: float | None = None, everything: bool = False) -> bool:
-    """THE drain: every queued record written, in queue order, on this thread; called when a thread leaves its
-    outermost boundary (and by `atexit`, bounded). Nothing on a watchdog thread, inside a boundary, or on a thread
-    that is already the active drainer (what is added meanwhile is that drainer's to write). Another thread's drain
-    under way: this one waits only until its OWN records are written (`everything`: all records queued before the
-    call; `timeout`: at most so long), then leaves the rest to that drainer; a thread with no record of its own waiting
-    never waits. Never raises. True: what it waited for is written."""
+    """THE drain, and the one place that decides whether to drain: every queued record written, in queue order, on
+    this thread; called when a thread leaves its outermost boundary (and by `atexit`, bounded). Nothing on a watchdog
+    thread, inside a boundary, or on a thread that is already the active drainer (what is added meanwhile is that
+    drainer's to write). What it waits for: its OWN records (`everything`: all records queued before the call); with
+    none pending it does nothing. Another thread's drain under way: it waits only until those are written (`timeout`:
+    at most so long), then leaves the rest to that drainer. Never raises. True: what it waited for is written."""
     me = threading.get_ident()
     if me in WATCH_THREADS or getattr(_local, "depth", 0) > 0:
         return False
@@ -354,7 +363,7 @@ def drain(timeout: float | None = None, everything: bool = False) -> bool:
             if remaining is not None and remaining <= 0:
                 return False
             _cond.wait(remaining)
-        if not _queue and not _state["dropped"]:
+        if (not _queue and not _state["dropped"]) or _state["done"] >= target:
             return True
         _state["drainer"] = me
     try:
