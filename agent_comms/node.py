@@ -578,7 +578,7 @@ def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
     report or a save of the node's. After the last signal and report: ONE bounded wait for the writer
     (`_exit_if_stalled`)."""
     with hostlog.enqueue_only():
-        hostlog.start_writer(force=True)    # (eagerly, here: no lifecycle thread's log call ever starts it)
+        hostlog.start_writer()      # (eagerly, here, once: nothing restarts it in this process)
         try:
             _run(hub, token, poll_seconds=poll_seconds)
         except BaseException as e:
@@ -632,7 +632,6 @@ def _run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
             node.sessions.start()   # their own loop: a message starts a turn without waiting for poll_seconds
         try:
             while True:
-                hostlog.start_writer()      # (the retry point if it is not running: this thread, at depth 0)
                 try:
                     node.tick()
                 except httpx.HTTPError as e:

@@ -789,8 +789,7 @@ def test_a_dead_writer_is_restarted_and_there_is_only_ever_one(monkeypatch):
     dead.start()
     dead.join()
     with hostlog._cond:
-        hostlog._state["gen"] += 1      # (the running writer leaves: as in a process with none yet)
-        hostlog._writer[0] = dead
+        hostlog._writer[0] = dead       # (the running writer is let go and leaves: a dead one is registered)
         hostlog._cond.notify_all()
     gate = threading.Barrier(16)
 
@@ -1006,7 +1005,7 @@ def test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread():
     first = run.body[1] if isinstance(run.body[0], ast.Expr) else run.body[0]
     assert isinstance(first, ast.With) and ast.unparse(first.items[0].context_expr) == "hostlog.enqueue_only()", \
         "node.run registers its thread first"
-    assert ast.unparse(first.body[0]) == "hostlog.start_writer(force=True)", "and starts the writer eagerly (A4)"
+    assert ast.unparse(first.body[0]) == "hostlog.start_writer()", "and starts the writer eagerly (A4)"
 
 
 def test_no_fork_without_exec_in_the_host_side_modules():
@@ -1509,6 +1508,7 @@ class Stuck(logging.Handler):
 logging.getLogger("agent_comms").addHandler(Stuck())
 logging.getLogger("agent_comms").setLevel(logging.INFO)
 with hostlog.enqueue_only():
+    hostlog.start_writer()          # (as `node.run` does, first: the final wait starts nothing)
     node.log.warning("a line")
     print("signals sent", flush=True)
     node._exit_if_stalled(3 if stalled else 0)
@@ -1579,7 +1579,7 @@ def final_flush(budget):
     return ok
 hostlog.final_flush = final_flush
 with hostlog.enqueue_only():
-    getattr(hostlog, "start_writer", lambda **k: None)(force=True)
+    hostlog.start_writer()
     node.log.warning("the last report")
     print("signals sent", flush=True)
     node._exit_if_stalled(0)
@@ -1621,8 +1621,7 @@ def test_r11_an_enqueue_after_the_seal_raises_nothing_starts_nothing_and_blocks_
     assert hostlog.final_flush(2.0) is True and hostlog._state["sealed"]
     seq, threads = hostlog._state["seq"], threading.active_count()
     with hostlog._cond:
-        hostlog._state["gen"] += 1          # (even with no writer running, nothing starts one now)
-        hostlog._writer[0] = None
+        hostlog._writer[0] = None           # (even with no writer running, nothing starts one now)
         hostlog._cond.notify_all()
     _time.sleep(0.1)
     threads = threading.active_count()
@@ -1644,7 +1643,6 @@ def test_r11_the_seal_and_the_idle_decision_are_one_step(monkeypatch):
     second critical section is therefore always preceded by the producer's record; the seal made in the deciding
     critical section never re-enters, and the producer runs only after it."""
     import threading
-    import time as _time
     from agent_comms import hostlog, session_host
     real_idle_by, real_cond = hostlog._idle_by, hostlog._cond
     go, done, decided, main = threading.Event(), threading.Event(), [False], threading.get_ident()
@@ -1676,6 +1674,7 @@ def test_r11_the_seal_and_the_idle_decision_are_one_step(monkeypatch):
         monkeypatch.setattr(hostlog, "_idle_by", idle_by)
         monkeypatch.setattr(hostlog, "_cond", Gate())
         threading.Thread(target=lambda: _on_watch_thread(producer), daemon=True).start()
+        seq = hostlog._state["seq"]
         try:
             assert hostlog.final_flush(2.0) is True
         finally:
@@ -1684,20 +1683,56 @@ def test_r11_the_seal_and_the_idle_decision_are_one_step(monkeypatch):
             assert done.wait(5)
             monkeypatch.setattr(hostlog, "_cond", real_cond)
         assert hostlog._state["sealed"]
-        _time.sleep(0.2)
+        assert hostlog._state["seq"] == seq, "the late enqueue never advances the sequence (R16)"
     assert "between the idle decision and the seal" not in rec.messages()
+
+
+def test_r11_a_line_logged_during_the_final_wait_is_rejected(monkeypatch):
+    """A3 (any state → sealed): the final wait seals FIRST, then waits for the registered writer to finish the records
+    it accepted before: a lifecycle thread's line logged while the writer is still busy with an earlier one is
+    rejected (the sequence does not advance), the earlier one is finished, and the wait ends idle."""
+    import threading
+    from agent_comms import hostlog, session_host
+    release, logged = threading.Event(), threading.Event()
+
+    def act(r):
+        if r.getMessage() == "earlier":
+            release.wait(10)
+    with _Records(act=act) as rec:
+        with hostlog.enqueue_only():
+            session_host.log.warning("earlier")
+        assert _wait(lambda: hostlog._state["busy"] is not None)
+        seq = hostlog._state["seq"]
+
+        def during():
+            assert _wait(lambda: hostlog._state["sealed"], 5)
+            session_host.log.warning("during the final wait")
+            logged.set()
+            release.set()
+        threading.Thread(target=lambda: _on_watch_thread(during), daemon=True).start()
+        try:
+            assert hostlog.final_flush(5.0) is True
+        finally:
+            release.set()
+        assert logged.wait(5)
+        assert hostlog._state["seq"] == seq, "rejected: the sequence did not advance"
+    assert "earlier" in rec.messages() and "during the final wait" not in rec.messages()
 
 
 # ---------------------------------------------------------------- R12 (a writer that cannot start), A4, A5
 
 
 def _no_writer():
-    """As in a process whose writer is not running (and none starting)."""
+    """As in a process whose writer is not running (and none starting): the registered writer is let go (it leaves
+    without dequeuing again)."""
     from agent_comms import hostlog
     with hostlog._cond:
-        hostlog._state["gen"] += 1
+        if "gen" in hostlog._state:     # (079306b, for the reproduction run)
+            hostlog._state["gen"] += 1
         hostlog._writer[0] = None
-        hostlog._state.update(starting=False, start_failed_at=None)
+        for k, v in (("starting", False), ("start_failed_at", None), ("token", None)):
+            if k in hostlog._state:
+                hostlog._state[k] = v
         hostlog._cond.notify_all()
 
 
@@ -1717,9 +1752,10 @@ def _refuse_the_writer(monkeypatch, error=RuntimeError("can't start new thread")
 
 
 def test_r12_a_writer_that_cannot_start_never_fails_a_log_call(monkeypatch):
-    """R12: the first record of a standalone caller tries to start the writer and the OS refuses: the log call
-    returns at once and raises nothing; nobody waits for a writer that is not running; a failed start is tried again
-    at most once per RESTART_SECONDS (no busy retry)."""
+    """R12: a standalone caller's record tries to start the writer (the lazy start, at its depth-0 exit) and the OS
+    refuses: the log call returns at once and raises nothing; nobody waits for a writer that is not running; no start
+    is left pending. (A2: no cooldown: each standalone exit with records waiting tries once; production makes ONE
+    start.)"""
     import time as _time
     from agent_comms import hostlog, session_host
     monkeypatch.setattr(hostlog, "ACK_SECONDS", 5.0)
@@ -1727,15 +1763,13 @@ def test_r12_a_writer_that_cannot_start_never_fails_a_log_call(monkeypatch):
     calls = _refuse_the_writer(monkeypatch)
     t0 = _time.monotonic()
     session_host.log.warning("the first line")
-    session_host.log.warning("a second line, within the retry interval")
+    session_host.log.warning("a second line")
     assert _time.monotonic() - t0 < 0.5
-    assert len(calls) == 1, "one start attempt, not one per line"
-    assert hostlog._writer[0] is None and not hostlog._state["starting"]
-    # (the production start points, refused too: `node.run`'s forced start and the pass boundary's retry, which is
-    # rate-limited; neither raises)
-    assert hostlog.start_writer(force=True) is False and len(calls) == 2
-    assert hostlog.start_writer() is False and len(calls) == 2, "within RESTART_SECONDS: not tried again"
-    assert not hostlog._state["starting"]
+    assert len(calls) == 2, "one start attempt per standalone exit"
+    assert hostlog._writer[0] is None and hostlog._state["token"] is None
+    # (the production start point, refused too: `node.run`'s eager start raises nothing)
+    assert hostlog.start_writer() is False and len(calls) == 3
+    assert hostlog._state["token"] is None
 
 
 def test_r12_the_final_wait_does_not_wait_for_a_writer_that_cannot_start(monkeypatch):
@@ -1752,7 +1786,7 @@ def test_r12_the_final_wait_does_not_wait_for_a_writer_that_cannot_start(monkeyp
     t0 = _time.monotonic()
     assert hostlog.final_flush(2.0) is True
     assert _time.monotonic() - t0 < 0.5, "no wait for a writer that is not running"
-    assert calls and hostlog._state["sealed"]
+    assert calls == [] and hostlog._state["sealed"], "and the final wait tried no start (R15)"
 
 
 def test_r12_a_stop_and_a_save_complete_when_the_writer_cannot_start(henv, monkeypatch):
@@ -1763,7 +1797,6 @@ def test_r12_a_stop_and_a_save_complete_when_the_writer_cannot_start(henv, monke
     from hostlog_guard import runner_lock
     from test_claude_steering import steered
     monkeypatch.setattr(hostlog, "ACK_SECONDS", 5.0)
-    monkeypatch.setattr(hostlog, "RESTART_SECONDS", 0.0)
     s, child, n = steered(henv, monkeypatch)
     _no_writer()
     monkeypatch.setattr(hostlog, "QUEUE_MAX", 3)
@@ -1786,7 +1819,7 @@ def test_r12_a_stop_and_a_save_complete_when_the_writer_cannot_start(henv, monke
     monkeypatch.undo()
     monkeypatch.setattr(hostlog, "ACK_SECONDS", 5.0)
     with _Records() as rec:
-        assert hostlog.start_writer(force=True), "the retry point starts it"
+        assert hostlog.start_writer(), "a start succeeds"
         session_host.log.warning("a start succeeds")
     said = rec.messages()
     drops = [m for m in said if m.endswith("deferred log line(s) were dropped: the queue was full")]
@@ -1796,7 +1829,7 @@ def test_r12_a_stop_and_a_save_complete_when_the_writer_cannot_start(henv, monke
 def test_a4_no_enqueue_under_a_host_lock_or_on_a_lifecycle_thread_starts_the_writer(env, monkeypatch):
     """A4: with no writer running, a record logged under a host lock (the runner lock, the cutoff lock, the registry
     lock) or on a lifecycle thread never calls `Thread.start()`; a standalone caller at depth 0 does (the lazy start),
-    and so does `start_writer` (production's eager start and its pass-boundary retry)."""
+    and so does `start_writer` (production's one eager start)."""
     import threading
     from agent_comms import hostlog, session_host
     runner = env.node.sessions
@@ -1820,24 +1853,24 @@ def test_a4_no_enqueue_under_a_host_lock_or_on_a_lifecycle_thread_starts_the_wri
     _on_watch_thread(lambda: session_host.log.warning("on a lifecycle thread"))
     done, err, _ = _production(lambda: session_host.log.warning("on a lifecycle thread"))
     assert done.wait(5) and not err and calls == []
-    assert hostlog.start_writer(force=True) and calls == ["start"]
+    assert hostlog.start_writer() and calls == ["start"]
 
 
 def test_a5_an_interrupt_during_an_enqueue_propagates_and_leaves_no_claim(monkeypatch):
     """A5: "no log call raises into the host" is for ordinary failures: an interrupt arriving inside the enqueue (here
     inside the writer's start) propagates out of the log call, and leaves the queue's lock free and no start
-    claimed; the next start succeeds."""
+    claimed (its token cancelled); the next start succeeds."""
     import pytest as _pytest
     from agent_comms import hostlog, session_host
     _no_writer()
     _refuse_the_writer(monkeypatch, error=KeyboardInterrupt())
     with _pytest.raises(KeyboardInterrupt):
         session_host.log.warning("interrupted")
-    assert not hostlog._state["starting"]
+    assert hostlog._state["token"] is None
     assert hostlog._cond.acquire(blocking=False)
     hostlog._cond.release()
     monkeypatch.undo()
-    assert hostlog.start_writer(force=True)
+    assert hostlog.start_writer()
 
 
 def test_a5_an_interrupt_inside_the_snapshot_propagates_and_leaves_nothing_held(monkeypatch):
@@ -1853,7 +1886,7 @@ def test_a5_an_interrupt_inside_the_snapshot_propagates_and_leaves_nothing_held(
     with hostlog.enqueue_only():
         with _pytest.raises(SystemExit):
             session_host.log.warning("interrupted in the snapshot")
-    assert not hostlog._state["starting"] and not hostlog._queue
+    assert hostlog._state["token"] is None and not hostlog._queue
     assert hostlog._local.depth == 0
     assert hostlog._cond.acquire(blocking=False)
     hostlog._cond.release()
@@ -1861,6 +1894,283 @@ def test_a5_an_interrupt_inside_the_snapshot_propagates_and_leaves_nothing_held(
     with _Records() as rec:
         session_host.log.warning("the next line")
     assert rec.messages() == ["the next line"]
+
+
+# ---------------------------------------------------------------- R14, R15 (review round 2): the writer's start
+
+
+def _list_handler():
+    """A plain handler on the package logger (no flush on leaving): (records as (message, thread ident), remove)."""
+    import threading
+    got = []
+    h = logging.Handler(logging.DEBUG)
+    h.emit = lambda r: got.append((r.getMessage(), threading.get_ident()))
+    lg = logging.getLogger("agent_comms")
+    saved = lg.level
+    lg.setLevel(logging.DEBUG)
+    lg.addHandler(h)
+
+    def remove():
+        lg.removeHandler(h)
+        lg.setLevel(saved)
+    return got, remove
+
+
+def _gate_the_worker(monkeypatch):
+    """The writer's thread, once launched, waits at a gate before it runs the writer's code (so before it can
+    register): (gate, the launched threads)."""
+    import threading
+    from agent_comms import hostlog
+    real, gate, launched = hostlog._write_loop, threading.Event(), []
+
+    def gated(*a):
+        launched.append(threading.current_thread())
+        gate.wait(10)
+        return real(*a)
+    monkeypatch.setattr(hostlog, "_write_loop", gated)
+    return gate, launched
+
+
+def _interrupt_after_the_launch(monkeypatch, before=None):
+    """`Thread.start()` for the writer's thread launches it as ever, and THEN an interrupt arrives (as a SIGTERM's
+    `KeyboardInterrupt` at the call's return, before the starter's next statement); `before(thread)` runs first.
+    Once only: later starts (the teardown's reset) are as ever."""
+    import threading
+    from agent_comms import hostlog
+    real, once = threading.Thread.start, []
+
+    def start(self):
+        real(self)
+        if self.name == hostlog.WRITER_NAME and not once:
+            once.append(self)
+            if before is not None:
+                before(self)
+            raise KeyboardInterrupt
+    monkeypatch.setattr(threading.Thread, "start", start)
+
+
+def _count_the_writers_made(monkeypatch, error=None):
+    """Every construction of the writer's `Thread` is counted (and refused with `error`, if given): the list."""
+    import threading
+    from agent_comms import hostlog
+    real, made = threading.Thread.__init__, []
+
+    def init(self, *a, **k):
+        if k.get("name") == hostlog.WRITER_NAME:
+            made.append(threading.get_ident())
+            if error is not None:
+                raise error
+        return real(self, *a, **k)
+    monkeypatch.setattr(threading.Thread, "__init__", init)
+    return made
+
+
+def test_r14_an_interrupt_after_the_launch_cancels_the_start_and_the_late_worker_touches_nothing(monkeypatch):
+    """R14 (A1, cancellation wins): the starter is interrupted after `Thread.start()` launched the worker and before
+    the worker registered (it is held at a gate): the starter's cleanup cancels the start; the late worker then exits
+    without touching the queue; no handler is entered; the final wait sees no worker that can dequeue (writer-less),
+    at once."""
+    import time as _time
+    import pytest as _pytest
+    from agent_comms import hostlog, session_host
+    _no_writer()
+    gate, launched = _gate_the_worker(monkeypatch)
+    _interrupt_after_the_launch(monkeypatch)
+    got, remove = _list_handler()
+    try:
+        with _pytest.raises(KeyboardInterrupt):
+            hostlog.start_writer()
+        assert _wait(lambda: len(launched) == 1), "the worker was launched"
+        with hostlog.enqueue_only():
+            session_host.log.warning("queued after the cancelled start")
+        gate.set()
+        assert _wait(lambda: not launched[0].is_alive()), "the late worker exits"
+        assert got == [] and len(hostlog._queue) == 1, (got, len(hostlog._queue))
+        assert hostlog._writer[0] is None
+        t0 = _time.monotonic()
+        assert hostlog.final_flush(2.0) is True and _time.monotonic() - t0 < 0.5
+    finally:
+        gate.set()
+        remove()
+
+
+def test_r14_a_registration_the_worker_won_is_never_undone_by_the_starters_cleanup(monkeypatch):
+    """R14 (A1, registration wins; the race pinned): the worker registers itself BEFORE the interrupt reaches its
+    starter. The starter's cleanup leaves that registration alone: it is THE writer, exactly one thread ever enters a
+    handler, a second start makes no thread, and the final wait sees it (a handler it is stuck in holds the exit:
+    False, never "writer-less")."""
+    import threading
+    import pytest as _pytest
+    from agent_comms import hostlog, session_host
+    _no_writer()
+    won = []
+    _interrupt_after_the_launch(monkeypatch, before=lambda t: won.append(_wait(lambda: hostlog._writer[0] is t, 2)))
+    release = threading.Event()
+    got, remove = _list_handler()
+    try:
+        with _pytest.raises(KeyboardInterrupt):
+            hostlog.start_writer()
+        assert won == [True], "the worker registered itself before the interrupt"
+        writer = hostlog._writer[0]
+        assert writer is not None and writer.is_alive()
+        made = _count_the_writers_made(monkeypatch)
+        assert hostlog.start_writer() is True and made == [], "a second start makes no thread"
+        with hostlog.enqueue_only():
+            for i in range(3):
+                session_host.log.warning("line %d", i)
+        assert _wait(lambda: len(got) == 3) and {t for _, t in got} == {writer.ident}
+
+        def blocks(r):
+            if r.getMessage() == "blocks":
+                release.wait(10)
+        h = logging.Handler(logging.DEBUG)
+        h.emit = blocks
+        logging.getLogger("agent_comms").addHandler(h)
+        try:
+            with hostlog.enqueue_only():
+                session_host.log.warning("blocks")
+            assert _wait(lambda: hostlog._state["busy"] is not None)
+            assert hostlog.final_flush(0.3) is False, "a writer stuck in a handler holds the exit: never writer-less"
+        finally:
+            release.set()
+            logging.getLogger("agent_comms").removeHandler(h)
+    finally:
+        release.set()
+        remove()
+
+
+def test_r14_a_worker_that_registers_after_the_seal_touches_nothing(monkeypatch):
+    """R14 (A3, any state → sealed): a start is pending (its worker launched, held at a gate) when the final wait
+    seals: the seal cancels the pending start, so the final wait is writer-less at once; the late worker then exits
+    without dequeuing the line queued before the seal; no handler is entered."""
+    import time as _time
+    from agent_comms import hostlog, session_host
+    _no_writer()
+    gate, launched = _gate_the_worker(monkeypatch)
+    got, remove = _list_handler()
+    try:
+        assert hostlog.start_writer() is True, "a start is pending"
+        assert _wait(lambda: len(launched) == 1)
+        with hostlog.enqueue_only():
+            session_host.log.warning("queued before the seal")
+        t0 = _time.monotonic()
+        assert hostlog.final_flush(0.5) is True and _time.monotonic() - t0 < 0.3
+        gate.set()
+        assert _wait(lambda: not launched[0].is_alive()), "the late worker exits"
+        assert got == [] and hostlog._writer[0] is None, got
+    finally:
+        gate.set()
+        remove()
+
+
+def test_r14_concurrent_claimants_make_one_thread(monkeypatch):
+    """A3 (not started → pending): with a start pending (its worker held at a gate), another start point returns
+    without making a thread; once the worker registers, exactly one writer runs."""
+    import threading
+    from agent_comms import hostlog
+    _no_writer()
+    gate, launched = _gate_the_worker(monkeypatch)
+    try:
+        assert hostlog.start_writer() is True
+        assert _wait(lambda: len(launched) == 1)
+        made = _count_the_writers_made(monkeypatch)
+        assert hostlog.start_writer() is True and made == []
+        gate.set()
+        assert _wait(lambda: hostlog._writer[0] is launched[0])
+        assert _wait(lambda: len([t for t in threading.enumerate() if t.name == hostlog.WRITER_NAME]) == 1), \
+            "one writer (the one let go by `_no_writer` has left)"
+    finally:
+        gate.set()
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")    # (the death's own traceback)
+def test_a3_a_registered_writer_that_dies_releases_every_waiter(monkeypatch):
+    """A3 (registered → dead): the writer's own code fails outside a handler and the thread ends. It deregisters as it
+    goes and wakes every waiter: a standalone caller waiting for its line returns at once, not after ACK_SECONDS; the
+    process has no writer from then on (in production nothing restarts it: a documented logging loss)."""
+    import collections
+    import time as _time
+    from agent_comms import hostlog, session_host
+    monkeypatch.setattr(hostlog, "ACK_SECONDS", 5.0)
+    assert hostlog.flush(5)
+    writer = hostlog._writer[0]
+
+    class Dies(collections.deque):
+        def popleft(self):
+            raise RuntimeError("the writer's own code failed")
+    monkeypatch.setattr(hostlog, "_queue", Dies())
+    t0 = _time.monotonic()
+    session_host.log.warning("the writer dies on this one")
+    assert _time.monotonic() - t0 < 1.0, "the waiter was released by the death"
+    assert _wait(lambda: not writer.is_alive()) and hostlog._writer[0] is None
+
+
+def test_r15_the_final_wait_starts_nothing_and_returns_within_its_bound(monkeypatch):
+    """R15 (A2): no writer runs, a line is queued, and nothing holds a start back (no cooldown): the final wait makes
+    no `Thread`, and returns within its bound (writer-less: at once)."""
+    import time as _time
+    from agent_comms import hostlog, session_host
+    _no_writer()
+    with hostlog.enqueue_only():
+        session_host.log.warning("queued with no writer")
+    made = _count_the_writers_made(monkeypatch)
+    t0 = _time.monotonic()
+    ok = hostlog.final_flush(0.5)
+    assert made == [], "the final wait started a writer"
+    assert ok is True and _time.monotonic() - t0 < 0.5
+
+
+def test_r15_no_start_after_the_seal(monkeypatch):
+    """R15: after the seal every start claim is refused: the eager start point and a standalone caller's lazy start
+    make no `Thread`."""
+    from agent_comms import hostlog, session_host
+    assert hostlog.final_flush(2.0) is True
+    _no_writer()
+    made = _count_the_writers_made(monkeypatch)
+    assert not hostlog.start_writer()
+    session_host.log.warning("a standalone line after the seal")
+    assert made == []
+
+
+def test_r15_a_thread_that_cannot_be_made_is_contained(monkeypatch):
+    """R15: `threading.Thread(...)` raising on construction (an ordinary failure) is contained as a failed `start()`
+    is: a standalone log call and the eager start raise nothing, no start is left pending, and the next start point
+    tries again."""
+    from agent_comms import hostlog, session_host
+    _no_writer()
+    made = _count_the_writers_made(monkeypatch, error=RuntimeError("can't make a thread"))
+    session_host.log.warning("a standalone line")
+    assert len(made) == 1
+    assert hostlog.start_writer() is False and len(made) == 2
+    assert hostlog._writer[0] is None and hostlog._state.get("token") is None
+
+
+def test_r15_the_start_points_are_exactly_two():
+    """R15 (A2), statically: the writer is started from exactly two places: `node.run`'s eager start (once, its first
+    statement inside `enqueue_only`) and a standalone caller's `_lazy_start` (from `_acknowledge`). The tests' own
+    `_reset` is the only other caller of `start_writer`. No pass retry, and the final wait starts nothing."""
+    import ast
+    from pathlib import Path
+    names = {"start_writer", "_start_writer", "_lazy_start"}
+    found = set()
+    for path in sorted((Path(__file__).parents[1] / "agent_comms").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call):
+                    f = node.func
+                    name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+                    if name in names:
+                        found.add((path.name, fn.name, name))
+    assert found == {
+        ("node.py", "run", "start_writer"),             # the one production start
+        ("hostlog.py", "start_writer", "_start_writer"),
+        ("hostlog.py", "_acknowledge", "_lazy_start"),  # a standalone caller, at depth 0
+        ("hostlog.py", "_lazy_start", "_start_writer"),
+        ("hostlog.py", "_reset", "start_writer"),       # (the tests' reset)
+    }, found
 
 
 # ---------------------------------------------------------------- R13: the real exit path, a real SIGTERM
@@ -1928,16 +2238,37 @@ def test_r13_a_real_sigterm_ends_the_node_within_the_bound_with_mains_status(tmp
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1]), "AGENT_COMMS_HOME": str(home)}
     child = subprocess.Popen([sys.executable, str(script), f"http://127.0.0.1:{hub.server_address[1]}"],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=str(tmp_path))
+    import queue as _queue
+    lines: _queue.Queue = _queue.Queue()
+
+    def read():     # (the handshake is bounded: a reader thread, and a timed wait for its lines)
+        for line in child.stdout:
+            lines.put(line)
+        lines.put(None)
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
     try:
-        line = child.stdout.readline()
-        while line and "entered" not in line:
-            line = child.stdout.readline()
-        assert "entered" in line, child.stderr.read()[-2000:]
+        deadline, ready = _time.monotonic() + 30, False
+        while not ready:
+            try:
+                line = lines.get(timeout=max(0.0, deadline - _time.monotonic()))
+            except _queue.Empty:
+                child.kill()                        # (through its own handle)
+                child.wait(5)
+                raise AssertionError("the child never entered the blocked handler within 30 s")
+            assert line is not None, child.stderr.read()[-2000:]
+            ready = "entered" in line
         t0 = _time.monotonic()
         child.send_signal(signal.SIGTERM)       # (the test's own child, and only it)
         status = child.wait(20)
         took = _time.monotonic() - t0
-        rest = child.stdout.read()
+        reader.join(5)
+        rest = []
+        while not lines.empty():
+            x = lines.get_nowait()
+            if x is not None:
+                rest.append(x)
+        rest = "".join(rest)
     finally:
         if child.poll() is None:
             child.kill()

@@ -15,11 +15,13 @@ is, through its loggers' own level checks and handlers, under the same logger na
   writer, never at the call. An exception is kept as its type's name and its traceback's (file, line, function)
   triples: no exception text, no source lines, no locals. Nothing is formatted at the call.
 - ONE queue (bounded: the oldest goes first when it is full, the writer says once how many went) and ONE writer: a
-  daemon thread ("hostlog-writer"). It is started EAGERLY in production (`start_writer`, by `node.run` before
-  recovery, outside every host lock; again at the node's pass boundary if it is not running) and lazily only by a
-  standalone caller at depth 0; a lifecycle thread's enqueue, or any enqueue under a host lock, never starts it. A
-  start is claimed under the queue's lock and made outside it; one that fails is contained (no log call raises an
-  ordinary failure into the host; an interrupt propagates). It is the
+  daemon thread ("hostlog-writer"). It is started ONCE in production (`start_writer`, by `node.run` before
+  recovery, outside every host lock; nothing restarts it: a writer that never started, or died, is a documented
+  loss of log lines) and lazily only by a standalone caller at depth 0; a lifecycle thread's enqueue, or any enqueue
+  under a host lock, never starts it. A start is claimed under the queue's lock by publishing a start-attempt token,
+  and made outside it; the WORKER registers itself, consuming that token, before it dequeues anything; a start that
+  fails or is interrupted cancels its token unless the worker already registered (no log call raises an ordinary
+  failure into the host; an interrupt propagates). It is the
   ONLY thread that ever enters a handler, a filter or a formatter (`_write`), in queue order (the enqueue order). It
   holds no lock of the host-side modules, ever. A handler that raises is skipped (per handler); nothing a handler
   raises ends the writer; the record in flight counts as attempted and is never written again.
@@ -34,10 +36,10 @@ is, through its loggers' own level checks and handlers, under the same logger na
   completion sequence it saw; nobody waits again until a LATER completion), and a record the bound evicted is
   resolved as dropped at once.
 - `flush(timeout)`: a bounded wait for the queue to be empty and the writer idle, entering no handler. `node.run` makes
-  ONE final bounded wait after the last signal and report (`final_flush`), which SEALS the queue in the same critical
-  section as its idle decision: every later record is rejected, so idle-and-sealed is never followed by a handler
-  entry; a node whose writer is still stuck then ends without waiting for the handler (`node.run`). A standalone
-  process's `atexit` makes the same wait and seal.
+  ONE final bounded wait after the last signal and report (`final_flush`). It starts nothing; it SEALS first (every
+  later record rejected, every pending start cancelled), then waits for the registered writer to finish what it
+  accepted, so idle-and-sealed is never followed by a handler entry; a node whose writer is still stuck then ends
+  without waiting for the handler (`node.run`). A standalone process's `atexit` makes the same seal and wait.
 """
 from __future__ import annotations
 
@@ -65,14 +67,15 @@ _cond = threading.Condition(threading.Lock())
 _queue: deque = deque()
 # seq: the last record queued; done: the last one the writer attempted; evicted: the last one the bound let go;
 # dropped: how many went since the writer last said so; busy: the record the writer is writing, or None; stalled_at:
-# the completion sequence a timed-out wait saw (the stall latch), or None; gen: the writer's generation (tests only
-# change it, to leave a writer a test blocked for good); exit_deadline: `final_flush`'s bound, shared with `atexit`.
-# sealed: the final wait made (`final_flush`): every later record is rejected (one-way; tests reset it); starting: a
-# start of the writer is claimed and under way (outside `_cond`); start_failed_at: when the last start failed.
-_state: dict = {"seq": 0, "done": 0, "evicted": 0, "dropped": 0, "busy": None, "stalled_at": None, "gen": 0,
-                "exit_deadline": None, "sealed": False, "starting": False, "start_failed_at": None}
+# the completion sequence a timed-out wait saw (the stall latch), or None;
+# exit_deadline: `final_flush`'s bound, shared with `atexit`. sealed: the final wait began (`final_flush`): every
+# later record is rejected and every pending start cancelled (one-way; tests reset it). token: the current start
+# attempt's token, published by its one claimant and consumed by its worker's own registration (`_register`), or
+# None. `_writer[0]`: THE registered writer (set only by the worker itself), or None. (DESIGN_NOTES "Host-side
+# logging: one writer, review round 2" has the writer's whole life as a state table.)
+_state: dict = {"seq": 0, "done": 0, "evicted": 0, "dropped": 0, "busy": None, "stalled_at": None,
+                "exit_deadline": None, "sealed": False, "token": None}
 _writer: list = [None]
-RESTART_SECONDS = 1.0       # a failed start of the writer is tried again at most this often
 _TYPE_NAME = type.__dict__["__name__"]      # a type's own name, read with no code of the object's own
 
 
@@ -485,118 +488,145 @@ def _write(r: _Record) -> None:
 
 
 def _writer_alive() -> bool:
+    """(Under `_cond`.) A writer is REGISTERED (it registered itself: `_register`) and its thread runs."""
     w = _writer[0]
     return w is not None and w.is_alive()
 
 
-def _claim_start(force: bool) -> bool:
-    """(Under `_cond`.) Claim THE one start of the writer: only if none is running and none is under way, and (unless
-    `force`) not within RESTART_SECONDS of a failed one (no busy retry). True: the caller starts it, outside `_cond`."""
-    if _writer_alive() or _state["starting"]:
-        return False
-    failed = _state["start_failed_at"]
-    if not force and failed is not None and time.monotonic() - failed < RESTART_SECONDS:
-        return False
-    _state["starting"] = True
-    return True
+def _pending() -> bool:
+    """(Under `_cond`.) A start is pending: its start-attempt token is published and not yet consumed by its worker's
+    registration nor cancelled by its starter; the seal cancels every pending start (a worker that wakes after it
+    leaves without touching the queue)."""
+    return _state["token"] is not None and not _state["sealed"]
 
 
-def _start_writer() -> None:
-    """The claimed start, OUTSIDE `_cond` (A2): a `Thread.start()` that fails (the OS refuses a thread) is contained:
-    the records stay queued up to the bound and are resolved as dropped by the usual rule; waiters are released (no
-    writer: nobody waits); a later start point tries again. The claim is let go however it ends (an interrupt
-    included, which propagates)."""
-    with _cond:
-        gen = _state["gen"]
-    w = threading.Thread(target=_write_loop, args=(gen,), name=WRITER_NAME, daemon=True)
-    started = False
+def _can_dequeue() -> bool:
+    """(Under `_cond`.) Some worker can dequeue: a registered writer, or a pending start whose worker may yet
+    register. "Writer-less" is its negation: no worker CAN dequeue (a cancelled worker may still wake up, and leaves)."""
+    return _writer_alive() or _pending()
+
+
+def _start_writer(lazy: bool = False) -> None:
+    """THE start (A1): claim under `_cond`, make and start the writer's `Thread` outside it.
+    - The claim is refused after the seal, while a writer is registered and while a start is pending (concurrent
+      claimants return); `lazy` (a standalone caller) claims only when records wait. The claimant publishes a new
+      start-attempt TOKEN.
+    - The worker accounts for itself (`_register`, its first act): nothing this thread does after `start()` is needed
+      for the worker to be tracked.
+    - If making the `Thread` or starting it fails (an ordinary failure: contained) or an interrupt arrives (it
+      propagates), the token is cancelled under `_cond` UNLESS the worker has already consumed it by registering: a
+      cleanup never undoes a registration the worker won, and a late worker whose token was cancelled leaves without
+      touching the queue.
+    (One residual, bounded: an interrupt inside the claim's own statements, before `token` is bound here, or inside
+    the cancellation, leaves a start pending that no worker consumes; the final wait seals, which cancels it.)"""
+    token, started = None, False
     try:
+        with _cond:
+            if not _state["sealed"] and not _can_dequeue() and (not lazy or _queue or _state["dropped"]):
+                token = _state["token"] = object()
+        if token is None:
+            return
+        _local.token = token        # (this thread's own start: its acknowledgement may wait for its worker)
+        w = threading.Thread(target=_write_loop, args=(token,), name=WRITER_NAME, daemon=True)
         w.start()
         started = True
     except Exception:
-        pass
+        pass        # (the OS refused the thread, or it could not be made: no writer; the token is cancelled below)
     finally:
-        with _cond:
-            _state["starting"] = False
-            if started:
-                _writer[0], _state["start_failed_at"] = w, None
-            else:
-                _state["start_failed_at"] = time.monotonic()
-            _cond.notify_all()
+        if token is not None and not started:
+            with _cond:
+                if _state["token"] is token:
+                    _state["token"] = None      # (cancelled: not consumed, so the worker had not registered)
+                _cond.notify_all()
 
 
 def _lazy_start() -> None:
     """(A standalone caller at depth 0, so never under a host lock, never on a lifecycle thread.) Start the writer if
-    records wait and none is running. The claim is let go however this ends (an interrupt included)."""
-    claimed = attempted = False
-    try:
-        with _cond:
-            claimed = bool(_queue or _state["dropped"]) and _claim_start(force=False)
-        if claimed:
-            attempted = True
-            _start_writer()
-    finally:
-        if claimed and not attempted:
-            with _cond:
-                _state["starting"] = False
-                _cond.notify_all()
+    records wait and no worker can dequeue: the standalone start point (caplog); production never reaches it."""
+    _start_writer(lazy=True)
 
 
-def start_writer(force: bool = False) -> bool:
-    """Start the writer if it is not running: by `node.run` (eagerly, before recovery, outside every host lock) and at
-    its pass boundary (the retry point after a failed start: on the main thread, at depth 0). True: it runs."""
+def start_writer() -> bool:
+    """`node.run`'s ONE eager start (before recovery, outside every host lock). Nothing restarts the writer in a node
+    process: a writer that never started, or died, is a documented loss of log lines for the rest of that process.
+    True: a writer is registered or its start is pending. It never waits."""
+    _start_writer()
     with _cond:
-        claimed = _claim_start(force)
-    if claimed:
-        _start_writer()
+        return _can_dequeue()
+
+
+def _register(token: object) -> bool:
+    """The worker's FIRST act, under `_cond` (A1): consume its still-current token and register as THE writer. A
+    sealed queue, or a token that is not current (cancelled by its starter, or superseded): it leaves at once without
+    touching the queue. True: registered."""
     with _cond:
-        return _writer_alive()
+        if _state["sealed"] or _state["token"] is not token:
+            return False
+        _state["token"] = None
+        _writer[0] = threading.current_thread()
+        _cond.notify_all()
+        return True
 
 
-def _write_loop(gen: int) -> None:
-    """The writer: every record, in queue order, handed to the handlers; never waits for anyone (a lifecycle thread);
-    holds no lock of the host-side modules. Nothing a handler raises ends it."""
+def _write_loop(token: object) -> None:
+    """The writer: registers itself first (`_register`); then every record, in queue order, handed to the handlers;
+    never waits for anyone (a lifecycle thread); holds no lock of the host-side modules. Nothing a handler raises
+    ends it. If its own code fails outside a handler it dies: it deregisters and wakes every waiter as it goes (A3,
+    registered → dead), and nothing restarts it in production. Let go (the tests' reset): it leaves without dequeuing
+    again."""
+    me = threading.current_thread()
     ENQUEUE_ONLY.add(threading.get_ident())
-    while True:
-        with _cond:
-            while gen == _state["gen"] and not _queue and not _state["dropped"]:
-                _cond.wait()
-            if gen != _state["gen"]:
-                return
-            dropped, _state["dropped"] = _state["dropped"], 0
-            if dropped:
-                r = _Record()
-                r.seq, r.created, r.name, r.level = 0, time.time(), __name__, logging.WARNING
-                me = threading.current_thread()
-                r.thread, r.thread_name = me.ident, me.name
-                r.msg, r.args = "%d deferred log line(s) were dropped: the queue was full", (dropped,)
-                r.caller, r.exc, r.extra = ("(hostlog)", 0, "writer"), None, None
-            else:
-                r = _queue.popleft()
-            _state["busy"] = r.seq
-        try:
-            _write(r)
-        except BaseException:       # (the writer is not the main thread: nothing it is handed ends it)
-            pass
-        finally:
+    try:
+        if not _register(token):
+            return
+        while True:
             with _cond:
-                if gen == _state["gen"]:
-                    _state["busy"] = None
-                    if r.seq > _state["done"]:
-                        _state["done"] = r.seq
-                    if _state["stalled_at"] is not None and _state["done"] > _state["stalled_at"]:
-                        _state["stalled_at"] = None     # (a LATER completion: the latch clears)
-                    _cond.notify_all()
+                while _writer[0] is me and not _queue and not _state["dropped"]:
+                    _cond.wait()
+                if _writer[0] is not me:
+                    return
+                dropped, _state["dropped"] = _state["dropped"], 0
+                if dropped:
+                    r = _Record()
+                    r.seq, r.created, r.name, r.level = 0, time.time(), __name__, logging.WARNING
+                    r.thread, r.thread_name = me.ident, me.name
+                    r.msg, r.args = "%d deferred log line(s) were dropped: the queue was full", (dropped,)
+                    r.caller, r.exc, r.extra = ("(hostlog)", 0, "writer"), None, None
+                else:
+                    r = _queue.popleft()
+                _state["busy"] = r.seq      # (published in the same step as the dequeue)
+            try:
+                _write(r)
+            except BaseException:       # (the writer is not the main thread: nothing it is handed ends it)
+                pass
+            finally:
+                with _cond:
+                    if _writer[0] is me:
+                        _state["busy"] = None
+                        if r.seq > _state["done"]:
+                            _state["done"] = r.seq
+                        if _state["stalled_at"] is not None and _state["done"] > _state["stalled_at"]:
+                            _state["stalled_at"] = None     # (a LATER completion: the latch clears)
+                        _cond.notify_all()
+    finally:
+        with _cond:
+            if _writer[0] is me:        # (registered → dead)
+                _writer[0] = None
+                _state["busy"] = None
+            _cond.notify_all()          # (every waiter re-checks: no writer, so no wait)
+        ENQUEUE_ONLY.discard(threading.get_ident())
 
 
 def _acknowledge() -> bool:
     """A standalone caller at depth 0: wait, at most ACK_SECONDS, for the writer to have attempted this thread's own
     last record. Not on a lifecycle thread, not inside a boundary, not while the writer is latched stalled; released at
-    once when that record was evicted by the bound. True: it was attempted (or dropped)."""
+    once when that record was evicted by the bound, and when no writer is registered (unless the start pending is this
+    thread's own, whose worker it waits for, within the same bound). True: it was attempted (or dropped)."""
     if not may_wait():
         return False
     _lazy_start()
     target = getattr(_local, "last", 0)
+    own = getattr(_local, "token", None)
     deadline = time.monotonic() + ACK_SECONDS
     with _cond:
         while True:
@@ -604,8 +634,8 @@ def _acknowledge() -> bool:
                 return True
             if _state["stalled_at"] is not None:
                 return False        # (the latch: nobody waits until the writer has made progress)
-            if _state["starting"] or not _writer_alive():
-                return False        # (R12: never a wait for a writer that is not running)
+            if not _writer_alive() and not (own is not None and _state["token"] is own and _pending()):
+                return False        # (R12: never a wait for a writer that is not running, nor for another's start)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _state["stalled_at"] = _state["done"]
@@ -621,11 +651,11 @@ def _idle() -> bool:
 
 def _idle_by(deadline: float, writerless_ok: bool = False) -> bool:
     """(Under `_cond`.) Wait until idle, at most until `deadline`. True: idle; with `writerless_ok` (the final wait),
-    also True as soon as no writer runs and no start is pending: no handler of ours can then be entered or stuck, so
+    also True as soon as no worker can dequeue (`_can_dequeue`): no handler of ours can then be entered or stuck, so
     the process may exit normally (what is queued is lost) instead of waiting out a budget nothing can use."""
     while not _idle():
-        if writerless_ok and not _state["starting"] and not _writer_alive():
-            return True         # (R12: a writer that cannot start costs the exit nothing but its queued lines)
+        if writerless_ok and not _can_dequeue():
+            return True         # (writer-less: a writer that never started or died costs only its queued lines)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
@@ -642,22 +672,22 @@ def flush(timeout: float) -> bool:
 
 
 def final_flush(budget: float = 2.0) -> bool:
-    """`node.run`'s ONE final bounded wait, after the last signal and report (and `atexit`'s, when nothing made it):
-    the writer started if it is not running (the last safe start point), then the wait and the SEAL in one critical
-    section (R11): from the moment "idle" is decided no record is accepted, so idle-and-sealed is never followed by a
-    handler entry. True: no handler of ours is running (idle; or no writer could be started, and what was queued is
-    lost), so the process may exit normally; False: the writer is still in a handler at the deadline."""
-    start_writer()
-    deadline = time.monotonic() + budget
+    """`node.run`'s ONE final bounded wait, after the last signal and report (and `atexit`'s, when nothing made it).
+    It starts nothing (R15). Its deadline is taken first; then, under `_cond`, it SEALS first (every later record
+    rejected, every pending start cancelled: only the registered writer finishes the records accepted before) and
+    waits, at most until the deadline, for idle or writer-less. True: no handler of ours is running, so the process
+    may exit normally (idle; or writer-less, what was queued is lost); False: the writer is still in a handler at the
+    deadline (the stalled exit)."""
+    deadline = time.monotonic() + budget        # (first: before anything that can block)
     with _cond:
+        _state["sealed"] = True     # (first: from here on nothing is accepted and nothing starts)
         _state["exit_deadline"] = deadline
-        ok = _idle_by(deadline, writerless_ok=True)
-        _state["sealed"] = True     # (one step with the idle decision)
-    return ok
+        _cond.notify_all()
+        return _idle_by(deadline, writerless_ok=True)
 
 
 def _at_exit() -> None:
-    """At interpreter exit, when no final wait was made (a standalone process): the same wait and seal, at most 2 s.
+    """At interpreter exit, when no final wait was made (a standalone process): the same seal and wait, at most 2 s.
     (A seal cannot rescue a handler already stuck: `logging.shutdown()` then waits for its lock, as on main.)"""
     try:
         if not _state["sealed"]:
@@ -670,17 +700,23 @@ atexit.register(_at_exit)
 
 
 def _reset(idle_seconds: float = 5.0) -> None:
-    """(Tests) The writer idle (bounded), then an empty queue and clear counters (the seal and a failed start
-    included), this thread at depth 0, and a writer running. A writer still busy after the bound (a test left a
-    handler blocked) is left behind: a new generation starts a new one."""
-    idle = flush(idle_seconds)
+    """(Tests) The writer idle (bounded), then an empty queue and clear counters (the seal and a pending start
+    included), this thread at depth 0, and a writer registered (bounded). A writer still busy after the bound (a test
+    left a handler blocked) is let go: it never dequeues again, and a new one starts. (No worker that can dequeue: no
+    wait at all.)"""
+    with _cond:
+        idle = _idle_by(time.monotonic() + idle_seconds, writerless_ok=True)
     with _cond:
         _queue.clear()
         if not idle:
-            _state["gen"] += 1
             _writer[0] = None
         _state.update(done=_state["seq"], evicted=_state["seq"], dropped=0, busy=None, stalled_at=None,
-                      exit_deadline=None, sealed=False, starting=False, start_failed_at=None)
+                      exit_deadline=None, sealed=False, token=None)
         _cond.notify_all()
     _local.depth = _local.last = 0
-    start_writer(force=True)
+    _local.token = None
+    start_writer()
+    deadline = time.monotonic() + 5.0
+    with _cond:
+        while _pending() and not _writer_alive() and time.monotonic() < deadline:
+            _cond.wait(0.05)
