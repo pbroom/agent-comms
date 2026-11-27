@@ -5078,6 +5078,27 @@ def test_r10_h2_a_codex_slot_never_takes_the_claude_path(henv, monkeypatch):
     assert s.steer is not None and not s.steer.holds and not host._reserves(s)
 
 
+def test_r10_g1_each_term_of_the_predicate_alone_makes_it_false(henv, monkeypatch):
+    """Ruling G1: the predicate's three terms each make it false alone. Two of them are redundant in every reachable
+    state (the adapter's `steering_on` is copied from the switch at open, and only a Claude adapter has it; every
+    Claude slot records `holds`), so no scenario can tell them apart: this pins each directly, on a live Claude
+    attempt, so the identity "switch off: the predicate is false" does not depend on the copy, and "a Codex slot:
+    false" does not depend on the adapter."""
+    s, child, n = steered(henv, monkeypatch)
+    host = henv.host
+    assert host._reserves(s) and s.held is None
+    monkeypatch.setattr(_SessionHost, "claude_steer", lambda self: False)
+    assert not host._reserves(s), "the switch, read on the host, alone"
+    monkeypatch.setattr(_SessionHost, "claude_steer", lambda self: True)
+    monkeypatch.setattr(s.provider, "steering_on", False, raising=False)
+    assert not host._reserves(s), "the adapter's copy, alone"
+    monkeypatch.setattr(s.provider, "steering_on", True, raising=False)
+    monkeypatch.setattr(s.steer, "holds", False)
+    assert not host._reserves(s), "the attempt's recorded Claude identity, alone (no hold)"
+    monkeypatch.setattr(s.steer, "holds", True)
+    assert host._reserves(s)
+
+
 def test_r10_g3_a_restart_with_the_switch_off_restores_no_steering(henv, monkeypatch):
     """Ruling G3: a host restarted with the switch off, from a state saved while it was on with a held end: no slot,
     no hold and no queued steer bytes come back; the session's modes name no steering."""
