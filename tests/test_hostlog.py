@@ -1931,6 +1931,25 @@ def _gate_the_worker(monkeypatch):
     return gate, launched
 
 
+def _release_the_gate(gate, launched):
+    """(A test's `finally`) Open the gate and JOIN, bounded, every gated worker that is not THE registered writer (a
+    late worker leaves at once), so a failing test's teardown never races the fixture's reset."""
+    from agent_comms import hostlog
+    gate.set()
+    for t in launched:
+        if t is not hostlog._writer[0]:
+            t.join(5)
+
+
+def _assert_consumed(writer):
+    """Under the queue's lock: `writer` is THE registered writer and its registration consumed its token (no start is
+    left pending)."""
+    from agent_comms import hostlog
+    with hostlog._cond:
+        registered, token = hostlog._writer[0], hostlog._state["token"]
+    assert registered is writer and token is None, (registered, token)
+
+
 def _interrupt_after_the_launch(monkeypatch, before=None):
     """`Thread.start()` for the writer's thread launches it as ever, and THEN an interrupt arrives (as a SIGTERM's
     `KeyboardInterrupt` at the call's return, before the starter's next statement); `before(thread)` runs first.
@@ -1990,7 +2009,7 @@ def test_r14_an_interrupt_after_the_launch_cancels_the_start_and_the_late_worker
         t0 = _time.monotonic()
         assert hostlog.final_flush(2.0) is True and _time.monotonic() - t0 < 0.5
     finally:
-        gate.set()
+        _release_the_gate(gate, launched)
         remove()
 
 
@@ -2013,6 +2032,7 @@ def test_r14_a_registration_the_worker_won_is_never_undone_by_the_starters_clean
         assert won == [True], "the worker registered itself before the interrupt"
         writer = hostlog._writer[0]
         assert writer is not None and writer.is_alive()
+        _assert_consumed(writer)
         made = _count_the_writers_made(monkeypatch)
         assert hostlog.start_writer() is True and made == [], "a second start makes no thread"
         with hostlog.enqueue_only():
@@ -2059,7 +2079,7 @@ def test_r14_a_worker_that_registers_after_the_seal_touches_nothing(monkeypatch)
         assert _wait(lambda: not launched[0].is_alive()), "the late worker exits"
         assert got == [] and hostlog._writer[0] is None, got
     finally:
-        gate.set()
+        _release_the_gate(gate, launched)
         remove()
 
 
@@ -2077,10 +2097,11 @@ def test_r14_concurrent_claimants_make_one_thread(monkeypatch):
         assert hostlog.start_writer() is True and made == []
         gate.set()
         assert _wait(lambda: hostlog._writer[0] is launched[0])
+        _assert_consumed(launched[0])
         assert _wait(lambda: len([t for t in threading.enumerate() if t.name == hostlog.WRITER_NAME]) == 1), \
             "one writer (the one let go by `_no_writer` has left)"
     finally:
-        gate.set()
+        _release_the_gate(gate, launched)
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")    # (the death's own traceback)
@@ -2097,7 +2118,7 @@ def test_a3_a_registered_writer_that_dies_releases_every_waiter(monkeypatch):
     assert hostlog.start_writer()
     assert _wait(lambda: hostlog._writer[0] is not None)
     writer = hostlog._writer[0]
-    assert hostlog._state["token"] is None, "its registration consumed its token"
+    _assert_consumed(writer)
 
     class Dies(collections.deque):
         def popleft(self):
@@ -2108,7 +2129,9 @@ def test_a3_a_registered_writer_that_dies_releases_every_waiter(monkeypatch):
     assert _time.monotonic() - t0 < 1.0, "the waiter was released by the death"
     assert _wait(lambda: not writer.is_alive()) and hostlog._writer[0] is None
     # (no start is left pending by the registration that the death undid: the final wait is writer-less at once)
-    assert hostlog._state["token"] is None
+    with hostlog._cond:
+        token = hostlog._state["token"]
+    assert token is None, token
     t0 = _time.monotonic()
     assert hostlog.final_flush(1.0) is True and _time.monotonic() - t0 < 0.3
 
@@ -2270,18 +2293,21 @@ def test_r13_a_real_sigterm_ends_the_node_within_the_bound_with_mains_status(tmp
         child.send_signal(signal.SIGTERM)       # (the test's own child, and only it)
         status = child.wait(20)
         took = _time.monotonic() - t0
-        reader.join(5)
-        rest = []
-        while not lines.empty():
-            x = lines.get_nowait()
-            if x is not None:
-                rest.append(x)
-        rest = "".join(rest)
     finally:
         if child.poll() is None:
             child.kill()
             child.wait(5)
+        reader.join(5)          # (bounded: the child is gone, so its stdout is at EOF)
+        child.stdout.close()
+        child.stderr.close()
         hub.shutdown()
+        hub.server_close()      # (the stub's socket, on every path)
+    rest = []
+    while not lines.empty():
+        x = lines.get_nowait()
+        if x is not None:
+            rest.append(x)
+    rest = "".join(rest)
     assert status == 0, (status, rest)
     assert took < 10, took
     assert "run returned" not in rest, "the stalled exit ends the process at the final wait"
