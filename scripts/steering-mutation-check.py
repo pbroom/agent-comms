@@ -212,7 +212,8 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('N', 'A4 the writer is started eagerly by node.run', '        hostlog.start_writer(force=True)    # (eagerly', '        pass    # (eagerly'),
     ('L', 'A4 an enqueue never starts the writer', '    # (A4) An enqueue never starts the writer', '    _lazy_start()\n    # (A4) An enqueue never starts the writer'),
     ('L', 'A5 the start claim is let go however it ends', '            _state["starting"] = False\n            if started:', '            if started:'),
-    ('L', 'R12 the final wait does not wait for a writer that cannot start', '        if writerless_ok and not _state["starting"] and not _writer_alive():\n            return True', '        if False:\n            return True')]
+    ('L', 'R12 the final wait does not wait for a writer that cannot start', '        if writerless_ok and not _state["starting"] and not _writer_alive():\n            return True', '        if False:\n            return True'),
+    ('L', 'A5 an interrupt in the snapshot propagates', '    except Exception as e:      # (a snapshot that fails keeps a line', '    except BaseException as e:      # (a snapshot that fails keeps a line')]
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
          "tests/test_hostlog.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",

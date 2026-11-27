@@ -1810,6 +1810,29 @@ def test_a5_an_interrupt_during_an_enqueue_propagates_and_leaves_no_claim(monkey
     assert hostlog.start_writer(force=True)
 
 
+def test_a5_an_interrupt_inside_the_snapshot_propagates_and_leaves_nothing_held(monkeypatch):
+    """A5, the enqueue proper (on a lifecycle thread, so no start is involved): a `SystemExit` arriving while the
+    record is snapshotted propagates out of the log call; the queue's lock is free, no start is claimed, the depth is
+    back to 0, nothing is queued, and the next line is written as ever."""
+    import pytest as _pytest
+    from agent_comms import hostlog, session_host
+
+    def interrupted(*a, **k):
+        raise SystemExit(7)
+    monkeypatch.setattr(hostlog, "_caller", interrupted)
+    with hostlog.enqueue_only():
+        with _pytest.raises(SystemExit):
+            session_host.log.warning("interrupted in the snapshot")
+    assert not hostlog._state["starting"] and not hostlog._queue
+    assert hostlog._local.depth == 0
+    assert hostlog._cond.acquire(blocking=False)
+    hostlog._cond.release()
+    monkeypatch.undo()
+    with _Records() as rec:
+        session_host.log.warning("the next line")
+    assert rec.messages() == ["the next line"]
+
+
 # ---------------------------------------------------------------- R13: the real exit path, a real SIGTERM
 
 
