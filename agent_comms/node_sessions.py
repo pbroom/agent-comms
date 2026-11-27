@@ -1655,11 +1655,10 @@ class SessionRunner:
         `shutdown_bound` allows it (the watch interval plus LOCK_SLACK_SECONDS: the loop held its lock for longer,
         limit e) is said in the log, once, with how late it was.
 
-        (Review round 6, ruling N1) The self-stop and the due SIGKILLs are main e6b421f's exactly: one locked section,
-        taken with main's unbounded wait, main's order, eligibility and dating inside it. So no SIGKILL can come
-        between a stop's registration and its SIGTERM, nor reach a process that replaced the one it was meant for:
-        the loop cannot run in between. Then the steer deadlines, in a section of their own whose wait is bounded by
-        one watch interval (round 5): a loop that holds its lock longer delays them to a later pass, never a kill.
+        (Review round 6, ruling N1; round 7, ruling R7-1) The pass is main e6b421f's exactly: ONE locked section, taken
+        with main's unbounded wait, with main's order (the self-stop, the due SIGKILLs, the steer deadlines),
+        eligibility and dating inside it. So no SIGKILL can come between a stop's registration and its SIGTERM, nor
+        reach a process that replaced the one it was meant for, and the next pass's kill scan keeps main's cadence.
         (Review round 5, ruling W) On this thread the host saves nothing, writes no transcript, runs no log handler
         and formats no traceback (all deferred to the loop). Each step is on its own: one that raises never keeps
         the next from running."""
@@ -1686,22 +1685,17 @@ class SessionRunner:
                                     "session loop held its lock that long (limit e)", sid, now - at)
             except Exception:
                 log.exception("hosted sessions: the due SIGKILLs failed")
-        if not self.lock.acquire(timeout=self.watch_seconds):
-            log.warning("hosted sessions: the session loop holds its lock: the steer deadlines wait for the next watch "
-                        "(limit e)")
-            return
-        try:
-            if self.stopping.is_set():
-                return
             # Then, after every deadline of main's has been met (a cut's drain must never delay them, R4-06): loss
             # is one-way, and a half-written steer frame past its limit is cut (a Codex one: main's step 2; a Claude
-            # one is left to the loop, which reads N's end first: ruling W).
-            self._steer_watch(now)      # (main's: the pass's own clock reading)
-            self.host.steer_deadlines(into=self.watched_steer, watchdog=True)
-        except Exception:
-            log.exception("hosted sessions: the steer deadlines failed")
-        finally:
-            self.lock.release()
+            # one is left to the loop, which reads N's end first: ruling W). Still in this one section (review round
+            # 7, ruling R7-1): the pass has main's lock structure exactly. The Claude part of this step waits for
+            # nothing (rulings W and A1: no save, transcript write, log handler, drain or registry wait on this
+            # thread; a stop that cannot take the registry at once is left to a later pass).
+            try:
+                self._steer_watch(now)
+                self.host.steer_deadlines(into=self.watched_steer, watchdog=True)
+            except Exception:
+                log.exception("hosted sessions: the steer deadlines failed")
 
     def _watch(self) -> None:
         me = threading.get_ident()

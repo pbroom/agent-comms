@@ -3966,10 +3966,9 @@ def test_r6_n1_no_kill_comes_between_a_stop_and_its_sigterm(env):
     assert "KILL" not in order or order.index("KILL") > order.index("TERM"), order
 
 
-def test_r6_n1_only_the_steer_deadlines_wait_is_bounded(env):
-    """Ruling N1 (a mutation row): the self-stop and the kills take the runner lock with main's unbounded wait; the
-    steer deadlines' own section waits at most one watch interval (a loop that keeps its lock delays them, never a
-    kill)."""
+def test_r7_1_the_watchdogs_pass_takes_the_runner_lock_once(env):
+    """Ruling R7-1 (round 6's bounded section withdrawn): the pass takes the runner lock ONCE, with main's unbounded
+    wait, and runs the self-stop, the kills and the steer deadlines inside that one section, as main e6b421f."""
     runner = env.node.sessions
     real = runner.lock
     waits = []
@@ -3993,7 +3992,7 @@ def test_r6_n1_only_the_steer_deadlines_wait_is_bounded(env):
         runner.enforce_deadlines()
     finally:
         runner.lock = real
-    assert waits == ["unbounded", runner.watch_seconds], waits
+    assert waits == ["unbounded"], waits
 
 
 def test_r6_n2_a_stalled_transcript_write_at_shutdown_holds_up_no_kill(henv, monkeypatch, tmp_path):
@@ -4219,6 +4218,319 @@ def test_r6_n4_known_limit_a_kill_that_returns_with_survivors_releases_ownership
     assert s2.child is None, "the sibling is stopped"
     assert s1.child is None and not any(token in g for g in host.groups.entries.values()), "pinned: released"
     assert s1.session_id not in _json.loads(host._state_path().read_text()), "pinned: no record kept"
+
+
+# ---------------------------------------------------------------- review round 7
+
+
+class _StallingHandler:
+    """A handler on the package logger that stalls (as a blocked disk or pipe would) on every record of `thread`
+    (all threads if None), and records (logger name, thread, message) for each."""
+
+    def __init__(self, seconds=3.0, thread=None):
+        import logging
+        import threading
+        self.seen, self.release, self.thread = [], threading.Event(), thread
+
+        class H(logging.Handler):
+            def emit(h, record):
+                me = threading.get_ident()
+                self.seen.append((record.name, me, record.getMessage()))
+                if self.thread is None or me == self.thread:
+                    self.release.wait(seconds)
+        self.handler = H()
+        self.logger = logging.getLogger("agent_comms")
+        self.level = self.logger.level
+
+    def __enter__(self):
+        import logging
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.addHandler(self.handler)
+        return self
+
+    def __exit__(self, *a):
+        self.release.set()
+        self.logger.removeHandler(self.handler)
+        self.logger.setLevel(self.level)
+
+
+def _wait_for(pred, seconds=3.0):
+    import time as _time
+    deadline = _time.monotonic() + seconds
+    while _time.monotonic() < deadline:
+        if pred():
+            return True
+        _time.sleep(0.02)
+    return pred()
+
+
+def test_r7_1_a_kill_due_after_the_scan_goes_when_main_would(env):
+    """Sol's round-7 blocker 1 (ruling R7-1): after the watchdog's kill scan the loop takes the runner lock and
+    keeps it past one watch interval; a kill that came due after the scan goes as soon as the loop lets go, as on
+    main (one critical section per pass: the next pass is already waiting for the lock), never a watch interval
+    later."""
+    import threading
+    import time as _time
+    sid, child, s = _stopping_turn(env)
+    runner = env.node.sessions
+    host = runner.host
+    runner.watch_seconds = 0.5
+    real = runner.lock
+    loop_holds, released, killed = threading.Event(), [], []
+
+    def loop():
+        with real:
+            loop_holds.set()
+            _time.sleep(0.75)
+            released.append(_time.monotonic())
+
+    class Proxy:
+        """The runner lock, with the loop let in first wherever the watchdog takes it a second time in a pass."""
+        def __enter__(self):
+            return real.__enter__()
+
+        def __exit__(self, *a):
+            return real.__exit__(*a)
+
+        def acquire(self, *a, **k):
+            loop_holds.wait(2)
+            return real.acquire(*a, **k)
+
+        def release(self):
+            return real.release()
+    real_kill_due, calls = host.kill_due, []
+
+    def kill_due():
+        out = real_kill_due()
+        if not calls:
+            calls.append(1)
+            env.clock.advance(host.kill_grace + 1)      # (it comes due after this scan)
+            threading.Thread(target=loop, daemon=True).start()
+        return out
+    host.kill_due = kill_due
+    real_kill = child.kill
+    child.kill = lambda: (killed.append(_time.monotonic()), real_kill())[1]
+    runner.lock = Proxy()
+    watch = threading.Thread(target=runner._watch, daemon=True)
+    watch.start()
+    try:
+        assert _wait_for(lambda: killed, 5), "the kill was sent"
+    finally:
+        runner.stopping.set()
+        watch.join(5)
+        runner.lock = real
+        runner.stopping.clear()
+    assert released and killed[0] - released[0] <= 0.15, (killed, released)
+
+
+def test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry(env):
+    """Ruling A1: a spawn holds the group registry while a held Claude end's contact runs out and another session's
+    kill comes due after the scan: the watchdog fences the hold (its decision recorded) without waiting for the
+    registry, so the next scan sends the kill on its cadence; the hold's stop goes on a later pass once the
+    registry is free, and its SIGKILL is never earlier than its real SIGTERM plus the grace."""
+    import threading
+    import time as _time
+    from test_hosted_sessions import P2
+    a, ca, n, s_uuid = claude_steered(env)
+    runner = env.node.sessions
+    host = runner.host
+    ca.emit(cresult(a, n, text="N's reply"))
+    tick(env)
+    sa = host.sessions[a]
+    assert sa.held is not None
+    ca.exits_on_terminate = False
+    b, cb, sb = _stopping_turn(env, project=P2)
+    runner.watch_seconds = 0.3
+    sa.steer.cover_until = env.clock() - 1      # (the hold's own contact ran out)
+    release, held = threading.Event(), threading.Event()
+
+    def spawn_holding_the_registry():
+        with host.groups.lock:
+            held.set()
+            release.wait(10)
+    threading.Thread(target=spawn_holding_the_registry, daemon=True).start()
+    assert held.wait(3)
+    real_kill_due, scans = host.kill_due, []
+
+    def kill_due():
+        out = real_kill_due()
+        scans.append(_time.monotonic())
+        if len(scans) == 1:
+            env.clock.advance(host.kill_grace + 1)      # (b's kill comes due after this scan)
+        return out
+    host.kill_due = kill_due
+    killed = []
+    real_kill = cb.kill
+    cb.kill = lambda: (killed.append(_time.monotonic()), real_kill())[1]
+    watch = threading.Thread(target=runner._watch, daemon=True)
+    watch.start()
+    try:
+        assert _wait_for(lambda: killed, 5), "b's kill was sent"
+        assert killed[0] - scans[0] <= runner.watch_seconds + 0.5, "on the watchdog's cadence"
+        assert sa.held is not None and sa.held.decided is not None, "the hold fenced: its decision recorded"
+        assert not ca.terminated and sa.stopping_since is None, "no SIGTERM, no kill clock, while the registry waits"
+        release.set()
+        assert _wait_for(lambda: ca.terminated, 5), "its stop goes once the registry is free"
+    finally:
+        release.set()
+        runner.stopping.set()
+        watch.join(5)
+        runner.stopping.clear()
+    term_at = sa.stopping_since
+    assert term_at is not None
+    env.clock.advance(host.kill_grace - 1)
+    with runner.lock:
+        host.kill_due()
+    assert not ca.killed, "no SIGKILL before its real SIGTERM plus the grace"
+
+
+@pytest.mark.parametrize("phase", ["held", "s_turn"])
+def test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals(henv, monkeypatch, phase):
+    """Sol's round-7 blocker 2 (ruling R7-2): two held ends at shutdown (one with S's own turn open), a stalling
+    log handler: every group's SIGTERM and SIGKILL is sent; the lines are written after the bulk SIGKILL pass."""
+    import threading
+    (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
+    host = henv.host
+    if phase == "s_turn":
+        c1.emit(vinit(S))
+        host.tick()
+        assert s1.held is not None and s1.held.s_turn
+    c1.exits_on_terminate = c2.exits_on_terminate = False
+    with _StallingHandler() as h:
+        t = threading.Thread(target=host.stop_all, daemon=True)
+        t.start()
+        h.thread = t.ident
+        ok = _wait_for(lambda: c1.terminated and c2.terminated and c1.killed and c2.killed, 2.0)
+        h.release.set()
+        t.join(10)
+    assert ok, (c1.terminated, c2.terminated, c1.killed, c2.killed)
+
+
+def test_r7_2_a_raising_kill_with_a_stalling_handler_still_kills_the_siblings(henv, monkeypatch):
+    """Ruling R7-2: the first group's SIGKILL raises and its log line would stall: the sibling's SIGKILL is sent."""
+    import threading
+    (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
+    host = henv.host
+    c1.exits_on_terminate = c2.exits_on_terminate = False
+
+    def bad():
+        raise OSError("kill failed")
+    c1.kill = bad
+    with _StallingHandler() as h:
+        t = threading.Thread(target=host.stop_all, daemon=True)
+        t.start()
+        h.thread = t.ident
+        ok = _wait_for(lambda: c2.killed, 2.0)
+        h.release.set()
+        t.join(10)
+    assert ok, "the sibling's SIGKILL"
+    assert any("SIGKILL" in m for _, _, m in h.seen), "the line was written, after the pass"
+
+
+@pytest.mark.parametrize("entry", ["shutdown", "signal_then_shutdown"])
+def test_r7_2_both_shutdown_entry_points_signal_every_group_with_a_stalling_handler(env, entry):
+    """Ruling R7-2: the node's shutdown (signals first) and the loop-exit cleanup (`sessions.shutdown()` directly,
+    node.py): a held Claude end and an ordinary sibling, a stalling handler: both groups get their SIGTERM and
+    SIGKILL."""
+    import threading
+    from test_hosted_sessions import P2
+    a, ca, n, s_uuid = claude_steered(env)
+    runner = env.node.sessions
+    ca.emit(cresult(a, n, text="N's reply"))
+    tick(env)
+    assert runner.host.sessions[a].held is not None
+    b, cb, mb = _ordinary_turn_in_flight(env, project=P2)
+    ca.exits_on_terminate = cb.exits_on_terminate = False
+
+    def run():
+        if entry == "signal_then_shutdown":
+            runner.signal()
+            runner.kill()
+        runner.shutdown()
+    with _StallingHandler(seconds=6) as h:
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        h.thread = t.ident
+        ok = _wait_for(lambda: ca.terminated and cb.terminated and ca.killed and cb.killed, 2.0)
+        h.release.set()
+        t.join(15)
+    assert ok, (ca.terminated, cb.terminated, ca.killed, cb.killed)
+
+
+def test_r7_a2_stop_all_restores_the_callers_prior_diversion(henv, monkeypatch):
+    """Ruling A2: `stop_all` run on a thread that was already diverting (a watchdog's) leaves it diverting."""
+    from agent_comms import session_host
+    _held_pair(henv, monkeypatch)
+    seen = []
+    t, done, ident, err = _on_watchdog(None, fn=lambda: (henv.host.stop_all(), seen.append(session_host.on_watch())))
+    assert done.wait(10) and not err, err
+    assert seen == [True]
+
+
+def test_r7_a2_a_held_publication_at_shutdown_does_no_io(henv, monkeypatch):
+    """Ruling A2 (pin): the publication of a held end's result inside `stop_all` stays in place (event order); it
+    appends to the outbox in memory and saves nothing there (the save waits for the end of `stop_all`)."""
+    from agent_comms import session_host
+    _held_pair(henv, monkeypatch)
+    host = henv.host
+    inside, io = [], []
+    real_emit = host._emit_hold
+
+    def emit_hold(*a, **k):
+        inside.append(1)
+        try:
+            return real_emit(*a, **k)
+        finally:
+            inside.pop()
+    host._emit_hold = emit_hold
+    for name in ("write", "replace", "open"):
+        real = getattr(session_host.os, name)
+        monkeypatch.setattr(session_host.os, name,
+                            lambda *a, _r=real, _n=name, **k: (io.append(_n) if inside else None, _r(*a, **k))[1])
+    host.stop_all()
+    assert not io, io
+
+
+def test_r7_a3_a_deferred_line_carries_the_exception_type_only(env):
+    """Ruling A3: a line logged with an exception on a diverting thread is replayed with the exception's TYPE only,
+    never its text (which gives no guarantee against steer or message text)."""
+    import logging
+    from agent_comms import session_host
+
+    class Marked(Exception):
+        pass
+
+    def logs():
+        try:
+            raise Marked("PINEAPPLE-STEER-TEXT")
+        except Marked:
+            logging.getLogger("agent_comms.node_sessions").exception("hosted sessions: something failed")
+    t, done, ident, err = _on_watchdog(None, fn=logs)
+    assert done.wait(5) and not err, err
+    with _StallingHandler(seconds=0) as h:
+        session_host.flush_watch_logs()
+    lines = [m for _, _, m in h.seen]
+    assert any("something failed" in m and "Marked" in m for m in lines), lines
+    assert not any("PINEAPPLE" in m for m in lines), lines
+
+
+def test_r7_3_the_deferred_queue_counts_what_it_drops(env):
+    """Ruling R7-3: more lines than the queue holds are logged on a diverting thread: the replay says, in one line,
+    how many were dropped."""
+    import logging
+    from agent_comms import session_host
+    n = session_host._WATCH_LINES.maxlen + 7
+
+    def logs():
+        lg = logging.getLogger("agent_comms.node_sessions")
+        for i in range(n):
+            lg.warning("line %d", i)
+    t, done, ident, err = _on_watchdog(None, fn=logs)
+    assert done.wait(10) and not err, err
+    with _StallingHandler(seconds=0) as h:
+        session_host.flush_watch_logs()
+    lines = [m for _, _, m in h.seen]
+    assert any("7" in m and "dropped" in m for m in lines), lines[-3:]
 
 
 RESULT_FIELDS = ["subtype", "is_error", "num_turns", "origin", "user_message_uuid", "user_message_uuids", "result",
@@ -4677,9 +4989,9 @@ def test_r4_t_a_stop_claimed_before_the_latch_may_signal_after_it(henv, monkeypa
     henv.host.tick()
     real_stop = henv.host._stop
 
-    def stop(sess, now, at_signal=False):
+    def stop(sess, now, at_signal=False, **kw):
         henv.host.steer_stopping()          # the latch lands between the claim and the signal
-        return real_stop(sess, now, at_signal=at_signal)
+        return real_stop(sess, now, at_signal=at_signal, **kw)
     henv.host._stop = stop
     henv.clock.advance(21)
     henv.host.steer_deadlines()

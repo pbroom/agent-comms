@@ -110,6 +110,7 @@ from .providers import Event, ProviderSession, validate_model, validate_session_
 # it.
 WATCH_THREADS: set[int] = set()
 _WATCH_LINES: deque = deque(maxlen=2000)
+_WATCH_DROPPED = [0]        # (review round 7, ruling R7-3) lines the full queue let go, said once at the replay
 
 
 def on_watch() -> bool:
@@ -123,16 +124,19 @@ _real_log = getattr(logging.Logger._log, "_real", logging.Logger._log)     # (on
 def _diverting_log(self, level, msg, args, exc_info=None, extra=None, stack_info=False, stacklevel=1):
     """(Review round 6, ruling W2.3) Every logger of the package, provider loggers included: on a watchdog thread a
     line is never made into a record, formatted or handed to a handler there. It is kept in memory (a bounded queue:
-    the oldest goes first if the loop is away that long), with an exception's type and text only (no traceback is
-    formatted), and the loop writes it at its next pass (`flush_watch_logs`). On any other thread, logging as ever."""
+    the oldest goes first if the loop is away that long, and the replay says how many went), with an exception's
+    TYPE only (round 7, ruling A3: no exception text, which gives no guarantee against steer or message text; no
+    traceback is formatted), and the loop writes it at its next pass (`flush_watch_logs`). On any other thread,
+    logging as ever."""
     if on_watch() and (self.name == _PACKAGE or self.name.startswith(_PACKAGE + ".")):
         try:
             if exc_info:
                 ex = exc_info if isinstance(exc_info, BaseException) else (
                     exc_info[1] if isinstance(exc_info, tuple) else sys.exc_info()[1])
                 if ex is not None:
-                    msg = f"{msg} ({type(ex).__name__}: %s)"
-                    args = tuple(args) + (ex,) if isinstance(args, tuple) else (args, ex)
+                    msg = f"{msg} ({type(ex).__name__})"
+            if len(_WATCH_LINES) == _WATCH_LINES.maxlen:
+                _WATCH_DROPPED[0] += 1
             _WATCH_LINES.append((self.name, level, msg, args))
         except Exception:       # (never raises on the watchdog's thread)
             pass
@@ -149,6 +153,13 @@ def flush_watch_logs() -> None:
     """The loop writes what the watchdog's thread logged (called at the start of its pass and of a host tick)."""
     if on_watch():
         return
+    dropped, _WATCH_DROPPED[0] = _WATCH_DROPPED[0], 0
+    if dropped:
+        try:
+            logging.getLogger("agent_comms.session_host").warning(
+                "%d deferred log line(s) were dropped: the queue was full", dropped)
+        except Exception:
+            pass
     while _WATCH_LINES:
         try:
             name, level, msg, args = _WATCH_LINES.popleft()
@@ -433,6 +444,9 @@ class Session:
     # (Review round 5, ruling Z2) its leader went after the stop latch, leaving its group: registered as stopping for
     # the bulk stop, which owns it; no SIGTERM was sent for it (so no SIGKILL may come of this)
     parked: bool = False
+    # (Review round 7, ruling A1) a stop decided on the watchdog's thread that could not take the group registry at
+    # once: retried on every pass; no `stopping_since` and no SIGTERM until it really goes (no kill clock before)
+    stop_due: bool = False
     tee_pending: list = field(default_factory=list)     # (ruling W) transcript lines the watchdog's thread read
     stopping_since: float | None = None
     killed: bool = False
@@ -1233,6 +1247,8 @@ class SessionHost:
     def _steer_deadlines(self, now: float, out: list[HostEvent], watchdog: bool = False) -> None:
         with self.one_drain_budget():      # one drain deadline for every cut in this call
             for s in list(self.sessions.values()):
+                if s.stop_due:
+                    self._stop_due(s, wait_registry=not watchdog)       # (ruling A1) a deferred stop, again
                 slot = s.steer
                 if (slot is not None and slot.mark is not None and slot.sent > 0 and s.child is not None
                         and s.stopping_since is None and not self._steer_stopped(slot)
@@ -1377,6 +1393,8 @@ class SessionHost:
             flush_watch_logs()      # (ruling W) what the watchdog's thread logged, written here
             for s in list(self.sessions.values()):
                 self._flush_tee(s)
+                if s.stop_due:
+                    self._stop_due(s, wait_registry=True)       # (ruling A1) the loop waits for the registry
             if self._save_due:      # (ruling T) what the watchdog's path published is persisted here, by the loop
                 self._save_due = False
                 self._save_state()
@@ -1746,7 +1764,7 @@ class SessionHost:
         s.group_token = None
         s.sealed_by = s.confirmed_by = None     # what that process said went with it
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
-        s.parked = False
+        s.parked = s.stop_due = False
         s.outbuf.clear()
         if s.steer is not None and s.steer.outcome is not None:
             s.steer = None          # its turn is decided and its process is gone: nothing more of it is written
@@ -2115,15 +2133,25 @@ class SessionHost:
                  s.session_id, msg.id)
         self._save_state()
 
-    def _stop(self, s: Session, now: float, at_signal: bool = False) -> None:
+    def _stop(self, s: Session, now: float, at_signal: bool = False, wait_registry: bool = True) -> None:
         """`at_signal` (review round 8, R8-01): passed True only by a single-session steering caller, for the stop
         that directly follows a live attempt's drain in that same call, or the contact cut's: the stop is then dated
         by a clock read immediately before its SIGTERM (after the registry, `poll` and the group probe, R8-02), so no
         SIGKILL comes before the grace from it. Every other caller passes nothing: main's `now`, exactly as on main.
         Nothing about the dating is stored or inferred from a slot or a past drain."""
         if s.child is not None and s.stopping_since is None:
-            s.stopping_since = now
-            self.groups.stopping(s.group_token)     # from now on nothing starts in its directory until it is gone
+            if not wait_registry:
+                # (Review round 7, ruling A1) the watchdog's thread never waits for the group registry (a spawn holds
+                # it across process creation): taken only if it is free at once; else the stop waits for a later
+                # pass (`stop_due`), with no `stopping_since` and no SIGTERM (no kill clock) until then
+                if not self.groups.try_stopping(s.group_token):
+                    s.stop_due = True
+                    return
+                s.stopping_since = now
+            else:
+                s.stopping_since = now
+                self.groups.stopping(s.group_token)     # from now on nothing starts in its directory until it is gone
+            s.stop_due = False
             # The whole process group (PopenChild). Not once all of it is known to be gone (a caller may have
             # stopped it already, node.shut_down): its id could be another group's by now.
             if s.child.poll() is None or self.group_alive(s.child.pid):
@@ -2669,7 +2697,15 @@ class SessionHost:
         if drain:       # (ruling W: never on the watchdog's thread; S is then decided from what was read so far)
             now = self._drain_before_stop(s, now, out)
         if s.held is held:
-            self._cutoff_stop(s, why, now, out)
+            self._cutoff_stop(s, why, now, out, wait_registry=drain)     # (ruling A1: no registry wait off the loop)
+
+    def _stop_due(self, s: Session, wait_registry: bool) -> None:
+        """(Review round 7, ruling A1) A stop decided earlier whose SIGTERM could not go (the registry was busy on the
+        watchdog's thread): tried again, dated at its SIGTERM; after the latch the bulk stop sends it."""
+        if s.child is None or s.stopping_since is not None or self.steer_stopped:
+            s.stop_due = s.child is not None and s.stopping_since is None and s.stop_due
+            return
+        self._stop(s, self.clock(), at_signal=True, wait_registry=wait_registry)
 
     def _steering(self, s: Session) -> bool:
         """The session holds a Claude steer whose outcome is open, or a held end: from the latch on the bulk stop
@@ -2702,7 +2738,7 @@ class SessionHost:
         else:
             log.log(level, msg, *args)
 
-    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent]) -> bool:
+    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent], wait_registry: bool = True) -> bool:
         """THE single-session stop of a session holding a live steer attempt or a held end (review round 3, ruling N;
         callers: `_hold_cut`, and the turn timeout `_hold_to_timeout`, the held one included). The decision and the
         fence are made under the cutoff lock; after the global latch it does nothing (the stop of every turn is the
@@ -2711,7 +2747,7 @@ class SessionHost:
         nothing."""
         if not self._claim(s, lambda: self._fail(s, why, out)):
             return False
-        self._stop(s, now, at_signal=True)      # (dated at its SIGTERM: R8-01)
+        self._stop(s, now, at_signal=True, wait_registry=wait_registry)      # (dated at its SIGTERM: R8-01)
         return True
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
@@ -2994,6 +3030,27 @@ class SessionHost:
         """Shutdown: terminate every session's process group, wait the grace period, kill what remains of each group
         (its leader may be gone while a member is not). A turn in flight is reported failed. Sessions are not ended:
         a later host may reopen them with resume. (Ruling H) Every SIGTERM goes before anything is persisted."""
+        # (Review round 7, rulings R7-2 and A2) From here through the last SIGKILL attempt, this thread's package
+        # logging is deferred by the watchdog's own mechanism (`WATCH_THREADS`): no log handler runs ahead of any
+        # signal (a held end's diagnostic, a raising SIGTERM's or SIGKILL's line, anything else). On leaving, whether
+        # the pass finished or raised, the thread's PRIOR state is restored, and only then are the lines replayed.
+        me = threading.get_ident()
+        was_diverting = me in WATCH_THREADS
+        WATCH_THREADS.add(me)
+        diverting = [True]
+
+        def undivert() -> None:
+            if diverting[0]:
+                diverting[0] = False
+                if not was_diverting:
+                    WATCH_THREADS.discard(me)
+                flush_watch_logs()
+        try:
+            return self._stop_all(undivert)
+        finally:
+            undivert()
+
+    def _stop_all(self, undivert: Callable[[], None]) -> list[HostEvent]:
         out = self._outbox
         now = self.clock()
         live = [s for s in self.sessions.values() if s.child is not None]
@@ -3027,6 +3084,7 @@ class SessionHost:
                 except Exception:
                     failed.add(s.session_id)
                     log.exception("session %s: its SIGKILL at shutdown failed", s.session_id)
+            undivert()      # (ruling R7-2) the last SIGKILL attempt is made: the deferred lines are written now
             for s in live:
                 # (Review round 4, ruling T) every step of the traversal per session: one session's fault (its
                 # read, close or cleanup) skips no other, and the final save runs in the `finally`
@@ -3060,5 +3118,6 @@ class SessionHost:
             for s in self.sessions.values():
                 s.sealed_by = s.confirmed_by = None     # this host is done: what its processes said goes with it
         finally:
+            undivert()          # (also when the pass raised: then the final save is made with logging restored)
             self._save_state()
         return self._take_outbox()

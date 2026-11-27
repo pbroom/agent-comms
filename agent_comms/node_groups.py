@@ -57,6 +57,19 @@ class Groups:
                 if token in groups:
                     groups[token][0] = self.STOPPING
 
+    def try_stopping(self, token: Hashable) -> bool:
+        """`stopping`, only if the registry is free at once (review round 7, ruling A1: the node's watchdog thread
+        never waits behind a spawn that holds it across process creation). False: nothing was recorded."""
+        if not self.lock.acquire(blocking=False):
+            return False
+        try:
+            for groups in self.entries.values():
+                if token in groups:
+                    groups[token][0] = self.STOPPING
+            return True
+        finally:
+            self.lock.release()
+
     def gone(self, token: Hashable) -> None:
         """The whole group is gone: leader reaped, no member left."""
         with self.lock:
