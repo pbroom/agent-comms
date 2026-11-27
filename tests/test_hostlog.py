@@ -1,9 +1,10 @@
 """Host-side logging (DESIGN_NOTES "Host-side logging"): the package-owned adapter (`agent_comms.hostlog`).
 
-THE invariant: no log handler runs, and nothing is formatted, while the calling thread holds a host lock (the runner
-lock, the cutoff lock, the registry lock), on any thread, for any host-side line; nothing process-wide is patched.
-Every line is a deferred record made at the call and written by one drain on the caller's thread at the outermost
-boundary, after every host lock is let go. A watchdog thread never drains."""
+THE guarantee (DESIGN_NOTES "Host-side logging: one writer"): a log handler that blocks forever, or raises, changes
+nothing but log output: every signal, report, save and return happens at its time. Every line is a deferred record
+made at the call; ONE writer thread is the only thread that ever enters a handler; a lifecycle thread (the node's
+main thread in `run`, the session loop, the watchdog, the checkpoint sender, the writer) never waits for it; a
+standalone caller (a test) waits, bounded, for its own last line at depth 0."""
 import logging
 
 import pytest
@@ -109,10 +110,12 @@ NODE_ROUTES = [n_start, n_timeout, n_watchdog_hold_cut, n_self_stop, n_close, n_
 @pytest.mark.parametrize("mode", ["blocks", "raises"])
 @pytest.mark.parametrize("route", NODE_ROUTES, ids=lambda f: f.__name__)
 def test_no_handler_is_entered_under_a_host_lock_on_the_nodes_routes(env, route, mode):
-    """The node's own routes (its pass, its watchdog, its shutdown): a handler that blocks or raises is never entered
-    while the entering thread holds the runner lock, the cutoff lock or the registry lock; lines were written."""
+    """The node's own routes (its pass, its watchdog, its shutdown), run under the production policy: a handler that
+    blocks or raises is entered only on the writer thread, never by a thread holding a lock of the host-side modules;
+    lines were written."""
+    from agent_comms import hostlog
     act = route(env)
-    with Guard(runner=env.node.sessions, mode=mode) as g:
+    with Guard(runner=env.node.sessions, mode=mode) as g, hostlog.enqueue_only():
         act()
     if route is not n_close:
         assert g.seen, "the route wrote lines"
@@ -153,62 +156,6 @@ def test_a_registry_callback_line_is_written_after_the_registry_is_let_go():
 
 
 # ---------------------------------------------------------------- the mechanism
-
-
-class _Records:
-    """A handler on the package logger that keeps every record it is handed (and, optionally, does something with
-    it: `act(record)`)."""
-
-    def __init__(self, act=None, level=logging.DEBUG):
-        self.records, self.act, self.level = [], act, level
-        outer = self
-
-        class H(logging.Handler):
-            def emit(self, rec):
-                outer.records.append(rec)
-                if outer.act is not None:
-                    outer.act(rec)
-        self.handler = H(logging.DEBUG)
-        self.logger = logging.getLogger("agent_comms")
-
-    def messages(self):
-        return [r.getMessage() for r in self.records]
-
-    def __enter__(self):
-        self.saved = self.logger.level
-        self.logger.setLevel(self.level)
-        self.logger.addHandler(self.handler)
-        return self
-
-    def __exit__(self, *a):
-        self.logger.removeHandler(self.handler)
-        self.logger.setLevel(self.saved)
-
-
-def _on_watch_thread(fn):
-    """`fn` on a thread registered as a watchdog's (it never drains); returns its ident once it is done."""
-    t, done, ident, err = _on_watchdog(None, fn=fn)
-    assert done.wait(10) and not err, err
-    return ident[0]
-
-
-@pytest.mark.parametrize("which", ["cutoff", "registry", "runner"])
-def test_each_host_lock_is_a_boundary_of_its_own(env, which):
-    """B4: each host lock, taken outside every entry point (an internal path a test drives directly), is a boundary:
-    a line logged while it is held is written when it is let go, never while it is held."""
-    from agent_comms import session_host
-    from hostlog_guard import own
-    runner = env.node.sessions
-    obj, attr = {"cutoff": (runner.host, "_steer_stop_lock"), "registry": (runner.host.groups, "lock"),
-                 "runner": (runner, "lock")}[which]
-    lock = getattr(obj, attr)
-    inner = own(obj, attr)
-    seen = []
-    with _Records(act=lambda r: seen.append(inner.mine())) as rec:
-        with lock:
-            session_host.log.warning("under the lock")
-            assert rec.records == []
-        assert rec.messages() == ["under the lock"] and seen == [False]
 
 
 def test_the_host_side_modules_take_their_loggers_from_hostlog():
@@ -270,412 +217,12 @@ def test_caplog_sees_a_lines_record_as_soon_as_the_public_call_returns(henv, cap
     assert [r for r in caplog.records if r.getMessage().startswith(f"started session {SID}")]
 
 
-def test_a_line_the_logger_would_not_emit_is_not_kept():
-    """B3: call-time level filtering: a line below the logger's level at the call is not queued (lowering the level
-    before the drain does not bring it back); one at or above it is written even if the level is raised before the
-    drain."""
-    from agent_comms import hostlog, session_host
-    real = logging.getLogger("agent_comms.session_host")
-    level = real.level
-    with _Records(level=logging.NOTSET) as rec:
-        real.setLevel(logging.WARNING)
-
-        def logs():
-            session_host.log.info("an info line")
-            session_host.log.warning("a warning line")
-            real.setLevel(logging.ERROR)
-        try:
-            _on_watch_thread(logs)
-            real.setLevel(logging.DEBUG)
-            hostlog.drain(everything=True)
-        finally:
-            real.setLevel(level)
-    assert rec.messages() == ["a warning line"]
-
-
 def _line():
     import sys
     return sys._getframe(1).f_lineno
 
 
-def test_a_deferred_record_is_the_calls_snapshot():
-    """B3: the record is made at the call: its time, thread and caller are the call's (no source lookup), an
-    exception is its type's name and its frames (no text), an object argument is its type's name (never formatted
-    later), a `%`-mapping is copied with reduced values; nothing is written until a drain."""
-    import threading
-    import time as _time
-    from agent_comms import hostlog, session_host
-
-    class Loud:
-        def __str__(self):
-            raise AssertionError("formatted")
-
-        __repr__ = __format__ = __str__
-
-    class Marked(Exception):
-        pass
-    mutable = ["kept as its type"]
-    at = {}
-
-    def logs():
-        at["before"] = _time.time()
-        at["thread"] = threading.current_thread().name
-        at["line"] = _line() + 1
-        session_host.log.warning("an object %s and a list %s and %d and %s", Loud(), mutable, 7, None)
-        session_host.log.info("a mapping %(a)s %(b)s", {"a": "text", "b": Loud()})
-        try:
-            raise Marked("PINEAPPLE-STEER-TEXT")
-        except Marked:
-            session_host.log.exception("it failed")
-        at["after"] = _time.time()
-    with _Records() as rec:
-        _on_watch_thread(logs)
-        assert rec.records == [], "nothing written on the watchdog's thread, nor before a drain"
-        mutable.append("changed")
-        _time.sleep(0.05)
-        hostlog.drain(everything=True)
-    first, mapping, failed = rec.records
-    assert at["before"] <= first.created <= at["after"] < _time.time()
-    assert first.threadName == at["thread"]
-    assert first.pathname == __file__ and first.lineno == at["line"] and first.funcName == "logs"
-    assert first.getMessage() == "an object Loud and a list list and 7 and None"
-    assert mapping.getMessage() == "a mapping text Loud"
-    assert failed.exc_info is None and failed.hostlog_exc[0] == "Marked"
-    assert [f[2] for f in failed.hostlog_exc[1]] == ["logs"]
-    text = logging.Formatter().format(failed)
-    assert "Marked" in text and "in logs" in text and "PINEAPPLE" not in text, text
-
-
-def test_enqueue_order_across_threads_is_the_write_order():
-    """B7: two watchdog threads log in turn (each line after the other's): the drain writes them in that order, which
-    is the queue's (`hostlog_seq`)."""
-    import threading
-    from agent_comms import hostlog, session_host
-    turn = [threading.Event() for _ in range(8)]
-
-    def side(k):
-        for i in range(k, 8, 2):
-            if i:
-                assert turn[i - 1].wait(5)
-            session_host.log.warning("line %d", i)
-            turn[i].set()
-    with _Records() as rec:
-        a = threading.Thread(target=lambda: _on_watch_thread(lambda: side(0)))
-        b = threading.Thread(target=lambda: _on_watch_thread(lambda: side(1)))
-        a.start()
-        b.start()
-        a.join(10)
-        b.join(10)
-        hostlog.drain(everything=True)
-    assert rec.messages() == [f"line {i}" for i in range(8)]
-    seqs = [r.hostlog_seq for r in rec.records]
-    assert seqs == sorted(seqs)
-
-
-def test_an_inner_public_call_under_the_runner_lock_leaves_its_lines_to_the_outer_boundary(henv):
-    """B4: a host call made under the runner lock (as the node makes them) returns with its lines still queued; the
-    lock's release (the outer boundary) writes them, on a normal and on an exceptional exit."""
-    from agent_comms import session_host
-    from hostlog_guard import runner_lock
-    lock, inner = runner_lock()
-    open_session(henv)
-    henv.host.send(SID, "go")
-    with _Records() as rec:
-        with lock:
-            henv.host.tick()
-            assert not [m for m in rec.messages() if m.startswith("started session")], "not under the lock"
-        assert [m for m in rec.messages() if m.startswith("started session")], "at its release"
-        with pytest.raises(RuntimeError):
-            with lock:
-                session_host.log.warning("a line before a raise")
-                assert rec.messages()[-1] != "a line before a raise"
-                raise RuntimeError("the pass failed")
-        assert rec.messages()[-1] == "a line before a raise", "an exceptional exit drains too"
-
-
-def test_a_handler_that_raises_is_caught_and_the_drain_goes_on():
-    """B5: a handler that raises on one record: the call returns normally, the next handler still gets that record,
-    and the later records are written."""
-    from agent_comms import session_host
-
-    def act(r):
-        if r.getMessage() == "first":
-            raise RuntimeError("a log handler failed")
-    with _Records(act=act) as bad, _Records() as good:
-        session_host.log.warning("first")
-        session_host.log.warning("second")
-    assert bad.messages() == ["first", "second"] and good.messages() == ["first", "second"]
-
-
-def test_a_handler_that_logs_and_calls_back_into_the_host_does_not_deadlock(henv):
-    """B5: a handler that logs and calls public host methods (whose lines are queued too) from inside the drain: no
-    deadlock; the nested drains leave their records to the ACTIVE drainer, which writes them before the outer call
-    returns."""
-    import threading
-    from agent_comms import hostlog, session_host
-    open_session(henv)
-    henv.host.send(SID, "go")
-    calls = []
-
-    def act(r):
-        if r.getMessage().startswith("started session") and not calls:
-            calls.append(1)
-            session_host.log.warning("from the handler")
-            henv.host.send(SID, "again")        # (public methods: their own boundaries, nested in the drain)
-            henv.host.tick()
-    with _Records(act=act) as rec:
-        done = threading.Event()
-        t = threading.Thread(target=lambda: (henv.host.tick(), done.set()), daemon=True)
-        t.start()
-        # (Bounded below WAIT_SECONDS: a nested drain that waited on itself would wait that long at each nested
-        # exit, so its mutant FAILS here instead of hanging the run.)
-        assert done.wait(min(1.0, hostlog.WAIT_SECONDS / 2)), "no deadlock, no wait on itself"
-        assert calls and "from the handler" in rec.messages(), "written by the active drainer before it returned"
-
-
-def test_a_blocked_drainer_does_not_delay_the_watchdogs_signals(env):
-    """B4: the loop's drain is stalled by a handler (after it let go of the runner lock); meanwhile the watchdog's
-    self-stop SIGTERMs the turn's group and, after the grace, SIGKILLs it: the watchdog never waits on a drainer."""
-    import threading
-    from agent_comms import node_sessions
-    sid, child, m = _ordinary_turn_in_flight(env)
-    runner = env.node.sessions
-    child.exits_on_terminate = False
-    stall, entered = threading.Event(), threading.Event()
-    loop = []
-
-    def act(r):
-        if r.getMessage() == "a loop line" and threading.get_ident() in loop:
-            entered.set()
-            stall.wait(10)
-
-    def the_loop():
-        loop.append(threading.get_ident())
-        with runner.lock:
-            node_sessions.log.warning("a loop line")
-    with _Records(act=act):
-        t = threading.Thread(target=the_loop, daemon=True)
-        t.start()
-        try:
-            assert entered.wait(5), "the loop's drain is stalled"
-            env.clock.advance(runner.self_stop_seconds + 1)
-            _on_watch_thread(runner.enforce_deadlines)
-            assert child.terminated, "the self-stop's SIGTERM went"
-            env.clock.advance(runner.host.kill_grace + 1)
-            _on_watch_thread(runner.enforce_deadlines)
-            assert child.killed, "and its SIGKILL"
-        finally:
-            stall.set()
-            t.join(5)
-
-
-def test_a_watchdog_thread_never_drains():
-    """B4: lines logged on a watchdog thread, inside and outside a boundary, with an explicit drain there too, are
-    written by the next drain elsewhere, never on that thread."""
-    import threading
-    from agent_comms import hostlog, session_host
-    written = []
-
-    def logs():
-        session_host.log.warning("outside")
-        with hostlog.BOUNDARY:
-            session_host.log.warning("inside")
-        hostlog.drain(everything=True)
-    with _Records(act=lambda r: written.append(threading.get_ident())) as rec:
-        ident = _on_watch_thread(logs)
-        assert rec.records == []
-        hostlog.drain(everything=True)
-    assert rec.messages() == ["outside", "inside"] and all(r.thread == ident for r in rec.records)
-    assert written and ident not in written
-
-
-def test_no_drain_inside_a_boundary_even_when_asked():
-    """B4: the drain itself refuses inside a boundary (depth above 0), whoever calls it: the boundary's exit writes."""
-    from agent_comms import hostlog, session_host
-    with _Records() as rec:
-        with hostlog.BOUNDARY:
-            session_host.log.warning("inside")
-            assert hostlog.drain(everything=True) is False and rec.records == []
-        assert rec.messages() == ["inside"]
-
-
-def test_the_watchdogs_lines_are_written_at_the_runner_locks_release_not_by_an_entry_that_logged_nothing(env):
-    """B4: what the watchdog queued is written by the loop when it lets go of the runner lock; an entry point that
-    logged nothing itself (`attempts`) writes and waits for nothing."""
-    from agent_comms import node_sessions
-    runner = env.node.sessions
-    with _Records() as rec:
-        _on_watch_thread(lambda: node_sessions.log.warning("the watchdog's line"))
-        runner.host.attempts()
-        assert rec.records == [], "not by an entry that logged nothing"
-        with runner.lock:
-            pass
-        assert rec.messages() == ["the watchdog's line"], "by the runner lock's release"
-
-
-def test_a_drain_with_another_drainer_stalled_is_bounded_when_asked():
-    """B5: `atexit`'s drain is best effort: with another thread's drain stalled it gives up after its timeout."""
-    import threading
-    import time as _time
-    from agent_comms import hostlog, session_host
-    stall, entered = threading.Event(), threading.Event()
-
-    def act(r):
-        if r.getMessage() == "stalls":
-            entered.set()
-            stall.wait(10)
-    with _Records(act=act):
-        t = threading.Thread(target=lambda: session_host.log.warning("stalls"), daemon=True)
-        t.start()
-        try:
-            assert entered.wait(5)
-            _on_watch_thread(lambda: session_host.log.warning("waits"))
-            started = _time.monotonic()
-            assert hostlog.drain(everything=True, timeout=0.2, wait_all=True) is False
-            assert _time.monotonic() - started < 2
-        finally:
-            stall.set()
-            t.join(5)
-
-
 # ---------------------------------------------------------------- review round 1: R1 (every lock) and R2 (threads)
-
-
-def _refused_once(env, kind, code):
-    """A report refused once with `code` at its first rung and taken at the next. `ordinary`: a Claude session's
-    status report, whose modes name the steer pair (no event carries a steer outcome); `steer`: a Claude `next_turn`
-    and a Codex `in_turn`, each in its own report. (runner, the POSTs made, the sessions refused)."""
-    from test_claude_steering import _claude_next_turn_and_codex_steer_pending, _posts, cinit, written
-    from test_hosted_tree import proc_of
-    runner = env.node.sessions
-    if kind == "steer":
-        a, b, runner = _claude_next_turn_and_codex_steer_pending(env)
-        sids = {a, b}
-    else:
-        sid = start(env, "a turn")["session_id"]
-        tick(env)
-        child = proc_of(env, sid)[1]
-        child.emit(cinit(sid, written(child)[-1]["uuid"]))
-        tick(env)
-        assert "held" in runner.host.modes(sid)
-        runner.reported.pop(sid, None)      # (its status goes again)
-        sids = {sid}
-    refused = set()
-
-    def refuse(path, body):
-        sid = path.rsplit("/", 1)[-1]
-        if sid in sids and sid not in refused and (kind == "steer" or "held" in (body.get("modes") or [])):
-            refused.add(sid)
-            return code
-        return None
-    return runner, _posts(runner, refuse), sids
-
-
-@pytest.mark.parametrize("mode", ["blocks", "raises", "reenters"])
-@pytest.mark.parametrize("code", [400, 422])
-@pytest.mark.parametrize("kind", ["ordinary", "steer"])
-def test_a_refused_reports_fallback_writes_its_line_after_the_report_lock(env, kind, code, mode):
-    """R1 (review round 1): a report refused with 400 or 422 and sent again at its next rung (`_post_report`, under
-    `_flush`'s report lock): its line is written once no lock of the host-side modules is held, after the retry was
-    sent; a handler that blocks holds up neither the retry nor the final report, one that raises changes nothing, and
-    one that re-enters `_flush` does not deadlock."""
-    import threading
-    runner, seen, sids = _refused_once(env, kind, code)
-    release, entered, at_entry, reentered = threading.Event(), threading.Event(), [], []
-
-    def act(r):
-        if "the hub refused the report" not in r.getMessage() or entered.is_set():
-            return
-        at_entry.append(len(seen))
-        entered.set()
-        if mode == "raises":
-            raise RuntimeError("a log handler failed")
-        if mode == "reenters":
-            reentered.append(runner._flush())
-        else:
-            release.wait(10)
-    with Guard(runner=runner) as g, _Records(act=act):
-        done = threading.Event()
-        t = threading.Thread(target=lambda: (runner._flush(), done.set()), daemon=True)
-        t.start()
-        try:
-            assert entered.wait(5), "the refusal's line was written"
-            assert mode == "blocks" or done.wait(5), "no deadlock"
-            assert at_entry[0] == len(sids) * 2, "the retries were sent before any handler was entered"
-        finally:
-            release.set()
-        assert done.wait(5)
-    assert not g.violations, g.violations
-    assert [p for p, _ in seen].count(next(iter(sids))) == 2
-    assert not [x for x, _ in runner.pending if x in sids], "the final report went"
-    if mode == "reenters":
-        assert reentered == [True]
-
-
-def test_a_failed_checkpoint_is_written_by_the_loop_and_never_holds_it(env):
-    """R2 (review round 1; the amendment's A4): the checkpoint sender's POST fails with a blocking handler installed:
-    (i) the sender returns without entering the handler (it is enqueue-only) and the loop is not held by it; (ii) the
-    loop's next pass writes the line into that blocked handler holding no lock of the host-side modules, and the
-    watchdog's SIGTERM and SIGKILL still go meanwhile."""
-    import threading
-    import httpx
-    runner = env.node.sessions
-    a, ca, n, s_uuid = claude_steered(env)
-    b, cb, mb = _ordinary_turn_in_flight(env, project=P2)
-    cb.exits_on_terminate = False
-    real = runner.client.request
-    posting, go, failed = threading.Event(), threading.Event(), threading.Event()
-
-    def request(method, url, *x, **kw):
-        if (kw.get("json") or {}).get("held") is not None:
-            posting.set()
-            go.wait(10)         # (it fails once the loop's passes are over: no loop pass writes it meanwhile)
-            failed.set()
-            raise httpx.ConnectError("the hub is away")
-        return real(method, url, *x, **kw)
-    runner.client.request = request
-    release, entered, where = threading.Event(), threading.Event(), []
-
-    def act(r):
-        if "was not taken" in r.getMessage():
-            where.append(threading.current_thread())
-            entered.set()
-            release.wait(10)
-    with Guard(runner=runner) as g, _Records(act=act):
-        runner.start_checkpoint_sender()
-        try:
-            ca.emit(cresult(a, n, text="N's reply"))
-            tick(env, times=2)
-            assert posting.wait(5), "the sender is posting the checkpoint"
-            go.set()
-            assert failed.wait(5), "the checkpoint POST failed"
-            assert _wait(lambda: runner.checkpoint_thread.is_alive() and not runner.checkpoint_queue)
-            assert not entered.wait(0.5), ("(i) the sender entered no handler: it is enqueue-only", where)
-            loop = threading.Thread(target=lambda: tick(env), daemon=True)
-            loop.start()
-            assert entered.wait(5) and where == [loop], "(ii) the loop's drain writes it"
-            env.clock.advance(runner.self_stop_seconds + 1)
-            ident = _on_watch_thread(runner.enforce_deadlines)
-            assert cb.terminated, "the watchdog's SIGTERM, while the loop's handler is blocked"
-            env.clock.advance(runner.host.kill_grace + 1)
-            _on_watch_thread(runner.enforce_deadlines)
-            assert cb.killed, "and its SIGKILL"
-            assert ident not in [t.ident for t in where]
-        finally:
-            release.set()
-            runner.stopping.set()
-            runner.checkpoint_thread.join(5)
-    assert not g.violations, g.violations
-
-
-def _wait(pred, seconds=5.0):
-    import time as _time
-    deadline = _time.monotonic() + seconds
-    while _time.monotonic() < deadline:
-        if pred():
-            return True
-        _time.sleep(0.02)
-    return pred()
 
 
 HOST_SIDE = ["session_host.py", "node_sessions.py", "node.py", "node_groups.py", "providers/__init__.py",
@@ -726,34 +273,6 @@ def _owner(node, up):
     return None
 
 
-def test_every_lock_of_the_host_side_modules_is_a_boundary_or_reviewed():
-    """R1 (review round 1): every `threading` lock, condition, event or semaphore constructed in the host-side modules
-    is either wrapped as a boundary (`hostlog.HostLock(...)`) or on the reviewed list of those under which no line can
-    be logged; a lock added later cannot fall outside the invariant silently, and the list has no stale entry."""
-    import ast
-    found = set()
-    for rel in HOST_SIDE:
-        tree, path = _module(rel)
-        up = _parents(tree)
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
-                    and node.value.id == "threading" and node.attr in LOCK_KINDS):
-                continue
-            parent = up.get(node)
-            call = parent if isinstance(parent, ast.Call) and parent.func is node else None
-            wrapper = up.get(call) if call is not None else None
-            if isinstance(wrapper, ast.Call) and call in wrapper.args:
-                name = ast.unparse(wrapper.func)
-                if name in ("hostlog.HostLock", "HostLock"):
-                    continue        # a boundary
-                if name == "threading.Condition":
-                    continue        # (a Condition's own lock: the Condition is what is reviewed)
-            key = (rel, _owner(node, up))
-            assert key in NOT_BOUNDARIES, f"{path.name}:{node.lineno}: {key[1]} is a lock outside the invariant"
-            found.add(key)
-    assert found == set(NOT_BOUNDARIES), set(NOT_BOUNDARIES) - found
-
-
 def test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time(env):
     """R1 (review round 1): the runner's lock, report lock and ack lock, the host's cutoff lock, the registry's lock and
     a steer attempt's record lock are boundaries (`HostLock`) as constructed."""
@@ -766,34 +285,6 @@ def test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time(env):
 
 
 # (Review round 1, R2) Every thread the host-side modules start: the loop drains; every other one is enqueue-only.
-THREADS = {"hosted-sessions": ("run_forever", "the loop: it drains"),
-           "hosted-sessions-deadlines": ("_watch", "enqueue-only"),
-           "hosted-sessions-checkpoints": ("_send_checkpoints", "enqueue-only")}
-
-
-def test_every_thread_the_host_side_modules_start_is_reviewed_and_every_background_one_is_enqueue_only():
-    """R2 (review round 1): every `threading.Thread(...)` in the host-side modules is on the reviewed list; each one
-    other than the loop runs its whole body inside `hostlog.enqueue_only()`."""
-    import ast
-    found, bodies = {}, {}
-    for rel in HOST_SIDE:
-        tree, path = _module(rel)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                bodies[node.name] = node
-            if isinstance(node, ast.Call) and ast.unparse(node.func) == "threading.Thread":
-                kw = {k.arg: k.value for k in node.keywords}
-                assert "name" in kw and isinstance(kw["name"], ast.Constant), f"{path.name}:{node.lineno}: unnamed"
-                found[kw["name"].value] = ast.unparse(kw["target"]).rsplit(".", 1)[-1]
-    assert {n: t for n, (t, _) in THREADS.items()} == found
-    for name, (target, kind) in THREADS.items():
-        if kind != "enqueue-only":
-            continue
-        withs = [w for w in ast.walk(bodies[target]) if isinstance(w, ast.With)
-                 and any(ast.unparse(i.context_expr) == "hostlog.enqueue_only()" for i in w.items)]
-        assert withs, f"{target} is not enqueue-only"
-
-
 def test_the_background_threads_register_as_enqueue_only_when_they_run(env):
     """R2: the deadline watchdog and the checkpoint sender, started as the node starts them, are in
     `hostlog.ENQUEUE_ONLY` while they run, and out of it once they end."""
@@ -815,75 +306,7 @@ def test_the_background_threads_register_as_enqueue_only_when_they_run(env):
     assert runner.checkpoint_thread.ident not in hostlog.ENQUEUE_ONLY and watch.ident not in hostlog.ENQUEUE_ONLY
 
 
-def test_a_thread_waits_for_its_own_records_behind_a_stalled_drainer_only_up_to_the_deadline(monkeypatch):
-    """R2 (the amendment's A2): while another thread's drain is stalled in a handler, a thread with nothing of its own
-    pending waits for nothing; one with a record of its own waits for it at most WAIT_SECONDS, then returns; the
-    active drainer writes that record once its handler returns."""
-    import threading
-    import time as _time
-    from agent_comms import hostlog, session_host
-    monkeypatch.setattr(hostlog, "WAIT_SECONDS", 0.3)
-    stall, entered = threading.Event(), threading.Event()
-
-    def act(r):
-        if r.getMessage() == "stalls":
-            entered.set()
-            stall.wait(10)
-    with _Records(act=act) as rec:
-        t = threading.Thread(target=lambda: session_host.log.warning("stalls"), daemon=True)
-        t.start()
-        try:
-            assert entered.wait(5)
-            t0 = _time.monotonic()
-            with hostlog.BOUNDARY:
-                pass
-            assert _time.monotonic() - t0 < 0.2, "nothing of its own: no wait"
-            t0 = _time.monotonic()
-            session_host.log.warning("mine")
-            waited = _time.monotonic() - t0
-            assert 0.25 <= waited < 2, waited
-            assert "mine" not in rec.messages()
-        finally:
-            stall.set()
-            t.join(5)
-    assert rec.messages() == ["stalls", "mine"], "written by the active drainer"
-
-
 # ---------------------------------------------------------------- R3: an exception's reviewed facts
-
-
-def test_facts_are_reviewed_integers_rendered_by_the_writer(monkeypatch):
-    """R3 (review round 1; the amendment's A3): `hostlog.facts` keeps an exception's type name and, for a known class,
-    an integer read at the call (an HTTP status error's status code, an OSError's errno, a subprocess's return code);
-    the WRITER renders them; nothing is rendered at the call, and no exception text is ever read."""
-    import errno as _errno
-    import subprocess
-    import httpx
-    from agent_comms import hostlog, session_host
-    rendered = []
-    real = hostlog._render_facts
-    monkeypatch.setattr(hostlog, "_render_facts", lambda *a: (rendered.append(a), real(*a))[1])
-    req = httpx.Request("POST", "http://secret-host.example/api/nodes/sessions/x?token=SECRET")
-    refused = _errno.ECONNREFUSED
-    cases = [
-        (httpx.HTTPStatusError("SECRET text", request=req, response=httpx.Response(502, request=req)),
-         "HTTPStatusError status=502"),
-        (ConnectionRefusedError(refused, "SECRET text"), f"ConnectionRefusedError errno={refused}"),
-        (OSError("SECRET text"), "OSError"),
-        (subprocess.CalledProcessError(3, ["SECRET", "argv"], output="SECRET"), "CalledProcessError returncode=3"),
-        (httpx.ConnectError("SECRET text", request=req), "ConnectError"),
-        (ValueError("SECRET text"), "ValueError"),
-    ]
-
-    def logs():
-        for e, _ in cases:
-            session_host.log.warning("it failed: %s", hostlog.facts(e))
-    with _Records() as rec:
-        _on_watch_thread(logs)
-        assert rendered == [], "nothing rendered at the call"
-        hostlog.drain(everything=True)
-    assert rec.messages() == [f"it failed: {want}" for _, want in cases]
-    assert len(rendered) == len(cases) and not any("SECRET" in m for m in rec.messages())
 
 
 def test_facts_never_call_a_hostile_exceptions_own_code():
@@ -982,166 +405,7 @@ def test_a_later_value_is_rendered_by_the_writer_only(monkeypatch):
     assert str(value) == claude.shown_version("2.1.330\n") and calls == [1, 1]
 
 
-# ---------------------------------------------------------------- review round 2: R5 (no drain inside a signal sequence)
-
-
-def _stubborn_shutdown(senv, when):
-    """A session process and an ordinary run that both ignore SIGTERM, and a warning queued by an enqueue-only thread
-    (the checkpoint sender's), on the node's own fixture: (node, session child, run child, kill times, TERM time)."""
-    from agent_comms import hostlog, node_sessions
-    from agent_comms.node import _Local
-    from test_dispatch import FakeChild
-    from test_hosted_sessions import children
-    from test_session_host import FakeSessionChild
-    node = senv.node
-    node.session_spawner.child = lambda pid: FakeSessionChild(pid, exits_on_terminate=False)
-    start(senv, "a turn")
-    tick(senv)
-    [session_child] = children(senv)
-    run_child = FakeChild(5000, exits_on_terminate=False)
-    node.running["run-1"] = _Local("run-1", run_child, senv.clock(), 1800.0, 10.0)
-    t0, kills = senv.clock(), {}
-    for name, child in (("session", session_child), ("run", run_child)):
-        real = child.kill
-        child.kill = lambda _r=real, _n=name: (kills.setdefault(_n, senv.clock() - t0), _r())[1]
-    if when == "fallback":
-        # an exception between the SIGTERMs and the SIGKILLs: the `stop_all` fallback (and the sessions' own stop)
-        real_alive, calls = node.runs_alive, []
-
-        def runs_alive():
-            calls.append(1)
-            if len(calls) == 2:
-                raise RuntimeError("a shutdown step failed")
-            return real_alive()
-        node.runs_alive = runs_alive
-
-    def queue():
-        with hostlog.enqueue_only():
-            node_sessions.log.warning("session %s: the checkpoint of message %s was not taken (%s); it is not sent "
-                                      "again", "s", 1, "ConnectError")
-    import threading
-    t = threading.Thread(target=queue)
-    t.start()
-    t.join(5)
-    return node, session_child, run_child, kills
-
-
-@pytest.mark.parametrize("mode", ["blocks", "raises"])
-@pytest.mark.parametrize("when", ["normal", "fallback"])
-def test_a_line_queued_before_shutdown_is_written_after_its_last_signal(senv, when, mode):
-    """R5 (review round 2; the amendment's A1 to A3): shutdown's signal sequence (the runs' and the sessions' SIGTERM,
-    the grace, both SIGKILLs, and the `stop_all` fallback when a step raises between them) is ONE boundary: a warning
-    the checkpoint sender queued before it is written only after the last signal, so a handler that blocks or raises
-    on it delays no SIGKILL: both go AT the grace deadline (10 s of the node's clock from the SIGTERMs, within one
-    0.2 s wait step), and the line is written after them."""
-    import threading
-    from agent_comms.node import shut_down
-    node, session_child, run_child, kills = _stubborn_shutdown(senv, when)
-    release, entered, at_entry = threading.Event(), threading.Event(), []
-
-    def act(r):
-        if "was not taken" not in r.getMessage() or entered.is_set():
-            return
-        at_entry.append((session_child.killed, run_child.killed))
-        entered.set()
-        if mode == "raises":
-            raise RuntimeError("a log handler failed")
-        release.wait(10)
-    with _Records(act=act):
-        done, err = threading.Event(), []
-
-        def run():
-            try:
-                shut_down(node)
-            except BaseException as e:      # noqa: BLE001 (the test reads it)
-                err.append(e)
-            finally:
-                done.set()
-        threading.Thread(target=run, daemon=True).start()
-        try:
-            assert _wait(lambda: session_child.killed and run_child.killed, 5), (
-                "both SIGKILLs went while the handler was blocked", kills, at_entry)
-        finally:
-            release.set()
-        assert done.wait(10), "shutdown ended"
-    assert entered.is_set() and at_entry[0] == (1, 1), ("the line, written after both SIGKILLs", at_entry)
-    assert session_child.terminated >= 1 and run_child.terminated >= 1
-    if when == "normal":
-        assert kills["session"] == pytest.approx(10, abs=0.25) and kills["run"] == pytest.approx(10, abs=0.25), kills
-        assert not err, err
-
-
 # ---------------------------------------------------------------- review round 2: R6 (the construction forms), R7
-
-
-def test_locks_are_built_only_in_the_reviewed_forms():
-    """R6 (review round 2; the amendment's A4): in the host-side modules a lock, condition, event or semaphore is built
-    only as `threading.X(...)` (or passed as `default_factory`) or wrapped as `hostlog.HostLock(...)`: `threading` is
-    imported only as itself and used only as `threading.<name>`; `from threading import` of those names, any alias of
-    the module, and a bare use of one of those names are failures. A helper that returns a lock would build it outside
-    an assignment, so the lock scan above already refuses it; the reviewed list of such factories is empty."""
-    import ast
-    factories = {}      # (module, function) -> why it may return a lock: none is reviewed
-    for rel in HOST_SIDE:
-        tree, path = _module(rel)
-        up = _parents(tree)
-        # (a bare name is one of threading's unless the module imports it from elsewhere: providers' `Event`)
-        elsewhere = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
-                     and n.module != "threading" for a in n.names}
-        elsewhere |= {n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
-        for node in ast.walk(tree):
-            where = f"{path.name}:{getattr(node, 'lineno', '?')}"
-            if isinstance(node, ast.Import):
-                for a in node.names:
-                    assert a.name != "threading" or a.asname is None, f"{where}: threading imported as {a.asname}"
-            if isinstance(node, ast.ImportFrom) and node.module == "threading":
-                bad = {a.name for a in node.names} & (LOCK_KINDS | {"*"})
-                assert not bad, f"{where}: from threading import {bad}"
-            if isinstance(node, ast.Name) and node.id in LOCK_KINDS - elsewhere:
-                raise AssertionError(f"{where}: a bare {node.id}")
-            if isinstance(node, ast.Name) and node.id == "threading":
-                parent = up.get(node)
-                assert isinstance(parent, ast.Attribute) and parent.value is node, f"{where}: threading used as a value"
-            if (isinstance(node, ast.Return) and node.value is not None
-                    and any(isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "threading"
-                            and n.attr in LOCK_KINDS for n in ast.walk(node.value))):
-                fn = next((a for a in _ancestors(node, up) if isinstance(a, (ast.FunctionDef, ast.Lambda))), None)
-                assert (rel, getattr(fn, "name", None)) in factories, f"{where}: an unreviewed lock factory"
-
-
-def _ancestors(node, up):
-    while node in up:
-        node = up[node]
-        yield node
-
-
-def test_a_lock_built_through_an_alias_a_bare_name_or_a_factory_is_refused(tmp_path):
-    """R6: the scans above refuse each way around them, as source text: an aliased module, `from threading import`, a
-    bare name, a helper that returns a lock."""
-    import ast
-    cases = ["import threading as t\nlock = t.Lock()\n",
-             "from threading import Lock\nlock = Lock()\n",
-             "from threading import *\n",
-             "import threading\nL = threading\nlock = L.RLock()\n",
-             "import threading\ndef make():\n    return threading.Lock()\nlock = make()\n"]
-    for src in cases:
-        tree = ast.parse(src)
-        up = _parents(tree)
-        refused = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import) and any(a.name == "threading" and a.asname for a in node.names):
-                refused = True
-            if isinstance(node, ast.ImportFrom) and node.module == "threading":
-                refused = True
-            if isinstance(node, ast.Name) and node.id in LOCK_KINDS:
-                refused = True
-            if isinstance(node, ast.Name) and node.id == "threading" and not (
-                    isinstance(up.get(node), ast.Attribute) and up[node].value is node):
-                refused = True
-            if isinstance(node, ast.Return) and node.value is not None and any(
-                    isinstance(n, ast.Attribute) and n.attr in LOCK_KINDS for n in ast.walk(node.value)):
-                refused = True
-        assert refused, src
 
 
 def test_facts_run_no_code_of_a_subclass_of_a_reviewed_class():
@@ -1184,8 +448,114 @@ def test_facts_run_no_code_of_a_subclass_of_a_reviewed_class():
     assert touched == [], touched
 
 
-def _queue_a_line(text="a queued line"):
-    """A line queued by an enqueue-only thread (as the checkpoint sender's or the watchdog's)."""
+# ---------------------------------------------------------------- helpers
+
+
+class _Records:
+    """A handler on the package logger that keeps every record it is handed (and, optionally, does something with
+    it: `act(record)`), with the thread that entered it. Leaving it waits (bounded) for the writer to be idle first,
+    so what was queued meanwhile is there."""
+
+    def __init__(self, act=None, level=logging.DEBUG):
+        import threading
+        self.records, self.threads, self.act, self.level = [], [], act, level
+        outer = self
+
+        class H(logging.Handler):
+            def emit(self, rec):
+                outer.records.append(rec)
+                outer.threads.append(threading.current_thread().name)
+                if outer.act is not None:
+                    outer.act(rec)
+        self.handler = H(logging.DEBUG)
+        self.logger = logging.getLogger("agent_comms")
+
+    def messages(self):
+        return [r.getMessage() for r in self.records]
+
+    def __enter__(self):
+        self.saved = self.logger.level
+        self.logger.setLevel(self.level)
+        self.logger.addHandler(self.handler)
+        return self
+
+    def __exit__(self, *a):
+        from agent_comms import hostlog
+        if hasattr(hostlog, "flush"):
+            hostlog.flush(10)
+        else:   # (before the one writer, for a reproduction run: the caller-thread drain)
+            hostlog.drain(everything=True)
+        self.logger.removeHandler(self.handler)
+        self.logger.setLevel(self.saved)
+
+
+def _on_watch_thread(fn):
+    """`fn` on a thread registered as the watchdog's (a lifecycle thread); returns its ident once it is done."""
+    t, done, ident, err = _on_watchdog(None, fn=fn)
+    assert done.wait(10) and not err, err
+    return ident[0]
+
+
+def _wait(pred, seconds=5.0):
+    import time as _time
+    deadline = _time.monotonic() + seconds
+    while _time.monotonic() < deadline:
+        if pred():
+            return True
+        _time.sleep(0.02)
+    return pred()
+
+
+def _production(fn):
+    """`fn` on a thread under the production policy (`hostlog.enqueue_only`, as `node.run` registers its thread),
+    asserting it is registered: (done, errors, results)."""
+    import threading
+    from agent_comms import hostlog
+    done, err, out = threading.Event(), [], []
+
+    def run():
+        try:
+            with hostlog.enqueue_only():
+                assert threading.get_ident() in hostlog.ENQUEUE_ONLY
+                assert not getattr(hostlog, "may_wait", hostlog.__dict__.get("may_drain"))()
+                out.append(fn())
+        except BaseException as e:      # noqa: BLE001 (the test reads it)
+            err.append(e)
+        finally:
+            done.set()
+    threading.Thread(target=run, daemon=True).start()
+    return done, err, out
+
+
+class _Blocked:
+    """A handler action that blocks the writer on its first record matching `text` (until released, at most 30 s),
+    or raises on it (`mode` "raises"); `state()` is recorded at entry. Released by the test's teardown (`with`)."""
+
+    def __init__(self, text, mode="blocks", state=lambda: None):
+        import threading
+        self.text, self.mode, self.state = text, mode, state
+        self.release, self.entered, self.at_entry, self.where = threading.Event(), threading.Event(), [], []
+
+    def __call__(self, r):
+        import threading
+        if self.text not in r.getMessage() or self.entered.is_set():
+            return
+        self.at_entry.append(self.state())
+        self.where.append(threading.current_thread().name)
+        self.entered.set()
+        if self.mode == "raises":
+            raise RuntimeError("a log handler failed")
+        self.release.wait(30)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.release.set()
+
+
+def _queue_from_another_thread(text="a line queued by another thread"):
+    """A line queued beforehand by another lifecycle thread (as the checkpoint sender's or the watchdog's)."""
     import threading
     from agent_comms import hostlog, node_sessions
 
@@ -1197,69 +567,967 @@ def _queue_a_line(text="a queued line"):
     t.join(5)
 
 
-def _blocking_on(text, state):
-    """A handler action that blocks (until released) on `text`, saying `state()` when entered."""
+# ---------------------------------------------------------------- the mechanism
+
+
+def test_handlers_are_entered_only_on_the_writer_thread_at_depth_0(henv):
+    """W1: lines logged on the test thread, a watchdog thread, inside a host call and under a host lock are all handed
+    to the handlers by the writer thread, at its depth 0, holding no lock; it is a daemon thread, and a lifecycle one."""
     import threading
-    release, entered, at_entry = threading.Event(), threading.Event(), []
+    from agent_comms import hostlog, session_host
+    depths = []
+    open_session(henv)
+    henv.host.send(SID, "go")
+    with _Records(act=lambda r: depths.append((hostlog.depth(), threading.get_ident() in hostlog.ENQUEUE_ONLY))) as rec:
+        session_host.log.warning("from the test thread")
+        _on_watch_thread(lambda: session_host.log.warning("from a watchdog thread"))
+        henv.host.tick()
+        with henv.host._steer_stop_lock:
+            session_host.log.warning("under the cutoff lock")
+    assert {"from the test thread", "from a watchdog thread", "under the cutoff lock"} <= set(rec.messages())
+    assert set(rec.threads) == {hostlog.WRITER_NAME}
+    assert set(depths) == {(0, True)}
+    [w] = [t for t in threading.enumerate() if t.name == hostlog.WRITER_NAME]
+    assert w.daemon
+
+
+def test_a_line_the_logger_would_not_emit_is_not_kept():
+    """B3: call-time level filtering: a line below the logger's level at the call is not queued (lowering the level
+    later does not bring it back); one at or above it is written even if the level is raised before the writer gets
+    to it."""
+    from agent_comms import session_host
+    real = logging.getLogger("agent_comms.session_host")
+    level = real.level
+    with _Records(level=logging.NOTSET) as rec:
+        real.setLevel(logging.WARNING)
+        try:
+            session_host.log.info("an info line")
+            session_host.log.warning("a warning line")
+            real.setLevel(logging.ERROR)
+        finally:
+            real.setLevel(level)
+    assert "an info line" not in rec.messages() and "a warning line" in rec.messages()
+
+
+def _line():
+    import sys
+    return sys._getframe(1).f_lineno
+
+
+def test_a_deferred_record_is_the_calls_snapshot():
+    """B3: the record is made at the call: its time, thread and caller are the call's (no source lookup), an
+    exception is its type's name and its frames (no text), an object argument is its type's name (never formatted),
+    a `%`-mapping is copied with reduced values."""
+    import threading
+    import time as _time
+    from agent_comms import session_host
+
+    class Loud:
+        def __str__(self):
+            raise AssertionError("formatted")
+
+        __repr__ = __format__ = __str__
+
+    class Marked(Exception):
+        pass
+    at = {}
+
+    def logs():
+        at["before"] = _time.time()
+        at["thread"] = threading.current_thread().name
+        at["line"] = _line() + 1
+        session_host.log.warning("an object %s and a list %s and %d and %s", Loud(), [1], 7, None)
+        session_host.log.info("a mapping %(a)s %(b)s", {"a": "text", "b": Loud()})
+        try:
+            raise Marked("PINEAPPLE-STEER-TEXT")
+        except Marked:
+            session_host.log.exception("it failed")
+        at["after"] = _time.time()
+    with _Records() as rec:
+        _on_watch_thread(logs)
+    first, mapping, failed = [r for r in rec.records if r.name == "agent_comms.session_host"]
+    assert at["before"] <= first.created <= at["after"]
+    assert first.threadName == at["thread"]
+    assert first.pathname == __file__ and first.lineno == at["line"] and first.funcName == "logs"
+    assert first.getMessage() == "an object Loud and a list list and 7 and None"
+    assert mapping.getMessage() == "a mapping text Loud"
+    assert failed.exc_info is None and failed.hostlog_exc[0] == "Marked"
+    assert [f[2] for f in failed.hostlog_exc[1]] == ["logs"]
+    text = logging.Formatter().format(failed)
+    assert "Marked" in text and "in logs" in text and "PINEAPPLE" not in text, text
+
+
+def test_enqueue_order_across_threads_is_the_write_order():
+    """W1: two threads log in turn (each line after the other's): the writer writes them in that order, the queue's
+    (`hostlog_seq`)."""
+    import threading
+    from agent_comms import session_host
+    turn = [threading.Event() for _ in range(8)]
+
+    def side(k):
+        for i in range(k, 8, 2):
+            if i:
+                assert turn[i - 1].wait(5)
+            session_host.log.warning("line %d", i)
+            turn[i].set()
+    with _Records() as rec:
+        a = threading.Thread(target=lambda: _on_watch_thread(lambda: side(0)))
+        b = threading.Thread(target=lambda: _on_watch_thread(lambda: side(1)))
+        a.start()
+        b.start()
+        a.join(10)
+        b.join(10)
+    assert [m for m in rec.messages() if m.startswith("line ")] == [f"line {i}" for i in range(8)]
+    seqs = [r.hostlog_seq for r in rec.records]
+    assert seqs == sorted(seqs)
+
+
+def test_a_lifecycle_thread_never_waits_for_a_blocked_writer(env, monkeypatch):
+    """W2 and C1: with the writer blocked in a handler, every kind of lifecycle thread returns at once from its log
+    calls and boundary exits: a thread under `enqueue_only` (the node's main thread in `run`, the checkpoint sender), a
+    watchdog thread, and the writer itself (a handler that logs)."""
+    import time as _time
+    from agent_comms import hostlog, session_host
+    monkeypatch.setattr(hostlog, "ACK_SECONDS", 5.0)
+    took = []
+
+    def timed():
+        t0 = _time.monotonic()
+        for i in range(20):
+            session_host.log.warning("lifecycle %d", i)
+        with hostlog.BOUNDARY:
+            pass
+        took.append(_time.monotonic() - t0)
+    with _Blocked("blocks the writer") as blocked, _Records(act=blocked):
+        session_host.log.warning("blocks the writer")
+        assert blocked.entered.wait(5)
+        done, err, _ = _production(timed)
+        assert done.wait(5) and not err, err
+        _on_watch_thread(timed)
+        assert all(t < 0.5 for t in took), took
+        blocked.release.set()
+
+
+def test_a_standalone_wait_is_bounded_latched_and_clears_on_progress(monkeypatch):
+    """W3 and C3: with the writer blocked, a standalone caller's own line is waited for at most ACK_SECONDS; the stall
+    latch then spares every later wait; once the writer has made progress beyond the latch, waits are normal again."""
+    import time as _time
+    from agent_comms import hostlog, session_host
+    monkeypatch.setattr(hostlog, "ACK_SECONDS", 0.3)
+    with _Blocked("blocks the writer") as blocked, _Records(act=blocked) as rec:
+        _queue_from_another_thread("blocks the writer")
+        assert blocked.entered.wait(5)
+        t0 = _time.monotonic()
+        session_host.log.warning("waited for")
+        first = _time.monotonic() - t0
+        t0 = _time.monotonic()
+        session_host.log.warning("not waited for (latched)")
+        second = _time.monotonic() - t0
+        assert 0.25 <= first < 2 and second < 0.1, (first, second)
+        assert hostlog._state["stalled_at"] is not None
+        blocked.release.set()
+        assert _wait(lambda: hostlog._state["stalled_at"] is None), "a later completion clears the latch"
+        monkeypatch.setattr(hostlog, "ACK_SECONDS", 5.0)
+        session_host.log.warning("synchronous again")
+        assert "synchronous again" in rec.messages()
+
+
+def test_a_waiter_on_a_record_the_bound_evicted_is_released_at_once(monkeypatch):
+    """C3 and C6: with the writer blocked, the queue overflows: the oldest go; a standalone caller waiting for its own
+    line that was evicted returns at once; when the writer resumes it says once how many went, then writes the rest
+    in order."""
+    import threading
+    import time as _time
+    from agent_comms import hostlog, session_host
+    monkeypatch.setattr(hostlog, "ACK_SECONDS", 10.0)
+    with _Blocked("blocks the writer") as blocked, _Records(act=blocked) as rec:
+        _queue_from_another_thread("blocks the writer")
+        assert blocked.entered.wait(5)
+        with hostlog.BOUNDARY:
+            session_host.log.warning("mine, to be evicted")
+
+            def flood():
+                for i in range(hostlog.QUEUE_MAX + 6):
+                    session_host.log.warning("flood %d", i)
+            t = threading.Thread(target=lambda: _on_watch_thread(flood))
+            t.start()
+            t.join(20)
+            t0 = _time.monotonic()
+        took = _time.monotonic() - t0
+        assert took < 1, took
+        blocked.release.set()
+    said = rec.messages()
+    assert "mine, to be evicted" not in said
+    assert said[1] == "7 deferred log line(s) were dropped: the queue was full", said[:3]
+    assert said[2] == "flood 6" and said[-1] == f"flood {hostlog.QUEUE_MAX + 5}"
+
+
+def test_a_handler_that_raises_anything_is_skipped_and_the_writer_goes_on():
+    """W1: a handler that raises (an Exception, a SystemExit, a KeyboardInterrupt) on a record: the next handler still
+    gets that record, the writer goes on with the next records, and it is the same writer."""
+    from agent_comms import hostlog, session_host
+    kinds = iter([RuntimeError("a log handler failed"), SystemExit(3), KeyboardInterrupt()])
 
     def act(r):
-        if r.getMessage() == text and not entered.is_set():
-            at_entry.append(state())
-            entered.set()
-            release.wait(10)
-    return act, release, entered, at_entry
+        if r.getMessage().startswith("raise"):
+            raise next(kinds)
+    with _Records(act=act) as bad, _Records() as good:
+        for i in range(3):
+            session_host.log.warning("raise %d", i)
+        session_host.log.warning("after")
+        writer = hostlog._writer[0]
+    assert good.messages()[-4:] == ["raise 0", "raise 1", "raise 2", "after"] and bad.messages()[-1] == "after"
+    assert writer.is_alive() and hostlog._writer[0] is writer
 
 
-def _in_thread(fn):
+def test_a_dead_writer_is_restarted_and_there_is_only_ever_one(monkeypatch):
+    """W1 and C6: a writer found dead is replaced at the next record; many threads logging their first lines at once
+    start exactly ONE writer."""
     import threading
-    done = threading.Event()
-    threading.Thread(target=lambda: (fn(), done.set()), daemon=True).start()
-    return done
+    from agent_comms import hostlog, session_host
+    dead = threading.Thread(target=lambda: None, name=hostlog.WRITER_NAME)
+    dead.start()
+    dead.join()
+    with hostlog._cond:
+        hostlog._state["gen"] += 1      # (the running writer leaves: as in a process with none yet)
+        hostlog._writer[0] = dead
+        hostlog._cond.notify_all()
+    gate = threading.Barrier(16)
+
+    def first():
+        gate.wait(5)
+        session_host.log.warning("first line")
+    with _Records() as rec:
+        threads = [threading.Thread(target=lambda: _on_watch_thread(first)) for _ in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert _wait(lambda: len([t for t in threading.enumerate() if t.name == hostlog.WRITER_NAME]) == 1)
+    assert rec.messages().count("first line") == 16
+    assert hostlog._writer[0] is not dead and hostlog._writer[0].is_alive()
 
 
-def test_the_nodes_own_stop_all_writes_no_line_between_its_signals(senv):
-    """R5 (review round 2): `Node.stop_all` on its own (two ordinary runs that ignore SIGTERM, a queued line, a
-    blocking handler): both SIGTERMs and both SIGKILLs go, the KILLs at the grace deadline, and the line is written
-    after the last of them (the registry's release between two runs' signals writes nothing)."""
+def test_flush_is_bounded_with_a_blocked_writer(monkeypatch):
+    """W5: `flush` waits for the queue to be empty and the writer idle, at most its bound, entering no handler."""
+    import time as _time
+    from agent_comms import hostlog
+    with _Blocked("blocks the writer") as blocked, _Records(act=blocked):
+        _queue_from_another_thread("blocks the writer")
+        assert blocked.entered.wait(5)
+        t0 = _time.monotonic()
+        assert hostlog.flush(0.3) is False
+        assert 0.25 <= _time.monotonic() - t0 < 2
+        blocked.release.set()
+        assert hostlog.flush(5) is True
+
+
+def test_a_handler_that_logs_or_calls_back_into_the_host_neither_waits_nor_deadlocks(henv):
+    """C1 and C6: a handler (on the writer) that logs through hostlog and calls public host methods: the writer waits
+    for nothing, nothing deadlocks, and the inner lines are written after the outer one."""
+    from agent_comms import session_host
+    open_session(henv)
+    henv.host.send(SID, "go")
+    calls = []
+
+    def act(r):
+        if r.getMessage().startswith("started session") and not calls:
+            calls.append(1)
+            session_host.log.warning("from the handler")
+            henv.host.send(SID, "again")
+            henv.host.state(SID)
+    with _Records(act=act) as rec:
+        done, err, _ = _production(henv.host.tick)
+        assert done.wait(5) and not err, err
+        assert _wait(lambda: "from the handler" in rec.messages())
+    said = rec.messages()
+    outer = next(i for i, m in enumerate(said) if m.startswith("started session"))
+    assert said.index("from the handler") > outer
+
+
+def test_a_thread_holding_a_host_lock_never_waits(env, monkeypatch):
+    """W3/W4: a standalone caller holding a lock of the host-side modules (the runner lock, the cutoff lock, the
+    registry lock) does not wait for a blocked writer when it logs; it waits (bounded) only once it is at depth 0."""
+    import time as _time
+    from agent_comms import hostlog, session_host
+    monkeypatch.setattr(hostlog, "ACK_SECONDS", 0.3)
+    runner = env.node.sessions
+    with _Blocked("blocks the writer") as blocked, _Records(act=blocked):
+        _queue_from_another_thread("blocks the writer")
+        assert blocked.entered.wait(5)
+        for lock in (runner.lock, runner.host._steer_stop_lock, runner.host.groups.lock):
+            with hostlog._cond:
+                hostlog._state["stalled_at"] = None
+            t0 = _time.monotonic()
+            with lock:
+                session_host.log.warning("under the lock")
+                inside = _time.monotonic() - t0
+            assert inside < 0.1, inside
+            assert _time.monotonic() - t0 >= 0.25, "at depth 0, the bounded wait"
+        blocked.release.set()
+
+
+# ---------------------------------------------------------------- static: the lock, thread and construction checks
+
+
+def _lock_problems(rel, tree, reviewed=None):
+    """THE checker (R1, R6, R10): every problem with how a module of the host-side modules builds its locks, as
+    (line, what): a lock, condition, event or semaphore built outside an assignment, `hostlog.HostLock(...)` or a base
+    class, or built in an assignment not on the reviewed list (`reviewed`, default NOT_BOUNDARIES); `threading`
+    aliased or used as a value; `from threading import` of a lock kind or `*`; a bare lock name the module does not
+    define or import from elsewhere; a `return` of a lock built in the function (directly, or through a local it was
+    assigned to)."""
+    import ast
+    reviewed = NOT_BOUNDARIES if reviewed is None else reviewed
+    up = _parents(tree)
+    problems = []
+    elsewhere = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                 and n.module != "threading" for a in n.names}
+    elsewhere |= {n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
+
+    def is_lock(n):
+        return (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "threading"
+                and n.attr in LOCK_KINDS)
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "threading" and a.asname:
+                    problems.append((line, f"threading imported as {a.asname}"))
+        if isinstance(node, ast.ImportFrom) and node.module == "threading":
+            bad = {a.name for a in node.names} & (LOCK_KINDS | {"*"})
+            if bad:
+                problems.append((line, f"from threading import {sorted(bad)}"))
+        if isinstance(node, ast.Name) and node.id in LOCK_KINDS - elsewhere:
+            problems.append((line, f"a bare {node.id}"))
+        if isinstance(node, ast.Name) and node.id == "threading" and not (
+                isinstance(up.get(node), ast.Attribute) and up[node].value is node):
+            problems.append((line, "threading used as a value"))
+        if is_lock(node):
+            parent = up.get(node)
+            call = parent if isinstance(parent, ast.Call) and parent.func is node else None
+            wrapper = up.get(call) if call is not None else None
+            if isinstance(wrapper, ast.Call) and call in wrapper.args and ast.unparse(wrapper.func) in (
+                    "hostlog.HostLock", "HostLock", "threading.Condition"):
+                continue
+            owner = _owner(node, up)
+            if (rel, owner) not in reviewed:
+                problems.append((line, f"{owner} is a lock outside the invariant"))
+        if isinstance(node, (ast.FunctionDef, ast.Lambda)):
+            built = {ast.unparse(t) for n in ast.walk(node) if isinstance(n, ast.Assign)
+                     and any(is_lock(x) for x in ast.walk(n.value)) for t in n.targets}
+            for n in ast.walk(node):
+                if isinstance(n, ast.Return) and n.value is not None and (
+                        any(is_lock(x) for x in ast.walk(n.value)) or ast.unparse(n.value) in built):
+                    problems.append((getattr(n, "lineno", 0), "a function that returns a lock"))
+    return problems
+
+
+def test_every_lock_of_the_host_side_modules_is_built_as_reviewed():
+    """R1, R6 (and R10's checker): in every host-side module, every lock is a boundary (`hostlog.HostLock`) or on the
+    reviewed list of those under which no line can be logged, built in the allowed forms only; the list has no stale
+    entry."""
+    import ast
+    found = set()
+    for rel in HOST_SIDE:
+        tree, path = _module(rel)
+        problems = _lock_problems(rel, tree)
+        assert not problems, [f"{path.name}:{ln}: {what}" for ln, what in problems]
+        up = _parents(tree)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "threading"
+                    and node.attr in LOCK_KINDS and (rel, _owner(node, up)) in NOT_BOUNDARIES):
+                found.add((rel, _owner(node, up)))
+    assert found == set(NOT_BOUNDARIES), set(NOT_BOUNDARIES) - found
+
+
+@pytest.mark.parametrize("src", [
+    "import threading as t\nlock = t.Lock()\n",
+    "from threading import Lock\nlock = Lock()\n",
+    "from threading import *\n",
+    "import threading\nL = threading\nlock = L.RLock()\n",
+    "import threading\ndef make():\n    return threading.Lock()\n",
+    "import threading\ndef make():\n    lock = threading.Lock()\n    return lock\n",
+    "import threading\nclass A:\n    def __init__(self):\n        self.x = threading.Lock()\n",
+    "import threading\nqueue = [threading.Condition()]\n",
+], ids=["alias", "from-import", "star", "value", "factory", "factory-via-local", "unreviewed-attr", "in-a-list"])
+def test_the_checker_refuses_each_way_around_it(src):
+    """R10 (review round 3): the SAME checker the modules are held to refuses each bypass, as source text: an aliased
+    module, `from threading import`, a star import, `threading` as a value, a factory (returning the lock directly or
+    through a local), an unreviewed lock, a lock kept anywhere but an assignment's own value."""
+    import ast
+    assert _lock_problems("fixture.py", ast.parse(src)), src
+
+
+def test_the_checker_accepts_the_reviewed_forms():
+    """R10: what the modules do passes: a boundary, a dataclass factory of one, a reviewed native lock."""
+    import ast
+    src = ("import threading\nfrom . import hostlog\nfrom dataclasses import field\n"
+           "lock = hostlog.HostLock(threading.RLock())\n"
+           "class A:\n    slot: object = field(default_factory=lambda: hostlog.HostLock(threading.RLock()))\n"
+           "    def __init__(self):\n        self.latch = threading.Lock()\n")
+    assert _lock_problems("fixture.py", ast.parse(src), reviewed={("fixture.py", "self.latch")}) == []
+
+
+THREADS = {"hosted-sessions": ("run_forever", "the session loop"),
+           "hosted-sessions-deadlines": ("_watch", "the watchdog"),
+           "hosted-sessions-checkpoints": ("_send_checkpoints", "the checkpoint sender"),
+           "WRITER_NAME": ("_write_loop", "the writer")}
+
+
+def test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread():
+    """W2 and C1: every `threading.Thread(...)` in the host-side modules is on the reviewed list and registers as a
+    lifecycle thread (it never waits for the writer): the loop, the watchdog and the checkpoint sender run their
+    bodies inside `hostlog.enqueue_only()`, the writer registers itself; and `node.run` registers the node's main
+    thread before anything is built or recovered."""
+    import ast
+    found, bodies = {}, {}
+    for rel in HOST_SIDE:
+        tree, path = _module(rel)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                bodies[node.name] = node
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "threading.Thread":
+                kw = {k.arg: k.value for k in node.keywords}
+                name = kw["name"].value if isinstance(kw["name"], ast.Constant) else ast.unparse(kw["name"])
+                found[name] = ast.unparse(kw["target"]).rsplit(".", 1)[-1]
+    assert {n: t for n, (t, _) in THREADS.items()} == found
+    for name, (target, _) in THREADS.items():
+        src = ast.unparse(bodies[target])
+        assert "hostlog.enqueue_only()" in src or "ENQUEUE_ONLY.add(threading.get_ident())" in src, target
+    run = bodies["run"]
+    first = run.body[1] if isinstance(run.body[0], ast.Expr) else run.body[0]
+    assert isinstance(first, ast.With) and ast.unparse(first.items[0].context_expr) == "hostlog.enqueue_only()", \
+        "node.run registers its thread first"
+
+
+def test_no_fork_without_exec_in_the_host_side_modules():
+    """W7: no `os.fork` (nor a fork-starting multiprocessing context) in the host-side modules: the writer thread
+    never has to be accounted for in a forked child (`os.register_at_fork` is not needed)."""
+    for rel in HOST_SIDE:
+        text = _module(rel)[1].read_text()
+        assert "os.fork" not in text and "multiprocessing" not in text, rel
+
+
+# ---------------------------------------------------------------- R3: facts rendered by the writer
+
+
+def test_facts_are_reviewed_integers_rendered_by_the_writer(monkeypatch):
+    """R3 (review round 1; its A3): `hostlog.facts` keeps an exception's type name and, for a known class, an integer
+    read at the call; the WRITER renders them (on its thread, never at the call), and no exception text is read."""
+    import errno as _errno
+    import subprocess
+    import threading
+    import httpx
+    from agent_comms import hostlog, session_host
+    rendered = []
+    real = hostlog._render_facts
+    monkeypatch.setattr(hostlog, "_render_facts",
+                        lambda *a: (rendered.append(threading.current_thread().name), real(*a))[1])
+    req = httpx.Request("POST", "http://secret-host.example/api/nodes/sessions/x?token=SECRET")
+    refused = _errno.ECONNREFUSED
+    cases = [
+        (httpx.HTTPStatusError("SECRET text", request=req, response=httpx.Response(502, request=req)),
+         "HTTPStatusError status=502"),
+        (ConnectionRefusedError(refused, "SECRET text"), f"ConnectionRefusedError errno={refused}"),
+        (OSError("SECRET text"), "OSError"),
+        (subprocess.CalledProcessError(3, ["SECRET", "argv"], output="SECRET"), "CalledProcessError returncode=3"),
+        (httpx.ConnectError("SECRET text", request=req), "ConnectError"),
+        (ValueError("SECRET text"), "ValueError"),
+    ]
+    with _Records() as rec:
+        for e, _ in cases:
+            session_host.log.warning("it failed: %s", hostlog.facts(e))
+    assert rec.messages() == [f"it failed: {want}" for _, want in cases]
+    assert rendered == [hostlog.WRITER_NAME] * len(cases), "rendered once each, by the writer"
+    assert not any("SECRET" in m for m in rec.messages())
+
+
+# ---------------------------------------------------------------- W7: the acceptance matrix (the production policy)
+#
+# Every case runs the node's code under the production policy (`_production`: the registration `node.run` makes), with
+# a line queued beforehand by another lifecycle thread, and a handler that blocks forever (until the test's teardown)
+# or raises on it. The guarantee: the handler changes nothing but log output.
+
+
+def _refused_once(env, kind, code):
+    """A report refused once with `code` at its first rung and taken at the next. `ordinary`: a Claude session's
+    status report, whose modes name the steer pair (no event carries a steer outcome); `steer`: a Claude `next_turn`
+    and a Codex `in_turn`, each in its own report. (runner, the POSTs made, the sessions refused)."""
+    from test_claude_steering import _claude_next_turn_and_codex_steer_pending, _posts, cinit, written
+    from test_hosted_tree import proc_of
+    runner = env.node.sessions
+    if kind == "steer":
+        a, b, runner = _claude_next_turn_and_codex_steer_pending(env)
+        sids = {a, b}
+    else:
+        sid = start(env, "a turn")["session_id"]
+        tick(env)
+        child = proc_of(env, sid)[1]
+        child.emit(cinit(sid, written(child)[-1]["uuid"]))
+        tick(env)
+        assert "held" in runner.host.modes(sid)
+        runner.reported.pop(sid, None)      # (its status goes again)
+        sids = {sid}
+    refused = set()
+
+    def refuse(path, body):
+        sid = path.rsplit("/", 1)[-1]
+        if sid in sids and sid not in refused and (kind == "steer" or "held" in (body.get("modes") or [])):
+            refused.add(sid)
+            return code
+        return None
+    return runner, _posts(runner, refuse), sids
+
+
+@pytest.mark.parametrize("mode", ["blocks", "raises", "reenters"])
+@pytest.mark.parametrize("code", [400, 422])
+@pytest.mark.parametrize("kind", ["ordinary", "steer"])
+def test_w7_1_a_refused_reports_retry_and_final_report_go_whatever_a_handler_does(env, kind, code, mode):
+    """W7.1 (R1's matrix): a report refused with 400 or 422 is sent again at its next rung and the final report goes,
+    whatever the handler does with the refusal's line (blocks, raises, re-enters `_flush` from the writer); every
+    handler entry is on the writer thread, holding no lock of the host-side modules."""
+    runner, seen, sids = _refused_once(env, kind, code)
+    reentered = []
+    with _Blocked("the hub refused the report", "raises" if mode == "raises" else "blocks") as blocked:
+        act = blocked
+        if mode == "reenters":
+            def act(r):
+                if "the hub refused the report" in r.getMessage() and not reentered:
+                    reentered.append(runner._flush())
+        with Guard(runner=runner) as g, _Records(act=act):
+            _queue_from_another_thread()
+            done, err, out = _production(runner._flush)
+            assert done.wait(10) and not err, err
+            assert out == [True]
+            if mode == "reenters":
+                assert _wait(lambda: reentered == [True]), "a handler that re-enters `_flush` does not deadlock"
+            blocked.release.set()
+    assert [p for p, _ in seen].count(next(iter(sids))) == 2, "the retry went"
+    assert not [x for x, _ in runner.pending if x in sids], "the final report went"
+    assert not g.violations, g.violations
+
+
+def test_w7_2_a_failed_checkpoint_neither_holds_the_sender_nor_the_loop(env):
+    """W7.2 (the amendment's A4, now for the loop too): the checkpoint POST fails with a blocking handler installed:
+    the sender returns without entering it; the loop's passes go on; the watchdog's SIGTERM and SIGKILL go; the
+    handler is entered by the writer only."""
+    import threading
+    import httpx
+    runner = env.node.sessions
+    a, ca, n, s_uuid = claude_steered(env)
+    b, cb, mb = _ordinary_turn_in_flight(env, project=P2)
+    cb.exits_on_terminate = False
+    real = runner.client.request
+    failed = threading.Event()
+
+    def request(method, url, *x, **kw):
+        if (kw.get("json") or {}).get("held") is not None:
+            failed.set()
+            raise httpx.ConnectError("the hub is away")
+        return real(method, url, *x, **kw)
+    runner.client.request = request
+    with _Blocked("was not taken") as blocked, _Records(act=blocked):
+        runner.start_checkpoint_sender()
+        try:
+            ca.emit(cresult(a, n, text="N's reply"))
+            for _ in range(2):
+                done, err, _ = _production(lambda: tick(env))
+                assert done.wait(10) and not err, err
+            assert failed.wait(5) and blocked.entered.wait(5)
+            assert blocked.where == ["hostlog-writer"], "entered by the writer, not the sender"
+            assert _wait(lambda: runner.checkpoint_thread.is_alive() and not runner.checkpoint_queue)
+            done, err, _ = _production(lambda: tick(env))
+            assert done.wait(5) and not err, "the loop's next pass goes on with the handler blocked"
+            env.clock.advance(runner.self_stop_seconds + 1)
+            _on_watch_thread(runner.enforce_deadlines)
+            assert cb.terminated, "the watchdog's SIGTERM"
+            env.clock.advance(runner.host.kill_grace + 1)
+            _on_watch_thread(runner.enforce_deadlines)
+            assert cb.killed, "and its SIGKILL"
+        finally:
+            blocked.release.set()
+            runner.stopping.set()
+            runner.checkpoint_thread.join(5)
+
+
+def _stubborn_pair(senv):
+    """A session process and an ordinary run that both ignore SIGTERM; their SIGKILL times on the node's clock from
+    now: (node, session child, run child, kills)."""
+    from agent_comms.node import _Local
+    from test_dispatch import FakeChild
+    from test_hosted_sessions import children
+    from test_session_host import FakeSessionChild
+    node = senv.node
+    node.session_spawner.child = lambda pid: FakeSessionChild(pid, exits_on_terminate=False)
+    start(senv, "a turn")
+    tick(senv)
+    [session_child] = children(senv)
+    run_child = FakeChild(5000, exits_on_terminate=False)
+    node.running["run-1"] = _Local("run-1", run_child, senv.clock(), 1800.0, 10.0)
+    t0, kills = senv.clock(), {}
+    for name, child in (("session", session_child), ("run", run_child)):
+        real = child.kill
+        child.kill = lambda _r=real, _n=name: (kills.setdefault(_n, senv.clock() - t0), _r())[1]
+    return node, session_child, run_child, kills
+
+
+@pytest.mark.parametrize("mode", ["blocks", "raises"])
+@pytest.mark.parametrize("when", ["normal", "fallback", "kill_raises"])
+def test_w7_3_shutdown_signals_at_its_times_whatever_a_handler_does(senv, when, mode):
+    """W7.3 (R5, R9): shutdown with a session process and an ordinary run that ignore SIGTERM and a line queued
+    beforehand, under the production policy, with a handler that blocks or raises on it: both SIGTERMs go, and both
+    SIGKILLs AT the grace deadline (10 s of the node's clock, within one 0.2 s wait step). `fallback`: a step raises
+    between TERM and KILL (the `stop_all` fallback; the error propagates). `kill_raises` (R9, the LAST possible KILL):
+    `sessions.kill()` raises before it signals; `quietly` says so, and the sessions' own shutdown kills the
+    survivor."""
+    from agent_comms.node import shut_down
+    node, session_child, run_child, kills = _stubborn_pair(senv)
+    if when == "fallback":
+        real_alive, calls = node.runs_alive, []
+
+        def runs_alive():
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("a shutdown step failed")
+            return real_alive()
+        node.runs_alive = runs_alive
+    if when == "kill_raises":
+        def kill():
+            raise RuntimeError("the sessions' kill failed")
+        node.sessions.kill = kill
+    with _Blocked("a line queued by another thread", mode) as blocked, _Records(act=blocked) as rec:
+        _queue_from_another_thread()
+        done, err, _ = _production(lambda: shut_down(node))
+        assert done.wait(10), "shutdown ended"
+        assert session_child.killed and run_child.killed, ("both SIGKILLs", kills)
+        blocked.release.set()
+    assert session_child.terminated >= 1 and run_child.terminated >= 1
+    assert set(rec.threads) <= {"hostlog-writer"}
+    if when == "fallback":
+        assert [type(e) for e in err] == [RuntimeError], err
+    else:
+        assert not err, err
+    if when == "normal":
+        assert kills["session"] == pytest.approx(10, abs=0.25) and kills["run"] == pytest.approx(10, abs=0.25), kills
+    if when == "kill_raises":
+        assert kills["run"] == pytest.approx(10, abs=0.25), kills
+        assert "hosted sessions: a shutdown step failed" in rec.messages(), "quietly's own line"
+
+
+# ---------------------------------------------------------------- W7.4 to W7.6: the node's own loop (`node.run`)
+#
+# `node.run` is driven on a thread with its outside world replaced: its settings and client, the `Node` it builds
+# (the fixture's), its SIGTERM handler (not installed: the test process keeps its own) and the sessions' threads (not
+# started); its exit (`os._exit`, which the stalled case takes) is recorded instead. SIGTERM is `run`'s `on_term`,
+# which only raises KeyboardInterrupt in the thread running the loop, at the point it is executing: the test raises
+# it at that same point (the hub call the loop waits on, the wait of the shutdown), which is what the signal does.
+
+
+class _Hub:
+    def __init__(self, real, act):
+        self.real, self.act = real, act
+
+    def request(self, method, path, **kw):
+        out = self.act(method, path)
+        if out is not None:
+            return out
+        return self.real.request(method, path, **kw)
+
+
+def _run_node(senv, monkeypatch, act, poll=0.01):
+    """`node.run` on its own thread with the fixture's node, a hub client doing `act(method, path)`: (done, errors,
+    exits)."""
+    import threading
+    from types import SimpleNamespace
+    import httpx
+    from agent_comms import config as config_mod
+    from agent_comms import hostlog
+    from agent_comms import node as node_mod
+    node = senv.node
+    node.client = _Hub(node.client, act)
+    monkeypatch.setattr(node_mod, "log_to_stderr", lambda: None)
+    monkeypatch.setattr(config_mod.Settings, "load", classmethod(lambda cls, *a, **k: SimpleNamespace(dispatch={})))
+    monkeypatch.setattr(config_mod, "home", lambda: senv.tmp)
+    monkeypatch.setattr(node_mod, "DispatchConfig", SimpleNamespace(from_dict=lambda *a, **k: node.config))
+
+    class Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(node_mod, "httpx", SimpleNamespace(Client=Client, HTTPError=httpx.HTTPError,
+                                                           HTTPStatusError=httpx.HTTPStatusError,
+                                                           Timeout=httpx.Timeout))
+    monkeypatch.setattr(node_mod, "Node", lambda *a, **k: node)
+    monkeypatch.setattr(node_mod.signal, "signal", lambda *a, **k: None)
+    monkeypatch.setattr(node_mod, "EXIT_FLUSH_SECONDS", 0.3, raising=False)
+    exits = []
+    monkeypatch.setattr(node_mod.os, "_exit", lambda status: exits.append(status))
+    if node.sessions is not None:
+        monkeypatch.setattr(node.sessions, "start", lambda: None)
+    done, err, registered = threading.Event(), [], []
+
+    def run():
+        try:
+            real_recover = node.recover
+
+            def recover():
+                registered.append(threading.get_ident() in hostlog.ENQUEUE_ONLY)
+                return real_recover()
+            node.recover = recover
+            node_mod.run("http://hub", "token", poll_seconds=poll)
+        except BaseException as e:      # noqa: BLE001 (the test reads it)
+            err.append(e)
+        finally:
+            done.set()
+    threading.Thread(target=run, daemon=True).start()
+    return done, err, exits, registered
+
+
+def _assignments(path):
+    return path.startswith("/api/nodes/assignments")
+
+
+@pytest.mark.parametrize("mode", ["blocks", "raises"])
+@pytest.mark.parametrize("where", ["hub_call", "hub_unreachable"])
+def test_w7_4_a_sigterm_that_ends_the_nodes_loop_starts_its_shutdown(senv, monkeypatch, where, mode):
+    """W7.4 (R8): SIGTERM arrives (a) while a pass waits on a hub call, with a line of that pass queued, or (c)
+    between passes, right after the loop's own `hub unreachable` line, with a handler that blocks forever or raises
+    on that line: `run` registered its thread before recovery, `shut_down` starts, both processes get their SIGTERM
+    and their SIGKILL AT the grace deadline, and the loop's thread never entered the handler."""
+    import httpx
+    from agent_comms import node as node_mod
+    node, session_child, run_child, kills = _stubborn_pair(senv)
+    calls = []
+
+    def act(method, path):
+        if method != "GET" or not _assignments(path):
+            return None
+        calls.append(1)
+        if where == "hub_call":
+            node_mod.log.warning("a line of the pass")
+            raise KeyboardInterrupt         # (SIGTERM, while the pass waits on this call)
+        if len(calls) == 1:
+            raise httpx.ConnectError("the hub is away")      # ("hub unreachable", the loop's own line)
+        raise KeyboardInterrupt             # (SIGTERM, at the next pass)
+    text = "a line of the pass" if where == "hub_call" else "hub unreachable"
+    with _Blocked(text, mode) as blocked, _Records(act=blocked) as rec:
+        _queue_from_another_thread()
+        done, err, exits, registered = _run_node(senv, monkeypatch, act)
+        assert done.wait(15), "run ended"
+        assert session_child.killed and run_child.killed, kills
+        blocked.release.set()
+    assert registered == [True], "the node's thread is a lifecycle thread from before its recovery"
+    assert not err, err
+    assert kills["session"] == pytest.approx(10, abs=0.25) and kills["run"] == pytest.approx(10, abs=0.25), kills
+    assert set(rec.threads) <= {"hostlog-writer"}
+    assert exits in ([], [0]), exits
+
+
+def _second_sigterm(senv, monkeypatch, blocked_mode):
+    """A first SIGTERM at a pass's hub call, a second one during the shutdown's grace wait: what is signalled, and
+    when (the node's clock), with the writer blocked or free."""
+    node, session_child, run_child, kills = _stubborn_pair(senv)
+    real_sleep, slept = node.sleep, []
+
+    def sleep(s):
+        slept.append(s)
+        if len(slept) == 3:
+            raise KeyboardInterrupt         # (the second SIGTERM, during the grace wait)
+        return real_sleep(s)
+    node.sleep = sleep
+
+    def act(method, path):
+        if method == "GET" and _assignments(path):
+            raise KeyboardInterrupt         # (the first SIGTERM)
+        return None
+    with _Blocked("a line queued by another thread", "blocks" if blocked_mode else "raises") as blocked, \
+            _Records(act=blocked if blocked_mode else None):
+        _queue_from_another_thread()
+        done, err, exits, _ = _run_node(senv, monkeypatch, act)
+        assert done.wait(15)
+        blocked.release.set()
+    return ((session_child.terminated, session_child.killed, run_child.terminated, run_child.killed), dict(kills),
+            [type(e) for e in err])
+
+
+def test_w7_4_a_second_sigterm_during_cleanup_behaves_the_same_with_a_blocked_writer(senv, monkeypatch, tmp_path):
+    """W7.4 and C6: a second SIGTERM during the shutdown's grace wait: what is signalled, when, and what escapes
+    `run` are the same with the writer blocked in a handler as with it free (no more than main asks)."""
+    blocked = _second_sigterm(senv, monkeypatch, True)
+    from test_hosted_sessions import session_env
+    from agent_comms import hostlog
+    hostlog._reset()
+    (tmp_path / "again").mkdir()
+    other = session_env(tmp_path / "again")
+    monkeypatch.undo()
+    free = _second_sigterm(other, monkeypatch, False)
+    assert blocked == free, (blocked, free)
+    signals, kills, err = blocked
+    assert signals[1] and signals[3], "both SIGKILLs"
+
+
+def test_w7_4_the_loops_other_exits_stop_the_sessions_whatever_a_handler_does(senv, monkeypatch):
+    """W7.4: the loop ends by `SystemExit` (or any exception but an interrupt) at a pass's hub call, with a line of
+    that pass queued and a handler that blocks forever on it: the sessions' processes are stopped (SIGTERM, then
+    SIGKILL at the grace deadline) and the exception escapes `run` as on main."""
+    from agent_comms import node as node_mod
+    node, session_child, run_child, kills = _stubborn_pair(senv)
+
+    def act(method, path):
+        if method == "GET" and _assignments(path):
+            node_mod.log.warning("a line of the pass")
+            raise SystemExit(4)
+        return None
+    with _Blocked("a line of the pass") as blocked, _Records(act=blocked):
+        done, err, exits, _ = _run_node(senv, monkeypatch, act)
+        assert done.wait(15)
+        assert session_child.killed, kills
+        blocked.release.set()
+    assert [type(e) for e in err] == [SystemExit] and err[0].code == 4
+    assert kills["session"] == pytest.approx(10, abs=0.25), kills
+
+
+def test_w7_5_an_ordinary_run_that_ignores_sigterm_is_killed_at_its_grace_across_passes(senv, monkeypatch):
+    """W7.5 (cross-pass escalation): an ordinary run times out and ignores its SIGTERM; between passes the loop writes
+    its `hub unreachable` line, and the writer is blocked on a line another thread queued: the next passes go on and
+    the run's SIGKILL goes at its grace deadline (one pass is 5 s of the node's clock here)."""
+    import httpx
     from agent_comms.node import _Local
     from test_dispatch import FakeChild
     node = senv.node
-    a, b = FakeChild(5001, exits_on_terminate=False), FakeChild(5002, exits_on_terminate=False)
-    node.running["run-a"] = _Local("run-a", a, senv.clock(), 1800.0, 10.0)
-    node.running["run-b"] = _Local("run-b", b, senv.clock(), 1800.0, 10.0)
-    _queue_a_line()
-    act, release, entered, at_entry = _blocking_on("a queued line", lambda: (a.terminated, b.terminated, a.killed,
-                                                                             b.killed))
-    with _Records(act=act):
-        done = _in_thread(node.stop_all)
-        try:
-            assert _wait(lambda: a.killed and b.killed, 5), "both SIGKILLs went while the handler was blocked"
-        finally:
-            release.set()
-        assert done.wait(10)
-    assert at_entry == [(1, 1, 1, 1)], at_entry
+    child = FakeChild(5000, exits_on_terminate=False)
+    node.running["run-1"] = _Local("run-1", child, senv.clock(), 1.0, 10.0)
+    term = []
+    real_term = child.terminate
+    child.terminate = lambda: (term.append(senv.clock()), real_term())[1]
+
+    def act(method, path):
+        if method == "GET" and _assignments(path):
+            if child.killed:
+                raise KeyboardInterrupt
+            senv.clock.advance(5)
+            raise httpx.ConnectError("the hub is away")
+        return None
+    with _Blocked("a line queued by another thread") as blocked, _Records(act=blocked):
+        _queue_from_another_thread()
+        killed_at = []
+        real_kill = child.kill
+        child.kill = lambda: (killed_at.append(senv.clock()), real_kill())[1]
+        done, err, exits, _ = _run_node(senv, monkeypatch, act)
+        assert _wait(lambda: child.killed, 10), "the run's SIGKILL went with the writer blocked"
+        assert done.wait(15)
+        blocked.release.set()
+    assert term and killed_at and killed_at[0] - term[0] == pytest.approx(10, abs=5.01), (term, killed_at)
 
 
-def test_a_node_pass_writes_no_line_between_the_runs_it_signals(senv):
-    """R5 (review round 2): a node pass that stops two runs the hub no longer lists (a queued line, a blocking
-    handler): both get their SIGTERM in that pass; the line is not written between them (nor by the pass at all: it
-    has nothing of its own pending), and the next drain that writes everything writes it."""
-    from agent_comms.node import _Local
-    from test_dispatch import FakeChild
+def test_w7_6_recovery_and_start_up_reach_the_sessions_and_the_loop(senv, monkeypatch):
+    """W7.6: a handler blocks forever on a line another thread queued, and the node logs during its own recovery: the
+    sessions' recovery is reached, and the loop's first pass runs."""
+    import threading
+    from agent_comms import node as node_mod
     node = senv.node
-    a, b = FakeChild(5001, exits_on_terminate=False), FakeChild(5002, exits_on_terminate=False)
-    node.running["run-a"] = _Local("run-a", a, senv.clock(), 1800.0, 10.0)
-    node.running["run-b"] = _Local("run-b", b, senv.clock(), 1800.0, 10.0)
-    _queue_a_line()
-    act, release, entered, at_entry = _blocking_on("a queued line", lambda: (a.terminated, b.terminated))
-    with _Records(act=act):
-        done = _in_thread(node.tick)
-        try:
-            assert _wait(lambda: a.terminated and b.terminated, 5), "both SIGTERMs went while the handler was blocked"
-        finally:
-            release.set()
-        assert done.wait(10)
-        assert at_entry in ([], [(1, 1)]), at_entry
-        from agent_comms import hostlog
-        hostlog.drain(everything=True)
-    assert at_entry and at_entry[-1] == (1, 1), at_entry
+    reached, passes = threading.Event(), []
+    real_save = node._save_state
+
+    def save():
+        node_mod.log.warning("a line of the recovery")
+        return real_save()
+    node._save_state = save
+    real_recover = node.sessions.recover
+    node.sessions.recover = lambda: (reached.set(), real_recover())[1]
+
+    def act(method, path):
+        if method == "GET" and _assignments(path):
+            passes.append(1)
+            raise KeyboardInterrupt
+        return None
+    with _Blocked("a line queued by another thread") as blocked, _Records(act=blocked):
+        _queue_from_another_thread()
+        assert blocked.entered.wait(5)
+        done, err, exits, registered = _run_node(senv, monkeypatch, act)
+        assert reached.wait(5), "the sessions' recovery was reached"
+        assert _wait(lambda: passes, 5), "and the loop's first pass"
+        assert done.wait(15)
+        blocked.release.set()
+    assert registered == [True] and not err, err
+
+
+def test_w7_7_the_session_loops_join_expires_and_shutdown_still_signals(env, monkeypatch):
+    """W7.7: at a standalone shutdown the session loop's thread does not end (here: it waits on a hub call); the
+    join expires and every session process still gets its SIGTERM and SIGKILL, with a handler blocked on a line
+    another thread queued."""
+    import threading
+    from agent_comms import node_sessions
+    monkeypatch.setattr(node_sessions, "JOIN_SECONDS", 0.2)
+    runner = env.node.sessions
+    sid, child, m = _ordinary_turn_in_flight(env)
+    child.exits_on_terminate = False
+    stuck = threading.Event()
+    runner.thread = threading.Thread(target=lambda: stuck.wait(30), daemon=True)
+    runner.thread.start()
+    with _Blocked("a line queued by another thread") as blocked, _Records(act=blocked):
+        _queue_from_another_thread()
+        done, err, _ = _production(runner.shutdown)
+        assert done.wait(10) and not err, err
+        assert child.terminated and child.killed
+        blocked.release.set()
+    stuck.set()
+
+
+# ---------------------------------------------------------------- C4: bounded process exit
+
+
+_EXIT_SCRIPT = r"""
+import logging, sys, threading
+from agent_comms import hostlog, node
+stalled = sys.argv[1] == "stalled"
+gate = threading.Event()
+
+class Stuck(logging.Handler):
+    def emit(self, record):
+        if stalled:
+            gate.wait()             # holds the handler's own lock for good (Handler.handle takes it)
+
+    def close(self):
+        print("closed by logging.shutdown", flush=True)
+        super().close()
+
+logging.getLogger("agent_comms").addHandler(Stuck())
+logging.getLogger("agent_comms").setLevel(logging.INFO)
+with hostlog.enqueue_only():
+    node.log.warning("a line")
+    print("signals sent", flush=True)
+    node._exit_if_stalled(3 if stalled else 0)
+print("returned normally", flush=True)
+"""
+
+
+@pytest.mark.parametrize("case", ["stalled", "free"])
+def test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock(tmp_path, case):
+    """C4: a SUBPROCESS runs the node's exit path (`node._exit_if_stalled`, after its signals) with a handler that
+    blocks forever while holding its own lock: it ends within the bound with the status it would have had (here 3),
+    skipping `logging.shutdown()`; with nothing stalled it returns and exits normally, `logging.shutdown()` closing the
+    handler."""
+    import subprocess
+    import sys
+    import time as _time
+    script = tmp_path / "exit.py"
+    script.write_text(_EXIT_SCRIPT)
+    t0 = _time.monotonic()
+    r = subprocess.run([sys.executable, str(script), case], capture_output=True, text=True, timeout=30,
+                       cwd=str(tmp_path), env={**__import__("os").environ,
+                                               "PYTHONPATH": str(__import__("pathlib").Path(__file__).parents[1])})
+    took = _time.monotonic() - t0
+    lines = r.stdout.splitlines()
+    if case == "stalled":
+        assert r.returncode == 3 and lines == ["signals sent"], (r.returncode, r.stdout, r.stderr)
+        assert took < 10, took
+    else:
+        assert r.returncode == 0 and lines == ["signals sent", "returned normally", "closed by logging.shutdown"], (
+            r.returncode, r.stdout, r.stderr)

@@ -1,6 +1,6 @@
-"""The dynamic guard of the host-side logging invariant (DESIGN_NOTES "Host-side logging"): no log handler is entered,
-and nothing is formatted, while the calling thread holds a host lock (the runner lock, the cutoff lock, the registry
-lock).
+"""The dynamic guard of host-side logging (DESIGN_NOTES "Host-side logging: one writer"): a log handler is entered only
+on the writer thread, and never by a thread that holds a lock of the host-side modules (the runner lock, the cutoff
+lock, the registry lock, the report lock, the ack lock, a steer attempt's record lock).
 
 `Guard` instruments the three locks of a host (and of its runner, when there is one) so each knows whether the CALLING
 thread owns it, and puts a handler on the package's logger that records, at every entry, which of them the entering
@@ -115,6 +115,9 @@ class Guard:
                 if guard.host is not None and any(s.steer is not None and s.steer.lock._is_owned()
                                                   for s in list(guard.host.sessions.values())):
                     held.append("slot")
+                if hostlog is not None and hasattr(hostlog, "WRITER_NAME") and (
+                        threading.current_thread().name != hostlog.WRITER_NAME):
+                    held.append("not the writer thread")    # (one writer: the only thread that enters a handler)
                 guard.seen.append((rec.name, rec.getMessage(), held))
                 if held:
                     guard.violations.append((rec.getMessage(), held))
@@ -132,5 +135,7 @@ class Guard:
         return self
 
     def __exit__(self, *a):
+        if hostlog is not None and hasattr(hostlog, "flush"):
+            hostlog.flush(10)       # (the writer has written what the route queued)
         self.logger.removeHandler(self.handler)
         self.logger.setLevel(self.level)

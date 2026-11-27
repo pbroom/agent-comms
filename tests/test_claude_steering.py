@@ -4287,6 +4287,8 @@ class _StallingHandler:
 
     def __exit__(self, *a):
         self.release.set()
+        from agent_comms import hostlog
+        hostlog.flush(10)       # (the one writer has written what was queued)
         self.logger.removeHandler(self.handler)
         self.logger.setLevel(self.level)
 
@@ -4565,7 +4567,7 @@ def test_r7_a2_stop_all_on_a_watchdog_thread_writes_no_line_there(henv, monkeypa
         assert done.wait(10) and not err, err
         assert seen == [True]
         assert not [th for _, th, _ in h.seen if th == ident[0]], "no handler on the watchdog's thread"
-        hostlog.drain(everything=True)
+        hostlog.flush(10)
         assert [m for _, th, m in h.seen if "the steer into message" in m and th != ident[0]], "written elsewhere"
 
 
@@ -4616,7 +4618,7 @@ def test_r7_a3_a_deferred_line_carries_the_exception_type_only(env):
     lg = logging.getLogger("agent_comms")
     lg.addHandler(h)
     try:
-        assert hostlog.drain(everything=True)
+        assert hostlog.flush(10)
     finally:
         lg.removeHandler(h)
     [(msg, text)] = [x for x in got if "something failed" in x[0]]
@@ -4625,21 +4627,39 @@ def test_r7_a3_a_deferred_line_carries_the_exception_type_only(env):
 
 
 def test_r7_3_the_deferred_queue_counts_what_it_drops(env):
-    """Ruling R7-3: more lines than the queue holds are logged on a watchdog thread: the next drain says, in one line,
-    how many were dropped."""
+    """Ruling R7-3 (host-side logging, one writer: the queue overflows only while the writer is held up): with the
+    writer blocked in a handler, more lines than the queue holds are logged on a watchdog thread: when the writer
+    resumes it says, in one line, how many were dropped, then writes the rest in order."""
+    import logging
+    import threading
     from agent_comms import hostlog, node_sessions
     n = hostlog.QUEUE_MAX + 7
+    gate, entered = threading.Event(), threading.Event()
 
-    def logs():
-        for i in range(n):
-            node_sessions.log.warning("line %d", i)
-    t, done, ident, err = _on_watchdog(None, fn=logs)
-    assert done.wait(10) and not err, err
-    with _StallingHandler(seconds=0) as h:
-        hostlog.drain(everything=True)
+    class Blocks(logging.Handler):
+        def emit(self, record):
+            if record.getMessage() == "blocks":
+                entered.set()
+                gate.wait(30)
+    blocks = Blocks()
+    logging.getLogger("agent_comms").addHandler(blocks)
+    try:
+        with _StallingHandler(seconds=0) as h:
+            t, done, ident, err = _on_watchdog(None, fn=lambda: node_sessions.log.warning("blocks"))
+            assert done.wait(5) and entered.wait(5)
+
+            def logs():
+                for i in range(n):
+                    node_sessions.log.warning("line %d", i)
+            t, done, ident, err = _on_watchdog(None, fn=logs)
+            assert done.wait(10) and not err, err
+            gate.set()
+    finally:
+        gate.set()
+        logging.getLogger("agent_comms").removeHandler(blocks)
     lines = [m for _, _, m in h.seen]
-    assert lines[0] == "7 deferred log line(s) were dropped: the queue was full", lines[:2]
-    assert lines[1] == "line 7" and lines[-1] == f"line {n - 1}" and len(lines) == hostlog.QUEUE_MAX + 1
+    assert lines[1] == "7 deferred log line(s) were dropped: the queue was full", lines[:3]
+    assert lines[2] == "line 7" and lines[-1] == f"line {n - 1}" and len(lines) == hostlog.QUEUE_MAX + 2
 
 
 # ---------------------------------------------------------------- review round 8

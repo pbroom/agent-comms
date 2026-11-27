@@ -1,12 +1,10 @@
-"""Host-side logging (DESIGN_NOTES "Host-side logging"): the package-owned logger of the session host, the node's
-session runner, the process-group registry, the node and the providers.
+"""Host-side logging (DESIGN_NOTES "Host-side logging", and "Host-side logging: one writer", which supersedes the
+caller-thread drain): the package-owned logger of the session host, the node's session runner, the process-group
+registry, the node and the providers.
 
-THE invariant: no log handler runs, and nothing is formatted, while the calling thread holds ANY lock of the
-host-side modules under which a line can be logged (review round 1, R1: the runner lock, the cutoff lock, the
-registry lock, the report lock, the acknowledgement lock, each steer attempt's record lock; DESIGN_NOTES has the
-table, and tests/test_hostlog.py a static check over every lock constructed there), on any thread, for any host-side
-line. Nothing process-wide is patched: `logging` is used as it is, through its loggers' own level checks and
-handlers, under the same logger names.
+THE guarantee: a log handler that blocks forever, or raises, changes nothing but log output: every signal, report,
+save and return of the host-side code happens at its time. Nothing process-wide is patched: `logging` is used as it
+is, through its loggers' own level checks and handlers, under the same logger names.
 
 - A line is a deferred record, made AT THE CALL (`HostLogger`): a snapshot of reviewed fields only (`_Record`): the
   wall time, the thread, the logger's name, the level (a line the logger would not emit is not kept: the level is
@@ -14,33 +12,26 @@ handlers, under the same logger names.
   lookup, and the arguments reduced there: `str`, `int`, `float`, `bool` and `None` kept (also as the values of a
   copied `%`-mapping), any other object replaced by its type's name; a value rendered later (`facts`: an
   exception's reviewed integers; `later`: a reviewed function of reduced values) is kept as it is and rendered by the
-  writer, never at the call. An exception is kept as its type's name and its
-  traceback's (file, line, function) triples: no exception text, no source lines, no locals. Nothing of the caller's
-  objects is held, so nothing is formatted later from an object that has changed since, or runs code of its own.
-- The records go into ONE queue (bounded: the oldest goes first when it is full, and the next drain says once how
-  many went) and are written, in the order they were queued, by THE drain (`drain`): on the calling thread, when it
-  leaves its OUTERMOST boundary (`BOUNDARY`: depth 0 again), whether it returns or raises. The writer makes a real
-  `logging.LogRecord` (its time and caller the call's) and hands it to the logger's handlers, one by one: a handler
-  that raises is caught and the next goes on; nothing reaches the host's code.
-- The boundaries, and so the per-thread depth, are kept in ONE place: `BOUNDARY` (a context manager, and `entry`, a
-  decorator: every public method of the session host), entered by every host lock as it is taken (`HostLock`: the
-  runner lock, the cutoff lock, the registry lock). A thread that holds a host lock is therefore always inside a
-  boundary, and the drain, which runs only at depth 0, never runs under one. A line logged with no boundary open is
-  its own: queued and drained at once. Leaving a host lock at depth 0 writes everything queued (so the loop writes
-  the watchdog's lines when it lets go of the runner lock); any other exit writes only when the thread has a record
-  of its own pending (an entry point that logged nothing writes and waits for nothing).
-- ONE predicate says whether a thread may drain (`may_drain`): it is inside no boundary and it is not enqueue-only.
-  Every background thread the node starts (review round 1, R2: the deadline watchdog, the checkpoint sender) is
-  enqueue-only (`enqueue_only`, registered in `ENQUEUE_ONLY`): its records wait for the loop (or a standalone caller).
-  A drain on a thread that is already draining (a handler that logs, or that calls back into the host) leaves what it
-  adds to that ACTIVE drainer, which writes until the queue is empty: it never waits on itself. While another thread
-  drains, a thread waits for nothing if it has no record of its own pending, and otherwise only for its own records,
-  for at most WAIT_SECONDS; then it returns, and the active drainer writes them. It waits holding no lock of the
-  host-side modules (it is at depth 0) and none of this module's: no cycle is possible. The serialization is the
-  drainer's turn (`_state["drainer"]`), taken and handed back under the queue's own short lock (a native lock, never a
-  boundary); a handler may call back into the host from the active drainer's thread, which cannot deadlock for the
-  reason just given. When the loop itself writes into a handler that blocks, it blocks there, outside every lock, as a
-  synchronous log call would (no separate writer thread).
+  writer, never at the call. An exception is kept as its type's name and its traceback's (file, line, function)
+  triples: no exception text, no source lines, no locals. Nothing is formatted at the call.
+- ONE queue (bounded: the oldest goes first when it is full, the writer says once how many went) and ONE writer: a
+  daemon thread ("hostlog-writer"), started at the first record and started again if it is found dead. It is the
+  ONLY thread that ever enters a handler, a filter or a formatter (`_write`), in queue order (the enqueue order). It
+  holds no lock of the host-side modules, ever. A handler that raises is skipped (per handler); nothing a handler
+  raises ends the writer; the record in flight counts as attempted and is never written again.
+- Who waits for the writer. A LIFECYCLE thread never does (`ENQUEUE_ONLY`, registered with `enqueue_only()`; ONE
+  predicate, `may_wait`): the node's main thread for the whole of `node.run` (registered before anything is built or
+  recovered), the session loop, the deadline watchdog, the checkpoint sender, and the writer itself (a handler that
+  logs, or calls back into the host, enqueues and returns). A STANDALONE caller (a test, a command calling the host
+  directly) waits, when it leaves its outermost boundary at depth 0 (never while it holds a lock of the host-side
+  modules: every such lock is a boundary, `HostLock`), for the writer to have attempted ITS OWN last record, for at
+  most ACK_SECONDS (`_acknowledge`): a public call returns with its lines with the handlers (caplog) in the
+  uncontended case. Best effort by statement: a stall latch (a wait that times out marks the writer stalled at the
+  completion sequence it saw; nobody waits again until a LATER completion), and a record the bound evicted is
+  resolved as dropped at once.
+- `flush(timeout)`: a bounded wait for the queue to be empty and the writer idle, entering no handler. `node.run` makes
+  ONE final bounded wait after the last signal and report (`final_flush`), and `atexit` uses what is left of it; a
+  node whose writer is still stalled then ends without waiting for the handler (`node.run`).
 """
 from __future__ import annotations
 
@@ -54,18 +45,25 @@ from collections import deque
 from contextlib import contextmanager
 from typing import Any, Callable
 
-# (Review round 1, R2) The threads that never drain: every background thread the node starts (`enqueue_only`). Their
-# records wait for the loop. (session_host's WATCH_THREADS is another registry, for saves and transcript lines only.)
+# The lifecycle threads: they never wait for the writer (`enqueue_only`, `may_wait`). (session_host's WATCH_THREADS
+# is another registry, for saves and transcript lines only.)
 ENQUEUE_ONLY: set[int] = set()
-QUEUE_MAX = 2000        # records kept for the drain at most; the oldest goes first (said once at the next drain)
-WAIT_SECONDS = 2.0      # the most a thread waits for its own records while another thread drains (A2)
+QUEUE_MAX = 2000        # records kept at most; the oldest goes first (the writer says once how many went)
+ACK_SECONDS = 2.0       # the most a standalone caller waits for its own last record (`_acknowledge`)
+WRITER_NAME = "hostlog-writer"
 
-_local = threading.local()      # `depth`: the boundaries this thread is inside
-# The queue's own lock: held only to append, to pop, and to hand the drainer's turn over, never across a handler, a
-# host call or a wait on anything else (a wait on this condition lets it go).
+_local = threading.local()      # `depth`: the boundaries this thread is inside; `last`: its last record's sequence
+# The queue's own lock: held only to append, to pop and to note a completion, never across a handler, a host call or
+# a wait on anything else (a wait on this condition lets it go). A native lock, never a boundary.
 _cond = threading.Condition(threading.Lock())
 _queue: deque = deque()
-_state = {"seq": 0, "done": 0, "dropped": 0, "drainer": None}
+# seq: the last record queued; done: the last one the writer attempted; evicted: the last one the bound let go;
+# dropped: how many went since the writer last said so; busy: the record the writer is writing, or None; stalled_at:
+# the completion sequence a timed-out wait saw (the stall latch), or None; gen: the writer's generation (tests only
+# change it, to leave a writer a test blocked for good); exit_deadline: `final_flush`'s bound, shared with `atexit`.
+_state: dict = {"seq": 0, "done": 0, "evicted": 0, "dropped": 0, "busy": None, "stalled_at": None, "gen": 0,
+                "exit_deadline": None}
+_writer: list = [None]
 _TYPE_NAME = type.__dict__["__name__"]      # a type's own name, read with no code of the object's own
 
 
@@ -78,7 +76,8 @@ def _type_name(v: Any) -> str:
 
 class _Boundary:
     """Entered and left in this one place: the depth goes up on entry and down on exit; leaving the outermost one
-    (depth 0 again) drains, on the thread that leaves it, whether its body returned or raised."""
+    (depth 0 again) is where a standalone caller waits for its own lines (`_acknowledge`), whether its body returned
+    or raised. A lifecycle thread waits for nothing there."""
 
     def __enter__(self) -> "_Boundary":
         _local.depth = getattr(_local, "depth", 0) + 1
@@ -88,16 +87,13 @@ class _Boundary:
         self.leave()
         return False
 
-    def leave(self, everything: bool = False) -> None:
-        """The exit: at depth 0 again, the drain (`everything`: a host lock let go, whose holder writes what any
-        thread queued, the watchdog's records included; otherwise the drain writes only when this thread has a record
-        of its own not yet written, so an entry point that logged nothing, such as `attempts` under the node's ack
-        lock, never writes or waits for other threads' lines)."""
+    def leave(self) -> None:
+        """The exit: at depth 0 again, a standalone caller's bounded acknowledgement of its own last record."""
         depth = getattr(_local, "depth", 0) - 1
         _local.depth = depth if depth > 0 else 0
         if depth <= 0:
             try:
-                drain(everything=everything)
+                _acknowledge()
             except Exception:       # (never into the host's code)
                 pass
 
@@ -132,7 +128,8 @@ def entries(cls: type) -> type:
 
 @contextmanager
 def enqueue_only():
-    """The calling thread never drains while inside (a background thread's whole body): its records wait."""
+    """The calling thread is a lifecycle thread while inside (a background thread's whole body; `node.run`'s): it
+    only enqueues, and never waits for the writer."""
     me = threading.get_ident()
     was = me in ENQUEUE_ONLY
     ENQUEUE_ONLY.add(me)
@@ -143,16 +140,16 @@ def enqueue_only():
             ENQUEUE_ONLY.discard(me)
 
 
-def may_drain() -> bool:
-    """THE predicate (review round 1, R2): the calling thread may drain now: it is inside no boundary (so it holds no
-    lock of the host-side modules) and it is not enqueue-only."""
+def may_wait() -> bool:
+    """THE predicate: the calling thread may wait for the writer now: it is inside no boundary (so it holds no lock of
+    the host-side modules) and it is not a lifecycle thread (the writer is one)."""
     return getattr(_local, "depth", 0) == 0 and threading.get_ident() not in ENQUEUE_ONLY
 
 
 class HostLock:
     """A lock of the host-side modules under which a line can be logged (the runner lock, the cutoff lock, the
     registry lock, the report lock, the acknowledgement lock, a steer attempt's record lock): taking it enters a
-    boundary, letting it go leaves that boundary, so no drain (no handler) can run on a thread while it holds one.
+    boundary, letting it go leaves that boundary, so no thread ever waits for the writer while it holds one.
     The lock's own semantics are the wrapped lock's (a Lock, or an RLock, re-entered as such: each acquisition enters
     the boundary once, each release leaves it once). It is NOT a general replacement for a lock: it has no
     `_release_save`/`_acquire_restore`, so a `threading.Condition` must not be built on it (a Condition of the
@@ -176,7 +173,7 @@ class HostLock:
 
     def release(self) -> None:
         self._lock.release()
-        BOUNDARY.leave(everything=True)
+        BOUNDARY.leave()
 
     def __enter__(self) -> bool:
         return self.acquire()
@@ -358,14 +355,17 @@ def _keep(name: str, level: int, msg: Any, args: tuple, exc_info: Any, extra: An
         _state["seq"] += 1
         r.seq = _local.last = _state["seq"]
         if len(_queue) >= QUEUE_MAX:
-            _queue.popleft()
+            gone = _queue.popleft()
             _state["dropped"] += 1
+            _state["evicted"] = max(_state["evicted"], gone.seq)
         _queue.append(r)
+        _ensure_writer()
+        _cond.notify_all()
 
 
 class HostLogger:
     """A host-side module's logger: `logging.getLogger(name)`'s level checks and handlers, with every line made into
-    a deferred record at the call and written by the drain (the module text). The API is the part of
+    a deferred record at the call and written by the writer (the module text). The API is the part of
     `logging.Logger`'s the host uses."""
 
     def __init__(self, name: str) -> None:
@@ -382,7 +382,7 @@ class HostLogger:
         if not isinstance(level, int):
             raise TypeError("level must be an integer")
         if self.logger.isEnabledFor(level):
-            with BOUNDARY:          # (a line logged outside every boundary is its own: drained when this exits)
+            with BOUNDARY:          # (a line logged outside every boundary is its own boundary)
                 _keep(self.name, level, msg, args, exc_info, extra, stacklevel)
 
     def debug(self, msg: Any, *args, **kw) -> None:
@@ -450,77 +450,109 @@ def _write(r: _Record) -> None:
             if rec.levelno >= h.level:
                 try:
                     h.handle(rec)
-                except Exception:       # (one handler's failure never stops the others, nor the drain)
+                except BaseException:   # (one handler's failure never stops the others: this is the writer's thread)
                     pass
         c = c.parent if c.propagate else None
     if found == 0 and logging.lastResort is not None and rec.levelno >= logging.lastResort.level:
         try:
             logging.lastResort.handle(rec)
-        except Exception:
+        except BaseException:
             pass
 
 
-def drain(everything: bool = False, timeout: float | None = None, wait_all: bool = False) -> bool:
-    """THE drain: every queued record written, in queue order, on this thread; called when a thread leaves its
-    outermost boundary (and by `atexit`). Only where `may_drain` says so, and never nested on the active drainer's own
-    thread (what is added meanwhile is that drainer's to write). With no drainer active it writes when it has a record
-    of its own pending, or always (`everything`: a host lock let go, so the loop writes what the background threads
-    queued). With another drainer active it waits for nothing if it has no record of its own pending (`wait_all`: for
-    every record queued before the call, `atexit`'s), else for those, for at most `timeout` (WAIT_SECONDS), and then
-    returns: the active drainer writes them. Never raises. True: what it waited for is written."""
-    if not may_drain():
+def _ensure_writer() -> None:
+    """(Under `_cond`.) THE writer is running: started if there is none or it is found dead. One at a time."""
+    w = _writer[0]
+    if w is None or not w.is_alive():
+        w = threading.Thread(target=_write_loop, args=(_state["gen"],), name=WRITER_NAME, daemon=True)
+        _writer[0] = w
+        w.start()
+
+
+def _write_loop(gen: int) -> None:
+    """The writer: every record, in queue order, handed to the handlers; never waits for anyone (a lifecycle thread);
+    holds no lock of the host-side modules. Nothing a handler raises ends it."""
+    ENQUEUE_ONLY.add(threading.get_ident())
+    while True:
+        with _cond:
+            while gen == _state["gen"] and not _queue and not _state["dropped"]:
+                _cond.wait()
+            if gen != _state["gen"]:
+                return
+            dropped, _state["dropped"] = _state["dropped"], 0
+            if dropped:
+                r = _Record()
+                r.seq, r.created, r.name, r.level = 0, time.time(), __name__, logging.WARNING
+                me = threading.current_thread()
+                r.thread, r.thread_name = me.ident, me.name
+                r.msg, r.args = "%d deferred log line(s) were dropped: the queue was full", (dropped,)
+                r.caller, r.exc, r.extra = ("(hostlog)", 0, "writer"), None, None
+            else:
+                r = _queue.popleft()
+            _state["busy"] = r.seq
+        try:
+            _write(r)
+        except BaseException:       # (the writer is not the main thread: nothing it is handed ends it)
+            pass
+        finally:
+            with _cond:
+                if gen == _state["gen"]:
+                    _state["busy"] = None
+                    if r.seq > _state["done"]:
+                        _state["done"] = r.seq
+                    if _state["stalled_at"] is not None and _state["done"] > _state["stalled_at"]:
+                        _state["stalled_at"] = None     # (a LATER completion: the latch clears)
+                    _cond.notify_all()
+
+
+def _acknowledge() -> bool:
+    """A standalone caller at depth 0: wait, at most ACK_SECONDS, for the writer to have attempted this thread's own
+    last record. Not on a lifecycle thread, not inside a boundary, not while the writer is latched stalled; released at
+    once when that record was evicted by the bound. True: it was attempted (or dropped)."""
+    if not may_wait():
         return False
-    me = threading.get_ident()
-    deadline = time.monotonic() + (WAIT_SECONDS if timeout is None else timeout)
+    target = getattr(_local, "last", 0)
+    deadline = time.monotonic() + ACK_SECONDS
     with _cond:
-        if _state["drainer"] == me:
-            return False        # (nested: the active drainer, on this very thread, writes it)
-        mine = getattr(_local, "last", 0)
-        target = _state["seq"] if wait_all else mine
-        while _state["drainer"] is not None:
-            if _state["done"] >= target:
-                return True     # (its records are written: the active drainer writes the rest)
+        while True:
+            if _state["done"] >= target or _state["evicted"] >= target:
+                return True
+            if _state["stalled_at"] is not None:
+                return False        # (the latch: nobody waits until the writer has made progress)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return False    # (A2: a fixed deadline; the active drainer writes them)
+                _state["stalled_at"] = _state["done"]
+                return False
             _cond.wait(remaining)
-        if (not _queue and not _state["dropped"]) or (not everything and _state["done"] >= target):
-            return True
-        _state["drainer"] = me
-    try:
-        while True:
-            with _cond:
-                dropped, _state["dropped"] = _state["dropped"], 0
-                r = _queue.popleft() if _queue and not dropped else None
-            if dropped:
-                said = _Record()
-                said.seq, said.created, said.name, said.level = 0, time.time(), __name__, logging.WARNING
-                t = threading.current_thread()
-                said.thread, said.thread_name = t.ident, t.name
-                said.msg, said.args = "%d deferred log line(s) were dropped: the queue was full", (dropped,)
-                said.caller, said.exc, said.extra = ("(hostlog)", 0, "drain"), None, None
-                r = said
-            if r is None:
-                return True
-            try:
-                _write(r)
-            except Exception:
-                pass
-            with _cond:
-                if r.seq > _state["done"]:
-                    _state["done"] = r.seq
-                _cond.notify_all()
-    finally:
-        with _cond:
-            _state["drainer"] = None
-            _cond.notify_all()
+
+
+def flush(timeout: float) -> bool:
+    """A bounded wait for the queue to be empty and the writer idle, on any thread; it enters no handler, so the bound
+    is real. True: idle."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _cond:
+        while _queue or _state["dropped"] or _state["busy"] is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _cond.wait(remaining)
+        return True
+
+
+def final_flush(budget: float = 2.0) -> bool:
+    """`node.run`'s ONE final bounded wait, after the last signal and report: `atexit` gets what is left of the same
+    bound. True: the writer is idle (the process may exit normally)."""
+    with _cond:
+        _state["exit_deadline"] = time.monotonic() + budget
+    return flush(budget)
 
 
 def _at_exit() -> None:
-    """Best effort at interpreter exit: what is queued is written, waiting for another drainer for 2 s at most. (The
-    deadline bounds only that wait: a handler this drain itself enters is not interrupted.)"""
+    """At interpreter exit: what is queued gets the writer's time, at most 2 s (or what is left of `final_flush`'s
+    bound). A handler the writer is stuck in is not waited for beyond that (the writer is a daemon thread)."""
     try:
-        drain(everything=True, timeout=2.0, wait_all=True)
+        deadline = _state["exit_deadline"]
+        flush(2.0 if deadline is None else min(2.0, deadline - time.monotonic()))
     except Exception:
         pass
 
@@ -528,10 +560,16 @@ def _at_exit() -> None:
 atexit.register(_at_exit)
 
 
-def _reset() -> None:
-    """(Tests) An empty queue, no drainer, this thread at depth 0."""
+def _reset(idle_seconds: float = 5.0) -> None:
+    """(Tests) The writer idle (bounded), then an empty queue and clear counters, this thread at depth 0. A writer
+    still busy after the bound (a test left a handler blocked) is left behind: a new generation starts a new one."""
+    idle = flush(idle_seconds)
     with _cond:
         _queue.clear()
-        _state.update(done=_state["seq"], dropped=0, drainer=None)
+        if not idle:
+            _state["gen"] += 1
+            _writer[0] = None
+        _state.update(done=_state["seq"], evicted=_state["seq"], dropped=0, busy=None, stalled_at=None,
+                      exit_deadline=None)
         _cond.notify_all()
     _local.depth = _local.last = 0

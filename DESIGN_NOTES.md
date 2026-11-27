@@ -17017,3 +17017,146 @@ feeds each of these bypasses to the checks as source text.
   | `--only correlation` | PASS, 24 |
   | `--only structured` | PASS, 36 |
   | `--only tree` | PASS, 143 |
+
+## Host-side logging: one writer
+
+Review round 3 and Sol's pre-check found the same class a fourth time: a production thread entering a log handler
+at a point where main could not have stalled. The rounds' instances were a fourth lock and a second background
+thread (round 1), between TERM and KILL at shutdown (round 2), and the unwind toward shutdown (round 3). Sol's list
+added more: `run()`'s `except BaseException` branch and a second SIGTERM; the cross-pass TERM→KILL of an ORDINARY run,
+which no lexical boundary covers; `recover()` and start-up; the `atexit` drain hanging in a handler it starts.
+
+The structure changed so that no production thread ever enters a handler (the brief "single writer", with Sol's
+C1–C6). Round 3's R8 (a "no drain on an unwind" carrier) is not built; R9 and R10 are folded into the matrix below.
+
+**Superseded**, where they say otherwise:
+- In "Host-side logging": the drain on the caller's thread, the boundary list ("where the drain runs"), and the
+  timing in "Behaviour that changes". Lines are now written by the writer as soon as it gets to them.
+- In "review round 1": R2's waiting rule and `WAIT_SECONDS`, and the thread table's "drains" column.
+- In "review round 2": all of R5's boundaries. They are reverted; the signal-sequence table no longer applies,
+  because no thread that signals ever writes.
+
+Still standing: the snapshot at the call, `facts`/`later`, the queue bound and its "dropped" line, `HostLock` and
+the depth, the lock table and its static test, R6, R7, and the protected tests.
+
+### The guarantee and the structure
+
+**THE guarantee:** a log handler that blocks forever, or raises, changes nothing but log output. Every signal,
+report, save and return happens at its time.
+
+- **One writer (W1).** `hostlog` owns ONE daemon thread, `hostlog-writer`.
+  - It is started at the first record, and again if it is found dead. Many threads logging at once start exactly
+    one.
+  - It is the only thread that calls `_write`, and so the only one that enters a handler, a filter or a formatter.
+    It works in queue order, at depth 0, holding no lock of the host-side modules.
+  - A handler that raises anything (an `Exception`, `SystemExit`, `KeyboardInterrupt`) is skipped, and the next
+    handler still gets the record. The record in flight counts as attempted and is never written again. Nothing ends
+    the writer.
+- **Lifecycle threads never wait (W2, C1).** One registry (`ENQUEUE_ONLY`, entered with `hostlog.enqueue_only()`)
+  and one predicate (`may_wait`: depth 0 and not registered). The registered threads:
+
+  | Thread | Registered where |
+  | --- | --- |
+  | the node's main thread | `node.run`, for the whole run, before anything is built or recovered |
+  | the session loop | `SessionRunner.run_forever` (new this round) |
+  | the deadline watchdog | `_watch` |
+  | the checkpoint sender | `_send_checkpoints` |
+  | the writer | itself, so a handler that logs, or calls back into the host, enqueues and returns |
+
+  - The hub's request threads reach no hostlog call site. Only `providers`' constants and pure helpers are imported
+    there (`hosted`, `hosted_spawn`, `hosted_tree`, `hosted_results`, `session_access`, `account_pools`,
+    `output_schema`, `session_worktrees`); `hosted.py` names `node_groups` only in a docstring.
+  - No `board` command reaches one except `board node`, which is registered. So none of them waits.
+- **A standalone caller waits, bounded (W3, C3).** A test, or a command calling the host directly, that leaves its
+  outermost boundary at depth 0 waits for the writer to have attempted ITS OWN last record, for at most
+  `ACK_SECONDS` (2 s; the suite sets 30 s in conftest). It never waits while holding a lock of the host-side modules:
+  every such lock is a boundary.
+  - The stall latch: a wait that times out records the completion sequence it saw. Nobody waits again until a LATER
+    completion.
+  - A record the bound evicted is resolved as dropped at once.
+  - So the acknowledgement is best effort, by statement: a timed-out or dropped record is not in `caplog` when the
+    call returns. Uncontended, `caplog` is synchronous, and the protected tests are unchanged and green.
+- **Depth narrowed (W4).** `HostLock`, `BOUNDARY` and `@hostlog.entries` stay, but an exit at depth 0 only
+  acknowledges; it writes nothing. `everything=`, the caller-side `drain` and `WAIT_SECONDS` are deleted, and
+  `may_drain` is now `may_wait`.
+- **Flush and exit (W5, C4).**
+  - `hostlog.flush(timeout)` waits, bounded, for the queue to be empty and the writer idle. It enters no handler, so
+    the bound is real.
+  - `node.run` makes ONE final wait after its last signal and report: `_exit_if_stalled`, which calls
+    `hostlog.final_flush` with `EXIT_FLUSH_SECONDS` = 2 s, shared with `atexit`'s flush.
+  - Idle: the process exits as ever, `logging.shutdown()` included.
+  - Still stuck in a handler: `os._exit` with the status `run` would have had (0; a `SystemExit`'s code; 130 for an
+    interrupt; 1 otherwise). That skips `atexit` hooks, `logging.shutdown()`, the traceback of an escaping exception
+    and unflushed buffered output. It is safe because every child was signalled and every report and save made
+    before. The lines still queued behind the stuck handler are lost.
+  - Standalone processes (the hub, a CLI command, a test run) have no writer work of the host's (above). Were one
+    stuck, its exit would wait in `logging.shutdown()` for the stuck handler's lock, no worse than main, where the
+    calling thread itself is stuck in the handler.
+- **Undone (W6, C5).** Round 2's signal-sequence scaffolding is reverted to main's shape:
+  - `node.shut_down` as one boundary;
+  - the `SessionRunner.shutdown` split into `stop_for_shutdown` and `report_shutdown`;
+  - `Node.tick` and `Node.stop_all` as boundaries, and the wrap in `Node.recover`.
+
+  node.py differs from main by its logger, the `facts` call sites and `run`'s registration and exit. node_sessions.py
+  differs by its locks as boundaries, `facts` call sites, the watchdog's and the sender's registration (and the
+  loop's), and `_deliver`'s docstring. tests/test_hosted_sessions.py is back to 654d44c's.
+- **Forks.** The host-side modules contain no `os.fork` and no `multiprocessing` (pinned by a test), so
+  `os.register_at_fork` is not needed.
+
+### Where a production thread could still stall on logging
+
+Nowhere, by construction: no production thread enters a handler. Each earlier place:
+
+| Place | Now |
+| --- | --- |
+| a boundary exit on an unwind | writes nothing |
+| a thread about to signal | never waits |
+| the `atexit` flush | bounded, entering no handler |
+| a generator or context manager closed by the collector | its exits write nothing |
+| `Node.recover`, start-up before the loop | the main thread is registered |
+
+The writer itself can be stuck in a handler; that costs only log output (and, at exit, the stalled `os._exit`).
+
+### The acceptance matrix (tests/test_hostlog.py), each case under the production policy
+
+Each case opts in with `hostlog.enqueue_only()`, as `node.run` does, and asserts it. A line is queued beforehand by
+another lifecycle thread, and a handler blocks forever (until the teardown) or raises:
+
+1. `test_w7_1_...`: the report fallback (ordinary and steer × 400 and 422 × blocks, raises, re-enters `_flush` from
+   the writer). The retry and the final report go; every entry is on the writer, holding no lock.
+2. `test_w7_2_...`: the checkpoint POST fails. The sender returns without entering the handler, the loop's passes go
+   on, and the watchdog's TERM and KILL go.
+3. `test_w7_3_...[normal|fallback|kill_raises]`: shutdown. Both TERMs; both KILLs at the grace deadline (10 s ± 0.25 s
+   of the node's clock); in `kill_raises` (R9) the LAST possible KILL: `sessions.kill()` raises, `quietly`'s line is
+   written, and the sessions' own shutdown kills the survivor; `err` is checked.
+4. `test_w7_4_...`, driving `node.run`. SIGTERM is `on_term` raising KeyboardInterrupt at the point the loop is at,
+   which is all the signal does to that thread. Three cases:
+   - SIGTERM during a pass's hub call, and at the between-pass `hub unreachable` line;
+   - a second SIGTERM during cleanup: identical signals, times and escaping exception with the writer blocked as
+     with it free;
+   - the `SystemExit` branch.
+5. `test_w7_5_...`: an ordinary run ignoring TERM is killed at its grace deadline across passes.
+6. `test_w7_6_...`: recovery and start-up reach the sessions' recovery and the loop's first pass.
+7. `test_w7_7_...`: the session loop's join expires at a standalone shutdown, and the signals still go.
+
+Plus:
+- the mechanism tests: handlers only on the writer, at depth 0; lifecycle threads never wait; the standalone bound,
+  latch and clearing; eviction release and the "dropped" line (C6); order across threads; a handler raising anything;
+  restart and exactly one writer (C6); `flush` bounded; a handler that logs or calls back into the host (C6); a
+  thread holding a host lock never waits;
+- `test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock[stalled|free]`, a SUBPROCESS: stalled
+  exits with status 3 after "signals sent", skipping `logging.shutdown()`; free exits 0 and `logging.shutdown()`
+  closes the handler;
+- R10: `_lock_problems` is THE checker. The modules are held to it and the fixtures run through the same function,
+  a factory that returns a lock through a local among them.
+
+The guard (tests/hostlog_guard.py) now also fails any handler entry off the writer thread, on every route of the
+existing matrices.
+
+On 567a0b1 (this round's tests copied in, each run alone, bounded):
+- W7.4 fails four ways: `run` did not end (no shutdown with a blocked handler), its thread was not registered, the
+  second SIGTERM stalls, and the `SystemExit` branch did not stop the sessions.
+- W7.5 fails: the run's KILL waits behind the handler.
+- W7.6 fails: the sessions' recovery is not reached.
+- W7.2 and W7.3 fail only on the writer-thread checks.
+- W7.7 passes there.
