@@ -1,14 +1,30 @@
-# The output of scripts/steering-mutation-check.py (review round 10): only round 10's rows (G1 and H2; G2 is tests
-# only, with no code row). On 790a25a two rows were MISSED: the switch, and the attempt's recorded Claude identity.
-# Both terms are redundant in every reachable state, so no scenario tells them apart; c6b40d3 pins each term
-# directly. The whole set (139 rows) last ran in round 6. Run on c6b40d3: all 4 caught.
+# The output of scripts/steering-mutation-check.py for the enabling PR (DESIGN_NOTES "Enabling Claude steering"): only the
+# rows for its new and changed code (S1 to S5). The script leaves out, as stale, the rows of earlier rounds whose lines this
+# PR rewrote; a row here stands for each. The whole set (152 rows) last ran in round 6. Run on d704cbf: all 21 caught.
 
-commit c6b40d3
-CAUGHT  G1 the predicate-false path is main's  (exit 1)
-CAUGHT  G1 the predicate asks the switch  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
-CAUGHT  G1 the predicate asks for a Claude attempt or a hold  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
-CAUGHT  H2 the predicate reads the attempt, not the advertised holds  test_r10_h2_a_claude_attempt_keeps_its_path_after_the_adapter_stops_advertising
-rows: 4
+commit d704cbf
+CAUGHT  S1 the switch  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
+CAUGHT  S1 the hold's causes reserve only with a held end  test_r10_h2_a_claude_attempt_keeps_its_path_after_the_adapter_stops_advertising
+CAUGHT  S1 steer bytes reserve only for a Claude attempt  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
+CAUGHT  S1 any other cause is main's  test_s1_a_stop_main_also_performs_is_mains_with_its_registry_wait[m_reply_pipe]
+CAUGHT  S1 a held cancel reserves  test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[r_cancel_held]
+CAUGHT  S1 a steer frame's broken pipe reserves  test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[r_steer_pipe]
+CAUGHT  S1 a partial frame's cut reserves  test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[r_partial_write]
+CAUGHT  S1 the held timeout's cause  test_r9_d2_a_held_turns_own_timeout_never_waits_on_the_registry
+CAUGHT  S1 the hold cut's cause  test_r3_n_the_sigterm_is_sent_outside_the_cutoff_lock
+CAUGHT  S1 main's route of a steering session is claimed  test_r5_known_limit_a_raising_log_handler_between_a_claim_and_its_signal
+CAUGHT  S2 busy commits nothing  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  S2 escalation armed before the commit  test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order
+CAUGHT  S2 the partial cut clears the buffer only after the reservation  test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[r_partial_write]
+CAUGHT  S2 the steer pipe clears the buffer only after the reservation  test_s1_a_steering_only_stop_never_waits_and_the_siblings_kill_goes[r_steer_pipe]
+CAUGHT  S3 a live miss gets a barrier  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[kept]
+CAUGHT  S3 a verified exit needs no entry  test_s3_a_verified_exit_needs_no_entry
+CAUGHT  S3 a live child with no token gets one  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[none]
+CAUGHT  S3 the registry inserts the barrier on a miss  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[kept]
+CAUGHT  S4 on by default  test_r9_f_claude_steering_is_off_by_default
+CAUGHT  S5c the watchdog's lane waits during reconciliation  test_s5c_a_handoff_inside_reconciliation_keeps_lost_ahead_of_a_watched_terminal[True]
+CAUGHT  S5c the phase is marked  test_s5c_a_handoff_inside_reconciliation_keeps_lost_ahead_of_a_watched_terminal[True]
+rows: 21
 stale or broken: []
 missed: []
 exit 0
