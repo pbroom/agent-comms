@@ -960,9 +960,10 @@ def test_node_shutdown_signals_every_child_before_reporting_and_always_cleans_up
         again = FakeChild(6000)
         node.running["run-2"] = _Local("run-2", again, senv.clock(), 1800.0, 10.0)
 
-        def boom():
+        def boom(*a, **kw):
             raise RuntimeError("session cleanup failed")
-        fake = SimpleNamespace(signal=lambda: None, alive=lambda: False, kill=lambda: None, shutdown=lambda: None)
+        fake = SimpleNamespace(signal=lambda: None, alive=lambda: False, kill=lambda: None,
+                               unproved=lambda budget: False, shutdown=lambda **kw: None)
         setattr(fake, broken, boom)
         node.sessions = fake
         del posts[:]

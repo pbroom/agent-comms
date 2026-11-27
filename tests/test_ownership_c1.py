@@ -1108,14 +1108,14 @@ class _RealRuns:
     its own inside this test's session (so the test may put a member of its own into it). Each is signalled only
     through its own handle (PopenChild, or the test's own `kill` on a handle not yet waited for)."""
 
-    def __init__(self, tmp_path):
-        self.tmp, self.procs = tmp_path, []
+    def __init__(self, tmp_path, script=None):
+        self.tmp, self.procs, self.script = tmp_path, [], script or STUBBORN
 
     def __call__(self, argv, *, cwd, env, log_path, **kw):
         import subprocess
         from agent_comms.dispatch import PopenChild
         ready = self.tmp / f"ready-{len(self.procs)}"
-        p = subprocess.Popen(["/bin/sh", "-c", STUBBORN, "sh", str(ready)], cwd=cwd, process_group=0,
+        p = subprocess.Popen(["/bin/sh", "-c", self.script, "sh", str(ready)], cwd=cwd, process_group=0,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.procs.append(p)
         _wait_for(ready)
@@ -1129,13 +1129,13 @@ class _RealRuns:
                 p.wait(timeout=10)
 
 
-def _real_run(nenv, tmp_path):
+def _real_run(nenv, tmp_path, script=None):
     """A dispatched run of the hub's, on a node whose clock, sleep and process questions are the REAL ones, and whose
     one child is `_RealRuns`'s: (node, run id, spawner)."""
     import time
     from agent_comms import session_host
     from test_nodes import allow, human_post
-    node, spawner = nenv.node, _RealRuns(tmp_path)
+    node, spawner = nenv.node, _RealRuns(tmp_path, script)
     node.spawner, node.clock, node.sleep = spawner, time.monotonic, time.sleep
     node.group_alive, node.group_absent = session_host.group_alive, node_groups.group_absent
     node.config.kill_grace_seconds = 0.3
@@ -1258,7 +1258,8 @@ def test_r9_one_shared_post_kill_deadline_for_every_killed_run(nenv):
 
 
 def test_r9_a_shutdown_that_needed_no_kill_does_not_wait(nenv):
-    """R9: a shutdown whose runs all went on their SIGTERM sends no KILL and does not wait at all."""
+    """R9 and R13.3: a shutdown whose runs all went on their SIGTERM and are already proved gone sends no KILL and
+    waits for nothing."""
     from agent_comms.node import shut_down
     node, kids = _fake_runs(nenv, 2, exits=True)
     marks: dict = {}
@@ -1366,8 +1367,15 @@ def test_r9_the_sessions_fallback_after_their_kill_raised_still_releases_them(tm
     monkeypatch.setattr(node.sessions, "kill", boom)
     marks: dict = {}
     _timed(node, marks, senv.clock)
+    order = []
+    report, kill = node.report_stopped, child.kill
+    node.report_stopped = lambda: (order.append(("runs reported", senv.clock())), report())[1]
+    child.kill = lambda: (order.append(("session KILL", senv.clock())), kill())[1]
     shut_down(node)
-    assert marks["report"] - marks["kill"] <= POST_KILL, "the node's wait delays the fallback by at most the window"
+    step = getattr(node_groups, "POST_KILL_STEP", 0.05)
+    assert marks["report"] - marks["kill"] <= POST_KILL + step / 2, "the watch delays the fallback by at most the window"
+    assert [what for what, _ in order] == ["runs reported", "session KILL"], \
+        "round 5, R14: the fallback's KILL still follows the runs' reports, as on main (the order is kept)"
     assert child.killed == 1, "the fallback killed the session's group"
     host = node.sessions.host
     assert host.sessions[sid].child is None and sid not in _state(host), "released, and not on record"
@@ -1600,3 +1608,332 @@ def test_r12_on_macos_a_libproc_load_failure_retains_and_says_so_once(monkeypatc
     with caplog.at_level("WARNING", logger="agent_comms"):
         assert node_groups.group_absent(424242) is False and node_groups.group_absent(os.getpgrp()) is False
     assert len([m for m in caplog.messages if "libproc could not be loaded" in m]) == 1, caplog.messages
+
+
+# ---------------------------------------------------------------- review round 5: R13, R14, R15
+
+TERM_EXITS = ': > "$1"; exec sleep 60'     # a leader that ends on SIGTERM
+
+
+def _member(leader, tmp_path):
+    """This test's own child, put into the leader's process group (a member the node did not start)."""
+    import subprocess
+    return subprocess.Popen(["sleep", "60"], cwd=tmp_path, process_group=leader.pid, stdin=subprocess.DEVNULL)
+
+
+def _reap_later(proc, after):
+    """Reap this test's own child through its own handle after `after` seconds (no signal: it is already dead)."""
+    import threading
+    t = threading.Timer(after, lambda: proc.wait(timeout=10))
+    t.start()
+    return t
+
+
+def _zombie(pid):
+    """Whether this pid is a zombie, as `ps` says (asked without reaping it or signalling it)."""
+    import subprocess
+    out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return out.startswith("Z")
+
+
+def _until(check, seconds=10.0):
+    import time
+    end = time.monotonic() + seconds
+    while not check():
+        assert time.monotonic() < end, "never happened"
+        time.sleep(0.01)
+
+
+def _killed_by_a_pass_before_shutdown(nenv, tmp_path):
+    """R13's sequence (REAL children): the run's timeout pass stops it (its SIGTERM ends the member, this test's own
+    child, which stays a zombie) and its grace pass KILLs the leader, just before the node shuts down; the leader is
+    then reaped. No reap pass runs between that and the shutdown."""
+    node, rid, spawner = _real_run(nenv, tmp_path)
+    leader = spawner.procs[0]
+    member = _member(leader, tmp_path)
+    local = node.running[rid]
+    local.timeout, local.grace = 0.0, 0.0
+    node._reap()                            # (the timeout pass: SIGTERM)
+    _until(lambda: _zombie(member.pid))     # (the member ended on it; never reaped here: it stays listed)
+    node._reap()                            # (the grace pass: SIGKILL)
+    assert local.killed
+    _until(lambda: local.child.poll() is not None)      # (the leader is reaped through its own handle)
+    assert member.returncode is None and node_groups.group_members(leader.pid) == (member.pid,), "a zombie member"
+    return node, rid, spawner, member
+
+
+@darwin_only
+@pytest.mark.parametrize("reaped_in_time", [True, False], ids=["clears-in-the-window", "never-clears"])
+def test_r13_a_run_killed_by_an_earlier_pass_is_watched_at_shutdown(nenv, tmp_path, caplog, reaped_in_time):
+    """R13 (a) and (d), REAL children: a run whose KILL came from an ordinary pass just before the shutdown, its leader
+    already reaped and a zombie member still listed. The shutdown's watch selects it (not yet proved gone), whoever
+    sent its KILL. (a) the member is reaped inside the window: the run is reported "ended" ("node shut down"), gone
+    from the state file, no line. (d) it never clears in time: the shutdown spends the one window, then the run is
+    retained, HELD, on record, not reported, said once. (5f90d53 watched only what `kill_runs` killed just now.)"""
+    import json as _json
+    import time
+    from agent_comms import nodes
+    from agent_comms.node import shut_down
+    node, rid, spawner, member = _killed_by_a_pass_before_shutdown(nenv, tmp_path)
+    timer = _reap_later(member, 0.3) if reaped_in_time else None
+    try:
+        t0 = time.monotonic()
+        with caplog.at_level("WARNING", logger="agent_comms"):
+            shut_down(node)
+        took = time.monotonic() - t0
+        r = nodes.run(nenv.board, rid)
+        lines = [m for m in caplog.messages if HOLD_LINE in m]
+        if reaped_in_time:
+            assert (r["state"], r.get("error")) == ("ended", "node shut down"), r
+            assert rid not in node.running and rid not in _json.loads(node._state_path().read_text())
+            assert not lines and took < POST_KILL + 1.0
+        else:
+            assert POST_KILL - 0.05 <= took <= POST_KILL + 1.0, took
+            assert rid in node.running and node.groups.state(("run", rid)) == node.groups.HELD
+            assert rid in _json.loads(node._state_path().read_text()) and r["state"] == "running"
+            assert len(lines) == 1, caplog.messages
+    finally:
+        if timer is not None:
+            timer.join(10)
+        if member.returncode is None:
+            member.wait(timeout=10)
+        spawner.cleanup()
+
+
+@darwin_only
+def test_r13_a_run_that_ended_on_its_sigterm_is_watched_at_shutdown(nenv, tmp_path, caplog):
+    """R13 (b), REAL children, no KILL at all: the shutdown's SIGTERM ends the leader and the member (this test's own
+    child, a zombie until the test reaps it inside the window). The watch selects the run, not yet proved gone, and
+    it is reported "ended" at shutdown, as on main. (5f90d53 sent no KILL, so watched nothing, and kept it.)"""
+    import json as _json
+    from agent_comms import nodes
+    from agent_comms.node import shut_down
+    node, rid, spawner = _real_run(nenv, tmp_path, script=TERM_EXITS)
+    member = _member(spawner.procs[0], tmp_path)
+    timer = _reap_later(member, 0.3)
+    try:
+        with caplog.at_level("WARNING", logger="agent_comms"):
+            shut_down(node)
+        r = nodes.run(nenv.board, rid)
+        assert (r["state"], r.get("error")) == ("ended", "node shut down"), r
+        assert rid not in node.running and rid not in _json.loads(node._state_path().read_text())
+        assert not [m for m in caplog.messages if HOLD_LINE in m]
+    finally:
+        timer.join(10)
+        spawner.cleanup()
+
+
+@darwin_only
+def test_r13_a_hosted_session_vetoed_by_an_earlier_kill_is_watched_at_shutdown(henv, tmp_path, caplog):
+    """R13 (c), REAL children: a hosted session whose group was stopped and KILLed by an earlier pass (vetoed), its
+    leader reaped, a zombie member (this test's own child) still listed. The host's own shutdown watch selects it,
+    though its KILL pass sends nothing now; the member is reaped inside the window and the session is released."""
+    import subprocess
+    from agent_comms.dispatch import PipedChild
+    from agent_comms.session_host import SessionHost
+    procs = []
+
+    def real(argv, *, cwd, env, log_path):
+        ready = tmp_path / "ready"
+        p = subprocess.Popen(["/bin/sh", "-c", STUBBORN, "sh", str(ready)], cwd=cwd, env={"PATH": "/bin:/usr/bin"},
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             process_group=0, bufsize=0)
+        procs.append(p)
+        _wait_for(ready)
+        return PipedChild(p)
+    host = SessionHost(henv.config, henv.log_dir, spawner=real, kill_grace_seconds=0.3)
+    s = host.open(SID, agent="claude", runtime="claude-code", project=open_session.__globals__["PROJECT"])
+    host.send(SID, "a long turn", message_id="1")
+    host.tick()
+    member = None
+    timer = None
+    try:
+        member = _member(procs[0], tmp_path)
+        _until(lambda: len(node_groups.group_members(procs[0].pid) or ()) == 2)
+        host._stop(s, host.clock())                     # (its SIGTERM: the member ends, a zombie)
+        assert host._kill_if_due(s, host.clock() + 1)   # (the kill scan's SIGKILL: vetoed from here on)
+        _until(lambda: s.child.poll() is not None)
+        assert not host.groups.may_signal(s.group_token)
+        timer = _reap_later(member, 0.3)
+        with caplog.at_level("WARNING", logger="agent_comms"):
+            host.stop_all()
+        assert s.child is None and SID not in _state(host) and not host.groups.entries
+        assert not [m for m in caplog.messages if HOLD_LINE in m or "may still be running" in m], caplog.messages
+    finally:
+        if timer is not None:
+            timer.join(10)
+        if member is not None and member.returncode is None:
+            member.wait(timeout=10)
+        for p in procs:
+            if p.returncode is None and p.poll() is None:
+                p.kill()
+            if p.returncode is None:
+                p.wait(timeout=10)
+
+
+def test_r13_the_runners_watch_selects_every_session_not_yet_proved_gone(tmp_path):
+    """R13 and A1: `SessionRunner.unproved` asks of EVERY session with a process handle (read under the runner's
+    lock) whether it is proved gone, whoever sent its KILL: one whose leader exited by itself with a member left is
+    unproved; once the member is gone it is not."""
+    from test_hosted_sessions import children, session_env, start, tick
+    senv = session_env(tmp_path)
+    runner = senv.node.sessions
+    start(senv)
+    tick(senv)
+    [child] = children(senv)
+    child.code = 0                          # (its leader exited by itself; no KILL was sent)
+    senv.groups.add(child.pid)              # (a member is left)
+    assert runner.unproved(0.5) is True
+    senv.groups.discard(child.pid)
+    assert runner.unproved(0.5) is False
+
+
+def test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock(tmp_path):
+    """R14 and A2: the runner's lock is taken with the watch's remaining budget as its timeout (non-blocking with
+    none left); held elsewhere, the look counts as "still unproved" and returns within that budget."""
+    import threading
+    import time
+    from test_hosted_sessions import session_env
+    runner = session_env(tmp_path).node.sessions
+    held, done = threading.Event(), threading.Event()
+
+    def hold():
+        with runner.lock:
+            held.set()
+            done.wait(5)
+    t = threading.Thread(target=hold)
+    t.start()
+    try:
+        held.wait(5)
+        t0 = time.monotonic()
+        assert runner.unproved(0.2) is True
+        assert time.monotonic() - t0 < 1.0
+        t0 = time.monotonic()
+        assert runner.unproved(0) is True
+        assert time.monotonic() - t0 < 0.2, "no budget left: one non-blocking attempt"
+    finally:
+        done.set()
+        t.join(5)
+
+
+def test_r14_the_watch_hands_the_sessions_its_remaining_budget(nenv):
+    """R14: the node's watch asks the sessions with what is left of its one deadline, and ends at that deadline."""
+    node = nenv.node
+    node.sleep = lambda s: nenv.clock.advance(s)
+    budgets = []
+    node.await_kills(lambda left: (budgets.append(left), True)[1])
+    assert budgets and budgets[0] == pytest.approx(POST_KILL) and all(0 <= b <= POST_KILL for b in budgets)
+    assert budgets == sorted(budgets, reverse=True) and budgets[-1] < budgets[0] / 2, "what is LEFT of the window"
+
+
+def test_r14_a_session_group_that_never_clears_costs_the_shared_window_once(tmp_path):
+    """R13.3 and A1: a session group that cannot be proved gone spends the one shared window once at the node's
+    shutdown: the host's own watch, after the runs' reports, uses the node's deadline (already past), and adds
+    nothing of its own when its KILL pass sends nothing."""
+    from agent_comms.node import shut_down
+    from test_hosted_sessions import children, session_env, start, tick
+    senv = session_env(tmp_path)
+    node = senv.node
+    start(senv)
+    tick(senv)
+    [child] = children(senv)
+    senv.groups.add(child.pid)              # (a member that never goes)
+    watch = []
+    real = node.await_kills
+
+    def timed(*a, **k):
+        t = senv.clock()
+        out = real(*a, **k)
+        watch.append(senv.clock() - t)
+        return out
+    node.await_kills = timed
+    t0 = senv.clock()
+    shut_down(node)
+    grace = node.config.kill_grace_seconds
+    assert watch and watch[0] == pytest.approx(POST_KILL)
+    # (the node's grace, its one window, then the host's own grace wait for a group still alive, as on main)
+    assert senv.clock() - t0 <= 2 * grace + POST_KILL + 0.5, "the window once, not twice"
+
+
+class _InterruptingLock:
+    """The registry's lock, which raises KeyboardInterrupt (as the node's SIGTERM handler does) right after its next
+    release, once armed."""
+
+    def __init__(self, lock):
+        self.lock, self.armed = lock, False
+
+    def __enter__(self):
+        return self.lock.__enter__()
+
+    def __exit__(self, *exc):
+        self.lock.__exit__(*exc)
+        if self.armed:
+            self.armed = False
+            raise KeyboardInterrupt
+
+    def acquire(self, *a, **k):
+        return self.lock.acquire(*a, **k)
+
+    def release(self):
+        self.lock.release()
+
+
+def _live(token="t", cwd="/w"):
+    g = node_groups.Groups()
+    g.start(cwd, token, lambda: object())
+    return g
+
+
+def test_r15_an_interrupt_before_the_fence_is_installed_leaves_the_token_as_it_was(monkeypatch):
+    """R15 and A3: an interrupt BEFORE the fence is installed: the token is exactly as it was (no HELD for a fence
+    that was never set)."""
+    g = _live()
+
+    def before(*a):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(g, "_admit_fence", before)
+    with pytest.raises(KeyboardInterrupt):
+        g.release("t", lambda: True, lambda: None)
+    assert g.state("t") == g.LIVE and g.may_signal("t")
+
+
+@pytest.mark.parametrize("where", ["inside-the-installation", "as-the-lock-is-released", "in-prepare", "in-the-proof"])
+def test_r15_an_interrupt_after_the_fence_is_installed_never_leaves_it_fenced(monkeypatch, where):
+    """R15 and A3: an interrupt after the fence is installed (inside `_admit_fence` once it installed, immediately
+    after the registry's lock is released, during the final reads, during the proof): the token ends HELD (admission
+    fenced AND numeric signalling vetoed), never FENCED. (5f90d53 left it FENCED for the first two.)"""
+    g = _live()
+    prepare = proof = None
+    if where == "inside-the-installation":
+        real = g._admit_fence
+
+        def installed_then_interrupted(*a):
+            real(*a)
+            raise KeyboardInterrupt
+        monkeypatch.setattr(g, "_admit_fence", installed_then_interrupted)
+    elif where == "as-the-lock-is-released":
+        g.lock = _InterruptingLock(g.lock)
+        g.lock.armed = True
+    elif where == "in-prepare":
+        def prepare():
+            raise KeyboardInterrupt
+    else:
+        def proof():
+            raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        g.release("t", proof or (lambda: False), lambda: None, prepare=prepare)
+    assert g.state("t") == g.HELD and not g.may_signal("t") and g.blocked("/w")
+
+
+def test_r15_an_interrupt_after_forget_still_completes_the_registry_cleanup():
+    """A3: the proof held and `forget()` dropped the owner's record, then an interrupt: the registry's removal still
+    completes, so no proved-gone group's entry is left behind with no record to retry it. (5f90d53 made it HELD.)"""
+    g = _live()
+    record = {"t": object()}
+
+    def forget():
+        record.pop("t")
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        g.release("t", lambda: True, forget)
+    assert record == {} and g.state("t") is None and g.may_signal("t") and not g.blocked("/w")

@@ -3270,7 +3270,7 @@ class SessionHost:
 
     # ------------------------------------------------------------ shutdown
 
-    def stop_all(self) -> list[HostEvent]:
+    def stop_all(self, watched_until: float | None = None) -> list[HostEvent]:
         """Shutdown: terminate every session's process group, wait the grace period, kill what remains of each group
         (its leader may be gone while a member is not). A turn in flight is reported failed. Sessions are not ended:
         a later host may reopen them with resume. (Ruling H) Every SIGTERM goes before anything is persisted."""
@@ -3290,11 +3290,11 @@ class SessionHost:
                     WATCH_THREADS.discard(me)
                 flush_watch_logs()
         try:
-            return self._stop_all(undivert)
+            return self._stop_all(undivert, watched_until)
         finally:
             undivert()
 
-    def _stop_all(self, undivert: Callable[[], None]) -> list[HostEvent]:
+    def _stop_all(self, undivert: Callable[[], None], watched_until: float | None = None) -> list[HostEvent]:
         out = self._outbox
         now = self.clock()
         live = [s for s in self.sessions.values() if s.child is not None]
@@ -3332,16 +3332,22 @@ class SessionHost:
                     failed.add(s.session_id)
                     log.exception("session %s: its SIGKILL at shutdown failed", s.session_id)
             undivert()      # (ruling R7-2) the last SIGKILL attempt is made: the deferred lines are written now
-            if attempted:
-                # (C1, review round 4, R9 and A2) every KILL of this pass is sent: one shared, bounded watch, with no
-                # signal, for each killed group's proof before the reads and the releases (`poll()` is still None
-                # just after a SIGKILL); a pass that killed nothing does not wait
+            # (C1, review rounds 4 and 5, R9, A2 and R13) every KILL of this pass is made: one bounded watch, with no
+            # signal, of EVERY session that still has its process and is not yet proved gone (whoever sent its KILL,
+            # and whether one was: a group vetoed by an earlier pass, a leader that went on its SIGTERM), before the
+            # reads and the releases (`poll()` is still None just after a SIGKILL). Its deadline: a fresh window when
+            # this pass sent a KILL now; else the node's watch's own deadline (`watched_until`), which already watched
+            # these sessions, so a group that cannot be proved gone spends the one window once; else a fresh one.
+            # Nothing unproved: no wait.
+            if attempted or watched_until is None:
                 kill_seen = self.clock() + node_groups.POST_KILL_SECONDS
-                for _ in range(int(node_groups.POST_KILL_SECONDS / node_groups.POST_KILL_STEP) + 1):
-                    left = kill_seen - self.clock()
-                    if all(self._proved_gone(s.child) for s in attempted) or left <= 0:
-                        break
-                    self.sleep(min(node_groups.POST_KILL_STEP, left))
+            else:
+                kill_seen = watched_until
+            for _ in range(int(node_groups.POST_KILL_SECONDS / node_groups.POST_KILL_STEP) + 1):
+                left = kill_seen - self.clock()
+                if left <= 0 or all(self._proved_gone(s.child) for s in live):
+                    break
+                self.sleep(min(node_groups.POST_KILL_STEP, left))
             for s in live:
                 # (Review round 4, ruling T) every step of the traversal per session: one session's fault (its
                 # read, close or cleanup) skips no other, and the final save runs in the `finally`

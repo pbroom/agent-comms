@@ -17080,9 +17080,10 @@ other system call goes through Python's `os` module, which raises on error. No o
 
 **The fix.** `node_groups.POST_KILL_SECONDS = 1.0` and `POST_KILL_STEP = 0.05`.
 - **After both initial KILL passes are SENT** (the runs' `kill_runs()` and the sessions' `kill()`), and before the
-  runs' releases, `shut_down` makes ONE shared, bounded watch, `Node.await_kills`. It looks, with no signal, at:
-  - each run whose KILL was attempted and whose leader's exit is not seen yet (`kill_runs` now returns them);
-  - each session the sessions' `kill()` attempted (it now returns them; `SessionRunner.unproved`).
+  runs' releases, `shut_down` makes ONE shared, bounded watch, `Node.await_kills`. In this round it looked, with no
+  signal, at the following (round 5, R13, replaced this selection with every group not yet proved gone):
+  - each run whose KILL was attempted and whose leader's exit is not seen yet (`kill_runs` returned them);
+  - each session the sessions' `kill()` attempted (it returned them; `SessionRunner.unproved`).
 
   It ends as soon as each is proved gone (`_proved_gone`: the leader's exit seen by its own handle AND `group_absent`),
   or at the deadline. The watch is bounded by the clock and by a count of looks, so a clock that does not move with
@@ -17101,15 +17102,16 @@ other system call goes through Python's `os` module, which raises on error. No o
 **Why one second.** SIGKILL is delivered at once, but the kernel finishes the exit asynchronously, and launchd reaps a
 killed group's orphaned members a moment later. One second covers that by a wide margin.
 
-**What it adds, checked against launchd.** At most one second to a shutdown that needed a KILL, and nothing to one
-that did not. The host's own window adds at most one more second, and only on the fallback path, where the sessions'
-initial KILL failed.
+**What it adds, checked against launchd** (as corrected in round 5, R13 and R14, below). The watch now selects every
+group not yet proved gone, so it waits whenever one is unproved, a KILL or not. At most 2 x POST_KILL_SECONDS in all,
+on the sessions' fallback route, plus probe and scheduling overhead.
 - scripts/install-launchagents.py installs the node's LaunchAgent with `ExitTimeOut` 60 (read, not touched).
-- A shutdown that needs a KILL takes the 10 s kill grace, then at most this second, then the reports: far inside 60 s.
+- A shutdown that needs a KILL takes the 10 s kill grace, then the watch, then the reports: far inside 60 s.
 - `node_sessions.shutdown_bound` (the hub's bound for a node's signals) is unchanged: the watch comes after the KILL.
 
-**No signal, no signal order and no stop decision changed.** The watch only observes, and the release rule decides as
-before.
+**No signal is added, no signal's order changes, and no stop decision changes.** The watch only observes, and the
+release rule decides as before. But a signal sent after the watch comes later by up to the window: the sessions'
+fallback KILL, when their first KILL pass raised (round 5, R14).
 
 **The fake child (tests/test_dispatch.py).** `kill()` no longer makes `poll()` answer at once. `polls_after_kill`
 polls (one, by default) answer None before the exit is seen, as with a real process. A test that wants the exit seen
@@ -17293,3 +17295,129 @@ scripts/session-host-e2e.py runs them.
 - **The `~/.codex/config.toml` hash** was be07f3845d522521 (the baseline since 12:37) before, after each real run and
   at the end. There was no further change.
 - The protected files are unchanged.
+
+### C1: review round 5
+
+Sol's delta review of 5f90d53: CHANGES, 1 blocker and 2 shoulds. Then an amendment after Sol's pre-check of the
+rulings (A1 to A3). Everything else in round 4 was accepted as built, the `shutdown=True` branch included. Each
+reproduction below fails on 5f90d53, with REAL children of the test where a process is involved.
+
+#### R13 [blocker], with A1: the watch selects by "not yet proved gone"
+
+**The sequence** (Sol). A run's timeout pass KILLs it just before the node shuts down. By `kill_runs()` its leader
+is already reaped, so it was not in the list `kill_runs` returned, while a killed member is still listed as a zombie
+for an instant. The watch did not watch it, `report_stopped()` refused the release, and the shutdown "ended" report
+was skipped, though the group cleared well inside the second. Main reports it. A hosted session vetoed by an earlier
+KILL missed both watches the same way, and so did a run whose leader went on its SIGTERM (no KILL at all).
+
+**The fix: one question decides what is watched**, asked of every group the owner still tracks at that point: is it
+not yet proved gone (`_proved_gone`: the leader's exit seen by its own handle AND `group_absent`)?
+- **Runs:** every entry of `Node.running` (`await_kills`), on the node's main thread as before. The same in
+  `Node.stop_all`'s path.
+- **Hosted sessions, in the node's watch:** every session with a process handle (`SessionRunner.unproved`), read
+  under the runner's lock, the owner's serialization.
+- **Hosted sessions, in the host's own watch** (`SessionHost._stop_all`): every session of the shutdown that still
+  has its process, not only the ones its KILL pass killed now.
+- **Separate from signal eligibility.** `may_signal`, `local.killed`, the veto and `poll() is None` keep deciding
+  signals exactly as before, and decide nothing about the watch. `kill_runs()` and `sessions.kill()` are back to
+  main's form (they return nothing), since nothing else needed what they killed.
+- **Nothing unproved: no wait.** A shutdown where everything is already proved gone waits for nothing.
+- **The consequence.** A shutdown with a group that truly cannot be proved gone (a survivor, or a group HELD long
+  before) now spends the full shared window once. That covers a long-HELD group too (A1). The TERM-only case is
+  covered: a leader that exited on its SIGTERM, with a member still being reaped.
+- **"Once" for sessions too.** The host's own watch, which runs after the runs' reports, shares the node's deadline
+  (`sessions.shutdown(watched_until=...)`, then `stop_all(watched_until=...)`), so a session group that never clears
+  costs the window once, not twice. The host takes a fresh window only when its own KILL pass sends a KILL now (the
+  fallback route), or when it is not run by the node (`watched_until` None).
+
+**R13.5: other places where a decision about waiting or releasing reuses a signal-eligibility test.**
+
+| Place | Its test | What it decides | Verdict |
+| --- | --- | --- | --- |
+| `Node._reap` (node.py): `code is not None and group_alive and may_signal` | liveness and `may_signal` | main's survivor stop, or the release attempt | Keep. A run that may be signalled and whose group is alive takes main's survivor stop and makes no release attempt that pass; that attempt would be refused anyway (a member is there). A HELD run goes to the release attempt every pass. |
+| `SessionHost._reap`: `group_alive and (stopping_since or may_signal)` | the same | the same, for a session | Keep, for the same reason. |
+| `SessionHost._steps`, the HELD guard | `may_signal` with no stop's clock | no further step for a HELD session | Keep. It decides steps, not release: the reap ran just before it in that pass. |
+| The shutdown's grace waits: `runs_alive()`, `sessions.alive()` (`_going`), `_stop_all`'s `going(s)` | `poll() is None`, `group_alive` | when the TERM has worked, and so when to KILL | Main's: a signal decision. The post-KILL watch now covers what these do not (members still being reaped). |
+| `kill_runs()`, `sessions.kill()`, `_stop_all`'s KILL pass | `poll() is None`, `_going`, `may_signal` | who gets a KILL | Signals only. No longer feeds the watch. |
+| `_stop_all`'s exception path: `released = s.child is None` | none | a release step that raised | Not a signal test. |
+| `_reserved_stop`'s barrier on a registry miss | `poll() is None or group_alive` | whether to insert a barrier | Admission (the enabling PR's S3), not release. |
+| `_lingering` | `s.killed` | a log line | Logging only. |
+
+None decides a release by a signal test. The two reap branches can only postpone an attempt the proof would refuse.
+
+#### R14 [should], with A2: the bound and the claim, exact
+
+- **The lock is bounded.** `SessionRunner.unproved(budget)` takes the runner's lock with the watch's actual remaining
+  budget as its timeout, and makes one non-blocking attempt when none is left. Not taken, the look counts as "still
+  unproved" and decides nothing else. A raising look counts the same.
+- **Who can hold that lock then.** Only a pass that took it before `stopping` was set and is finishing its local
+  work: the host's tick, bounded by its drain deadline, or a child's git worktree command, bounded by its own timeout.
+  Never a hub call: the loop makes those outside the lock (`pass_once`: `_flush` and `_sync` come before and after
+  its locked section). The watchdog takes it only with LOCK_SLACK_SECONDS.
+- **The order is kept, and pinned** (A2: no reordering). When the sessions' first KILL pass raised, the node's watch
+  (which now also watches those sessions, still alive, so it spends the whole window) runs before
+  `sessions.shutdown()`, whose fallback KILL then comes after the runs' reports, as on main.
+  `test_r9_the_sessions_fallback_after_their_kill_raised_still_releases_them` pins the order: the runs' reports, then
+  the session's KILL.
+- **What is true now, stated exactly.** The watch adds no signal and reorders none. But it can delay a later
+  session fallback signal by up to POST_KILL_SECONDS of polling, and two serial watches (on that fallback route: the
+  node's, then the host's own after its fallback KILL) can add up to twice that, plus probe and scheduling overhead.
+  The sentences that said "no signal is delayed" are corrected: node.py `await_kills` and `shut_down`, the
+  POST_KILL_SECONDS comment in node_groups.py, and round 4's notes above.
+- **The total worst case added to a shutdown: 2 seconds** (2 x POST_KILL_SECONDS), plus probe and scheduling
+  overhead. The route that reaches it: the sessions' first KILL pass raises, so the node's watch spends its whole
+  window on those still-alive sessions; then, after the runs' reports and the host's own grace (main's), the host's
+  fallback KILL pass sends a KILL and takes a fresh window for a group that still cannot be proved gone. Every other
+  route adds at most 1 second.
+
+#### R15 [should], with A3: an interrupt cannot leave a token FENCED
+
+- **The defect.** `release`'s `try`/`finally` began after `_admit_fence()`. An interrupt between the installation and
+  the `try` (the node's SIGTERM handler raises KeyboardInterrupt on the main thread) left the token FENCED, with
+  nothing to move it.
+- **The fix.** The installation is now inside the protected region. From its first instruction on, the token ends in
+  one of three states, never FENCED:
+
+| Where the interrupt lands | The token ends |
+| --- | --- |
+| Before the fence is installed | Exactly as it was. No HELD for a fence never set: the cleanup converts only a FENCED entry (`_held_if_fenced`). This is what the code before round 4 did too: it fenced first, outside the `try`. |
+| After the installation (inside `_admit_fence`, or right after its lock is released), during the final reads, or during the proof | HELD: admission fenced and numeric signals vetoed. |
+| After the proof held, `forget()` returned, before `_gone()` finished | The registry's removal completes in the `finally`, so no proved-gone group's entry is left with no record to retry it. Round 4 made that token HELD, with its owner's record already gone. |
+| A second interrupt inside that cleanup | Fail closed. The entry may stay, and its checkout admits nothing, for the rest of this node process. |
+
+- **Why failing closed there is right.** The only interrupt source on a releasing thread is the node's own SIGTERM or
+  Ctrl-C handler (`node.run`'s `on_term`). Python delivers signals to the main thread only, so the hosted sessions'
+  loop thread, where a session's reap releases, gets none. The process is then on its way out, and the entry goes
+  with it. No other interrupt source was found: the other handlers (cli.py, waiter.py) belong to other processes.
+  `release`'s docstring says this.
+- **One more consequence.** A `forget()` that raises after a True proof now still removes the registry entry (the
+  group IS proved gone). Neither owner's `forget()` can raise: one pops a dict entry, the other sets attributes.
+
+#### Tests (tests/test_ownership_c1.py)
+
+Each test below fails on 5f90d53, except the pins listed last.
+- **R13, with REAL children:**
+  - `test_r13_a_run_killed_by_an_earlier_pass_is_watched_at_shutdown[clears-in-the-window]`: the run's timeout pass
+    and grace pass stop and KILL it just before the shutdown, and its leader is reaped. The member, this test's own
+    child, is a zombie until the test reaps it inside the window. The run is reported "ended" ("node shut down"), gone
+    from the state file, and no line is written. This is (a).
+  - `...[never-clears]`: the same, but the member is not reaped in time. The shutdown spends the one window, then the
+    run is retained: HELD, on record, still "running" at the hub, said once. This is (d).
+  - `test_r13_a_run_that_ended_on_its_sigterm_is_watched_at_shutdown`: no KILL at all. This is (b).
+  - `test_r13_a_hosted_session_vetoed_by_an_earlier_kill_is_watched_at_shutdown`: the host's own watch. This is (c).
+- **R13 and R14, with fakes:**
+  - `test_r13_the_runners_watch_selects_every_session_not_yet_proved_gone` (a leader that exited by itself);
+  - `test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock`;
+  - `test_r14_the_watch_hands_the_sessions_its_remaining_budget`.
+- **R15:**
+  - `test_r15_an_interrupt_after_the_fence_is_installed_never_leaves_it_fenced[inside-the-installation|as-the-lock-is-released]`;
+  - `test_r15_an_interrupt_after_forget_still_completes_the_registry_cleanup`.
+- **Pins that hold on 5f90d53 too:**
+  - `test_r15_an_interrupt_before_the_fence_is_installed_leaves_the_token_as_it_was`;
+  - `test_r15_...[in-prepare|in-the-proof]`;
+  - `test_r14_a_session_group_that_never_clears_costs_the_shared_window_once`;
+  - the fallback-order assertion added to `test_r9_the_sessions_fallback_after_their_kill_raised_still_releases_them`.
+- **A fake changed:** `test_node_shutdown_signals_every_child_before_reporting_and_always_cleans_up_the_runs`
+  (test_hosted_sessions.py). Its stand-in for the sessions now takes `shutdown(watched_until=...)` and answers
+  `unproved`.
+

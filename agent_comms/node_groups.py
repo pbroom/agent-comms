@@ -29,14 +29,18 @@ _LISTING_ROOM = (64, 1024, 16384)   # slots added to the kernel's estimate, trie
 _LIBPROC: list = []
 _LOAD_FAILED_SAID: list = []        # (C1, review round 4, R12/A5) a libproc that would not load is said once
 
-# (C1, review round 4, R9/A2) After a shutdown's SIGKILLs are SENT, how long the owner watches, with no signal, for
-# each killed group's proof (its leader's exit observed by its own handle AND `group_absent`) before it applies the
-# release rule. SIGKILL is delivered at once, but the kernel finishes the exit asynchronously: `poll()` right after
-# `killpg(SIGKILL)` answered None 40 times of 40 in the review's probe, and a killed group's members are reaped by
-# launchd a moment later. One second covers that by a wide margin, ONE shared deadline for all of a shutdown's killed
-# groups (not one per group), and keeps a shutdown that needed a KILL far inside launchd's exit timeout for the node's
-# LaunchAgent (60 s, scripts/install-launchagents.py: the 10 s kill grace, then at most this second, then the reports).
-# A shutdown that sent no KILL does not wait at all.
+# (C1, review rounds 4 and 5, R9, A2, R13 and R14) After a shutdown's initial KILL passes, how long the owner watches,
+# with no signal, every group it still tracks that is not yet proved gone (its leader's exit observed by its own handle
+# AND `group_absent`) before it applies the release rule. SIGKILL is delivered at once, but the kernel finishes the
+# exit asynchronously: `poll()` right after `killpg(SIGKILL)` answered None 40 times of 40 in the review's probe, and a
+# killed group's members are reaped by launchd a moment later. One second covers that by a wide margin, ONE shared
+# deadline for all of a shutdown's groups (not one per group; the hosted sessions' own watch shares it). Nothing
+# unproved: no wait. A group that cannot be proved gone (a survivor, one HELD long before) spends the whole window.
+# The watch sends no signal and reorders none, but a signal this shutdown sends AFTER it comes up to this long later:
+# the sessions' fallback KILL when their first KILL pass raised. The most it adds to a shutdown is 2 x this (two
+# serial watches, on that fallback route: the node's, then the host's own after its fallback KILL), plus probe and
+# scheduling overhead: far inside launchd's exit timeout for the node's LaunchAgent (60 s,
+# scripts/install-launchagents.py; a shutdown that needs a KILL takes the 10 s kill grace first).
 POST_KILL_SECONDS = 1.0
 POST_KILL_STEP = 0.05               # between two looks within that window
 
@@ -283,11 +287,25 @@ class Groups:
         one, so admission sees the barrier anyway. Proved: `forget()` drops the tracking record, then the registry
         entry goes (`_gone`); True. Scope: this is the removal path of a live node's started groups. A spawn that
         fails removes its provisional registration in `start`, and a start never made or a claim lost has no group to
-        release."""
-        with self.lock:
-            self._admit_fence(token, fence)
-        proved = False
+        release.
+
+        (Review round 5, R15 and A3) An exception at ANY point, an interrupt included (the node's SIGTERM handler
+        raises KeyboardInterrupt on the main thread, where a run's release and the shutdown's run), ends in one of
+        three states, never FENCED, because the installation itself is inside the protected region:
+        - before the fence is installed: the token is exactly as it was (no HELD for a fence never set);
+        - after it is installed, during the final reads or the proof: HELD (admission fenced and numeric signals
+          vetoed), as for a refused proof;
+        - once the proof held: the registry's removal completes (`_gone`), even if `forget()` or an interrupt cut in
+          after the owner's record went, so no proved-gone group's entry is left with no record to retry it.
+        A SECOND interrupt inside that cleanup fails closed: the entry may stay (its checkout admits nothing) for the
+        rest of this node process. The only interrupt source on a releasing thread is the node's own SIGTERM or
+        Ctrl-C handler (Python delivers signals to the main thread only; the hosted sessions' loop thread gets none),
+        so the process is then on its way out and the entry goes with it."""
+        proved = begun = False
         try:
+            with self.lock:
+                self._admit_fence(token, fence)
+            begun = True
             if prepare is not None:
                 prepare()
             try:
@@ -296,17 +314,27 @@ class Groups:
                 proved = False
             if proved:
                 forget()
-        except BaseException:
-            proved = False
-            raise
         finally:
-            if not proved:
+            if proved:
+                self._gone(token)       # (also when `forget()` raised, or an interrupt came after it: see above)
+            else:
                 with self.lock:
-                    self._fence(token, fence)       # (refused, or the final reads raised: HELD from here on)
-        if not proved:
-            return False
-        self._gone(token)
-        return True
+                    if begun:
+                        self._fence(token, fence)   # (refused, or the final reads or the proof raised: HELD)
+                    else:
+                        self._held_if_fenced(token)     # (cut at the installation: only a FENCED entry changes)
+        return proved
+
+    def _held_if_fenced(self, token: Hashable) -> None:
+        """(The registry's lock held; review round 5, R15) An installation that an exception or an interrupt cut
+        short: a FENCED entry for the token (only `release` makes one) becomes HELD, with the HELD index; any other
+        state is left exactly as it was."""
+        found = False
+        for groups in self.entries.values():
+            if token in groups and groups[token][0] == self.FENCED:
+                groups[token][0], found = self.HELD, True
+        if found:
+            self.held.add(token)
 
     def _gone(self, token: Hashable) -> None:
         """The whole group is gone: leader reaped, no member left (only `release` says so)."""

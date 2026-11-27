@@ -492,13 +492,14 @@ class Node:
                 self._stop(local, "kill")
 
     def stop_all(self) -> None:
-        """Shutdown: terminate every run, wait the grace period, kill what remains, watch the kills finish (bounded,
-        `await_kills`), report each ended."""
+        """Shutdown: terminate every run, wait the grace period, kill what remains, watch every run not yet proved gone
+        (bounded, `await_kills`), report each ended."""
         self.signal_runs()
         deadline = self.clock() + self.config.kill_grace_seconds
         while self.runs_alive() and self.clock() < deadline:
             self.sleep(0.2)
-        self.await_kills(self.kill_runs())
+        self.kill_runs()
+        self.await_kills()
         self.report_stopped()
 
     # stop_all's steps, so that shut_down can stop hosted sessions within the same grace period and before any report.
@@ -510,16 +511,10 @@ class Node:
     def runs_alive(self) -> bool:
         return any(l.child.poll() is None for l in self.running.values())
 
-    def kill_runs(self) -> list[str]:
-        """SIGKILL for every run whose leader is still there; the runs whose KILL has been attempted (now, or by an
-        earlier pass) and whose leader's exit is not seen yet: what `await_kills` watches."""
-        killed = []
-        for rid, local in self.running.items():
+    def kill_runs(self) -> None:
+        for local in self.running.values():
             if local.child.poll() is None:
                 self._stop(local, "kill")
-                if local.killed:
-                    killed.append(rid)
-        return killed
 
     def _proved_gone(self, local: _Local) -> bool:
         """The proof the release rule asks for (`_release`), as an observation only: the leader's exit seen by its
@@ -529,23 +524,29 @@ class Node:
         except Exception:
             return False
 
-    def await_kills(self, rids: list[str], others: Callable[[], bool] | None = None) -> None:
-        """(C1, review round 4, R9 and A2) After a shutdown's SIGKILLs are SENT (no signal is delayed by this), and
-        before the runs' releases: watch, with no signal, until each killed run is proved gone (`_proved_gone`) and
-        `others()` (the hosted sessions' killed groups) says nothing is left to see, or ONE shared deadline,
-        POST_KILL_SECONDS from now, is reached. A shutdown that killed nothing returns at once. Bounded by the clock
-        and by a count of looks, so a clock that does not move with the sleep cannot hold it."""
-        if not rids and others is None:
-            return
+    def await_kills(self, others: Callable[[float], bool] | None = None) -> float:
+        """(C1, review rounds 4 and 5, R9, A2, R13 and R14) After the shutdown's initial KILL passes, before the runs'
+        releases: watch, with no signal, every group still tracked that is not yet proved gone, and stop as soon as
+        none is left, or at ONE shared deadline, POST_KILL_SECONDS from now. What is watched is decided by that one
+        question alone (R13), asked of every run in `running` (`_proved_gone`) and, through `others(budget)`, of every
+        hosted session with a process handle (`SessionRunner.unproved`): never by who sent a KILL, when, or whether a
+        leader is still there, which decide signals only. A shutdown where everything is already proved gone waits for
+        nothing; one with a group that cannot be proved gone (a survivor, a group HELD long before) spends the whole
+        window, once. It sends no signal and changes no signal's order, but a later signal of this shutdown can come
+        up to the window later: the sessions' fallback when their first KILL raised (see `shut_down`). `others` is
+        given the window's remaining budget (R14). Bounded by the clock and by a count of looks, so a clock that does
+        not move with the sleep cannot hold it. Returns the deadline, which the hosts' own watch then shares."""
         deadline = self.clock() + POST_KILL_SECONDS
         for _ in range(int(POST_KILL_SECONDS / POST_KILL_STEP) + 1):
-            waiting = [rid for rid in rids if rid in self.running and not self._proved_gone(self.running[rid])]
-            if not waiting and not (others is not None and others()):
-                return
+            waiting = [rid for rid, local in self.running.items() if not self._proved_gone(local)]
+            left = deadline - self.clock()
+            if not waiting and not (others is not None and others(max(left, 0.0))):
+                break
             left = deadline - self.clock()
             if left <= 0:
-                return
+                break
             self.sleep(min(POST_KILL_STEP, left))
+        return deadline
 
     def _release(self, rid: str, local: _Local, final: bool = False) -> bool:
         """(Ownership until verified exit, C1) The dispatched run's side of THE release rule (`Groups.release`), for
@@ -595,8 +596,7 @@ def shut_down(node: Node) -> None:
             return default
 
     stopped = False
-    killed: list = []
-    sessions_killed: list = []
+    watched: list = []
     try:
         node.signal_runs()
         deadline = node.clock() + node.config.kill_grace_seconds
@@ -605,26 +605,31 @@ def shut_down(node: Node) -> None:
         while (node.runs_alive() or (sessions is not None and quietly(sessions.alive, False))) \
                 and node.clock() < deadline:
             node.sleep(0.2)
-        killed = node.kill_runs()
+        node.kill_runs()
         if sessions is not None:
-            sessions_killed = quietly(sessions.kill, []) or []
+            quietly(sessions.kill)
         stopped = True
     finally:
         try:
             if stopped:
-                # (C1, review round 4, R9 and A2) both KILL passes are sent: one shared, bounded watch of what they
-                # killed, the runs' and the sessions', before the runs' releases and reports (in their order)
+                # (C1, review rounds 4 and 5, R9, A2 and R13) both initial KILL passes are made: one shared, bounded
+                # watch of every group not yet proved gone, the runs' and the sessions', before the runs' releases and
+                # reports (in their order). The order of everything after it is main's: when the sessions' KILL pass
+                # raised, their fallback KILL (in `sessions.shutdown()`, after the runs' reports, as on main) comes up
+                # to POST_KILL_SECONDS later than it would have (R14).
                 others = None
-                if sessions_killed:
-                    def others() -> bool:
-                        return quietly(lambda: sessions.unproved(sessions_killed), False)
-                quietly(lambda: node.await_kills(killed, others))
+                if sessions is not None:
+                    def others(budget: float) -> bool:
+                        return quietly(lambda: sessions.unproved(budget), True)     # (cannot tell: still unproved)
+                watched.append(quietly(lambda: node.await_kills(others)))
                 node.report_stopped()
             else:
                 node.stop_all()
         finally:
             if sessions is not None:
-                sessions.shutdown()     # its processes are gone: the bookkeeping, then its reports
+                # its processes are gone: the bookkeeping, then its reports; the host's own watch shares the one
+                # deadline of the node's (R13.3: a group that cannot be proved gone spends the window once)
+                sessions.shutdown(watched_until=watched[0] if watched else None)
 
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
