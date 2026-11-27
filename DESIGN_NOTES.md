@@ -15788,3 +15788,152 @@ the round asked (the coordinator's gate runs every e2e set):
 - `uv run pytest -q -p no:cacheprovider`: 4862 passed, 10 skipped, 0 failed.
 - `--only steering` with stand-ins: PASS (115 checks).
 - No real CLI was run.
+
+### Review round 9 (on 7439382: CHANGES, two blockers; M8 evidence sufficient) and what changed: Claude steering ships OFF
+
+Backup branch `backup/claude-steering-7439382`. Sol found two blockers: a reserved stop whose SIGTERM raised stranded
+a live group (round 8's no-clock rule), and a held turn's own timeout still waited on the registry. Sol's pre-check
+added E1 to E4 and F. Under F, **Claude steering is off by default in this PR**: with steering off, Sol judges the
+branch safe to merge. Each sequence is a test written first. On an export of 7439382, 9 of round 9's 14 tests fail
+there: D1, E1 [live], D3, D2, the C3 timeout pin, and F's four. The other 5 pass there as pins: E1 [stopping], E2
+[alive, gone] (7439382 also went on after a registry miss), and D4's two.
+
+#### D1 and E1. Once the checkout is reserved, the commit is main's `_stop` (the host)
+
+- **The class.** Any difference between the reserved stop and main's `_stop` after the reservation. Round 8 had one:
+  a SIGTERM that raised cleared the kill clock. With the hold fenced, nothing then retried the SIGTERM or killed the
+  group, and N could be published while the group was live.
+- **Owner: `SessionHost._stop(reserved=True)`.** It differs from e6b421f's `_stop` in ONE thing: it does not register
+  with the registry again (the claim already reserved without waiting). Everything after that point is main's code.
+  A SIGTERM that raises is main's failure in main's form: `stopping_since` stays, so the kill scan escalates to
+  SIGKILL after the grace, and N's end is published once the group is gone. Round 8's "a raising SIGTERM clears the
+  clock" is withdrawn.
+- **What lies between the reservation and `_stop`'s body.** Inside the cutoff lock: the decision (`_fail` →
+  `_finalize_hold`), which is in-memory work; then, after the lock, the claim's deferred log lines (a loop-thread
+  handler can raise there: the known limit below). E1: if the decision raises, only the reservation THIS attempt
+  made is undone (`Groups.unreserve`, for a RESERVED result only). A STOPPING barrier that was there before (ALREADY)
+  stays.
+- **Tests.**
+  - `test_r9_d1_a_reserved_stop_whose_sigterm_raises_is_mains` (Sol's sequence; replaces round 8's no-clock test).
+  - `test_r9_e1_a_commit_that_fails_early_undoes_only_its_own_reservation[live|stopping]`.
+
+#### D3 and E2. What the registry says (the registry)
+
+- **`Groups.try_stopping` has four results.**
+  - RESERVED: this call marked the group STOPPING.
+  - ALREADY: it was STOPPING before; the barrier is not this call's.
+  - BUSY: the registry is held; nothing was recorded.
+  - MISSING: no entry for the token.
+- **E2: MISSING is a registry miss, not a verified exit.** The caller does what main's `_stop` does when
+  `groups.stopping` finds no token. Main's `stopping` loop records nothing and returns; `_stop` then probes the
+  concrete group (`poll` and `killpg(pgid, 0)`). It sends the SIGTERM if the group is alive, keeping its owner and
+  kill clock, and takes the gone path (no SIGTERM) only when the probe confirms exit. No new retry or repair.
+- **Tests.**
+  - `test_r9_d3_try_stopping_says_what_happened`.
+  - `test_r9_e2_a_registry_miss_is_not_a_verified_exit[alive|gone]`.
+
+#### D2 and E4. No stop that steering adds waits on the registry (the host)
+
+- **Owner.** `_cutoff_stop(..., *, reserve)`: a required keyword, so the blocking mode cannot be had by omission.
+  The held turn's own timeout (`_hold_to_timeout`, both its call sites) now reserves without waiting, like the
+  expired hold's cut. Registry busy: no stop is committed, and it is tried again on the next tick or pass.
+- **Test.** `test_r9_d2_a_held_turns_own_timeout_never_waits_on_the_registry` (Sol's two-deadline sequence, with E3):
+  the registry stays busy until the expired hold also reaches its own turn timeout. In that tick neither enforcer
+  waits on the registry. A sibling's SIGKILL comes due while the registry is held and goes as main would send it.
+  Once the registry frees, the stop is committed once.
+- **E4, the call-site list** (each call into `_stop`, `_stop_from`, `groups.stopping` or `_cutoff_stop` under the
+  runner lock). This is the input for the enabling PR; none of the routes marked "listed" is changed here.
+
+| site | on main e6b421f | newly reachable for a held end or a Claude attempt | registry |
+| --- | --- | --- | --- |
+| the expired hold's cut (`_hold_cut` → `_cutoff_stop(reserve=True)`) | no | yes (it is the hold's own deadline) | reserved without waiting (C1) |
+| the held turn's own timeout (`_hold_to_timeout` → `_cutoff_stop(reserve=True)`, both sites) | no (main has the timeout, not this call) | yes | reserved without waiting (D2) |
+| the turn timeout's ordinary stop, the interrupt's, the handshake's (`_hold_to_timeout` → `_stop_from`/`_stop`) | yes | no | main's blocking wait |
+| a broken pipe of a steering session (`_write` → `_cutoff_stop(reserve=False)`) | no | yes | **listed**: blocking, as main's own write-failure stop |
+| the Claude partial-write cut (`_steer_cut` → `_stop(at_signal=True)`) | yes (step 2's) | yes, a Claude attempt reaches it | **listed**: blocking, as main's |
+| close, a fatal frame, a host error of a held session (`_end` → `_stop_from`, after its claim) | yes | yes, via the claim | **listed**: blocking, as main's |
+| cancel of a held session (`cancel` → `_stop_from`, after its claim) | yes | yes, via the claim | **listed**: blocking, as main's |
+| a leader reaped with surviving members (`_reap` → `_stop_from`) | yes | yes, via the claim | **listed**: blocking, as main's |
+| a survivor after the latch, and the latch during the reap's drain (`_reap` → `groups.stopping`, parked) | no | yes | **listed**: blocking registration |
+| the held-end diagnostic before the SIGTERM on the loop path (the claim's deferred lines, written after the lock) | no | yes | **listed**: a log handler, not the registry (the round-5 known limit) |
+| write failures and the write timer (`_write` → `_stop`, four sites) | yes | no | main's |
+| `_held`, `_spent` (`_stop`) | yes | no | main's |
+| parking (`park` → `_stop`) | yes | no (a held end keeps N in flight: `busy`) | main's |
+| the self-stop and shutdown (`stop_turns`, `stop_all` → `_stop`) | yes | yes (a held end is stopped like any turn) | main's (N4) |
+| `_stop` itself (`groups.stopping`) | yes | through the sites above | main's blocking registration |
+
+  With Claude steering off (F), no held end and no Claude attempt exists, so every "newly reachable" row above is
+  unreachable.
+
+#### D4 and C2/C3. Notes and pins
+
+- **"No stop is committed", not "nothing changes".** While the reservation is unavailable:
+  - the loop's drain still reads, and S's own turn's evidence can settle N:
+    `test_r9_d4_while_the_reservation_waits_s_can_still_settle_n` (pin);
+  - the contact clock's expiry still latches: `test_r9_d4_while_the_reservation_waits_the_contact_expiry_latches`
+    (pin).
+- **C2's list gains a third deadline reader**, `_hold_to_timeout`, besides the watchdog's `steer_deadlines` and the
+  loop's `_hold_pass`. It also reserves without waiting.
+- **C3's pin runs on through the held turn's own timeout:**
+  `test_r9_c3_known_limit_the_stall_runs_on_through_the_held_turns_own_timeout`.
+
+#### F. Claude steering is OFF by default (the node and the host)
+
+- **The switch.** `[dispatch.sessions] claude_steer = true`, read on the node, next to `[dispatch.sessions] steer`
+  (the hub's switch from #115/#116). The default is false. Codex steering does not read it and stays as deployed.
+- **Off at every layer.**
+  - The host sets `steering_on` on each Claude adapter from the switch (`SessionHost.claude_steer`). Off, the
+    adapter's `steers` and `holds` are false. So `modes` reports no `steer` or `held` for a Claude session, the
+    node's reports carry no Claude steer mode (nor its extensions or acknowledged modes), and the hub offers it no
+    steer.
+  - `steer_offer` makes no slot (it asks the modes).
+  - The one place a hold is created (`_on_event`, on `_steer_end`'s HOLD) asks the switch too: with it off, N's
+    end is published as on main.
+- **A steer for a running Claude turn, off.** As on main e6b421f, the hub refuses it with `REFUSED["cli"]`: the
+  session's reported modes do not name `steer`. That check in `hosted_steer` is main's, unchanged.
+- **Tests.**
+  - `test_r9_f_claude_steering_is_off_by_default` (the guard).
+  - `test_r9_f_with_the_default_no_steer_mode_no_slot_no_hold`.
+  - `test_r9_f_the_one_place_a_hold_is_made_is_guarded`.
+  - `test_r9_f_with_the_default_a_steer_for_a_claude_turn_is_mains`.
+- **Every other Claude steering test, and the M8 replays, run with the switch ON.** tests/test_claude_steering.py
+  turns it on for itself with an autouse fixture, and the default-off tests turn it back. The e2e script's node
+  configuration sets `claude_steer = true` for every run of it, so `--only steering` (stand-ins and real CLIs)
+  needs no other change.
+- **Staging.** The machinery ships dark here. The enabling PR works through the E4 list, then flips the default.
+  To switch it on by hand on a node, set `[dispatch.sessions] claude_steer = true` in that node's `board.toml` and
+  restart `board node`. The hub needs `[dispatch.sessions] steer` on, as for Codex.
+
+- **Other changes for F.**
+  - tests/golden_schema_free.py's `record` takes `claude_steer`; the golden 2.1.330 test runs it ON (the enabled
+    version).
+  - `test_with_claude_steering_off_as_shipped_the_330_run_names_no_claude_mode` pins the shipped default: the
+    Claude sessions report main's modes (`restart` only), and only the hub's `held` feature is step 3's.
+
+#### Mutation check, review round 9
+
+Only round 9's rows ran, as the round asked, plus four rows re-anchored on lines this round rewrote (C1's two, the
+interrupted timeout's cutoff and the broken pipe's). Round 9's own rows:
+- D1: a raising SIGTERM keeps main's clock.
+- D2: the held turn's own timeout reserves without waiting.
+- E2: a registry miss is not a refusal.
+- E1: the attempt's own reservation is undone; and only its own.
+- D3: a barrier that was there before is ALREADY.
+- F: the adapter steers only with the switch on; the host sets the switch on each adapter; the one place a hold is
+  made asks the switch; off by default.
+
+All 14 caught (on 864e1b6). Round 8's "a failed SIGTERM starts no kill clock" row is gone with its code (that ruling
+was withdrawn). The output is in `scripts/steering-mutation-results.txt`; the whole set (139 rows) last ran in round 6.
+
+#### Runs
+
+After the last code commit (bab5e33; 864e1b6 fixes a test, 9bdb13d adds results), on 26 and 27 November, as the
+round asked:
+- `uv run pytest -q -p no:cacheprovider`: 4875 passed, 10 skipped, 1 failed. The failure is
+  `test_the_end_to_end_script_passes_with_the_stand_in`: the suite's own run of the stand-in e2e did not finish
+  within its 300-second limit. Another program kept this machine busy throughout (load average 7 to 7.6), so the
+  suite took 21 minutes where it takes 11. As in round 6, this is not a change of this round: the same e2e, run
+  directly, passed just after (next line), and twice earlier in this round (364 s).
+- The stand-in e2e in full (F touches the configuration): PASS (395 checks).
+- `--only steering` with stand-ins: PASS (115 checks).
+- No real CLI was run.
