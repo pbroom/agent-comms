@@ -456,6 +456,8 @@ def _write(r: _Record) -> None:
         args = tuple(str(a) if type(a) is _Later else a for a in args)     # (rendered here, once: never at the call)
     elif type(args) is dict and any(type(a) is _Later for a in args.values()):
         args = {k: str(a) if type(a) is _Later else a for k, a in args.items()}
+    if type(args) is dict:
+        args = (args,)      # (as `Logger._log` hands a mapping over: logging's own rule then makes it the args)
     rec = logger.makeRecord(r.name, r.level, fn, ln, r.msg, args, None, func=func, extra=r.extra)
     rec.created = r.created
     rec.msecs = int((r.created - int(r.created)) * 1000) + 0.0
@@ -590,18 +592,24 @@ def _write_loop(token: object) -> None:
                     r = _Record()
                     r.seq, r.created, r.name, r.level = 0, time.time(), __name__, logging.WARNING
                     r.thread, r.thread_name = me.ident, me.name
-                    r.msg, r.args = "%d deferred log line(s) were dropped: the queue was full", (dropped,)
+                    r.msg = ("%d deferred log line(s) were dropped "
+                             "(the queue was full, or a line could not be made a record)")
+                    r.args = (dropped,)
                     r.caller, r.exc, r.extra = ("(hostlog)", 0, "writer"), None, None
                 else:
                     r = _queue.popleft()
                 _state["busy"] = r.seq      # (published in the same step as the dequeue)
+            lost = False
             try:
                 _write(r)
             except BaseException:       # (the writer is not the main thread: nothing it is handed ends it)
-                pass
+                lost = r.seq != 0       # (it failed before any handler, which `_write` contains each on its own: counted
+                #                          as dropped and said once, like the bound's drops; never the notice itself)
             finally:
                 with _cond:
                     if _writer[0] is me:
+                        if lost:
+                            _state["dropped"] += 1
                         _state["busy"] = None
                         if r.seq > _state["done"]:
                             _state["done"] = r.seq

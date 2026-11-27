@@ -4658,7 +4658,8 @@ def test_r7_3_the_deferred_queue_counts_what_it_drops(env):
         gate.set()
         logging.getLogger("agent_comms").removeHandler(blocks)
     lines = [m for _, _, m in h.seen]
-    assert lines[1] == "7 deferred log line(s) were dropped: the queue was full", lines[:3]
+    assert lines[1] == ("7 deferred log line(s) were dropped "
+                        "(the queue was full, or a line could not be made a record)"), lines[:3]
     assert lines[2] == "line 7" and lines[-1] == f"line {n - 1}" and len(lines) == hostlog.QUEUE_MAX + 2
 
 

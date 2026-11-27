@@ -224,7 +224,9 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('L', 'A3 a dead writer deregisters', '            if _writer[0] is me:        # (registered → dead)\n                _writer[0] = None', '            if _writer[0] is me:        # (registered → dead)\n                pass'),
     ('L', 'A3 a dead writer wakes every waiter', '            _cond.notify_all()          # (every waiter re-checks: no writer, so no wait)', '            pass          # (every waiter re-checks: no writer, so no wait)'),
     ('L', 'R15 the final wait starts nothing', '    deadline = time.monotonic() + budget        # (first: before anything that can block)', '    start_writer()\n    deadline = time.monotonic() + budget        # (first: before anything that can block)'),
-    ('L', 'R15 no start claim after the seal', '            if not _state["sealed"] and not _can_dequeue() and (not lazy', '            if not _can_dequeue() and (not lazy')]
+    ('L', 'R15 no start claim after the seal', '            if not _state["sealed"] and not _can_dequeue() and (not lazy', '            if not _can_dequeue() and (not lazy'),
+    ('L', 'PR a mapping is handed to makeRecord as logging does (a one-element tuple)', '    if type(args) is dict:\n        args = (args,)      # (as', '    if False:\n        args = (args,)      # (as'),
+    ('L', 'PR a record lost before any handler is counted and said', '                        if lost:\n                            _state["dropped"] += 1', '                        if False:\n                            _state["dropped"] += 1')]
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
          "tests/test_hostlog.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",

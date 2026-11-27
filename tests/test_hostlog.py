@@ -758,7 +758,8 @@ def test_a_waiter_on_a_record_the_bound_evicted_is_released_at_once(monkeypatch)
         blocked.release.set()
     said = rec.messages()
     assert "mine, to be evicted" not in said
-    assert said[1] == "7 deferred log line(s) were dropped: the queue was full", said[:3]
+    assert said[1] == ("7 deferred log line(s) were dropped "
+                       "(the queue was full, or a line could not be made a record)"), said[:3]
     assert said[2] == "flood 6" and said[-1] == f"flood {hostlog.QUEUE_MAX + 5}"
 
 
@@ -1822,7 +1823,8 @@ def test_r12_a_stop_and_a_save_complete_when_the_writer_cannot_start(henv, monke
         assert hostlog.start_writer(), "a start succeeds"
         session_host.log.warning("a start succeeds")
     said = rec.messages()
-    drops = [m for m in said if m.endswith("deferred log line(s) were dropped: the queue was full")]
+    drops = [m for m in said if m.endswith("deferred log line(s) were dropped "
+                                           "(the queue was full, or a line could not be made a record)")]
     assert len(drops) == 1 and said[0] == drops[0] and said[-1] == "a start succeeds", said[:4]
 
 
@@ -2202,6 +2204,121 @@ def test_r15_the_start_points_are_exactly_two():
         ("hostlog.py", "_lazy_start", "_start_writer"),
         ("hostlog.py", "_reset", "start_writer"),       # (the tests' reset)
     }, found
+
+
+# ---------------------------------------------------------------- after the PR's automated review: mapping args
+
+
+class _Probe(logging.Handler):
+    """A real handler as the stdlib's own are written: `emit` formats, and a failure goes to `handleError` (recorded
+    here instead of printed). Every record handed to it is in `written` or in `errors`."""
+
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.written, self.errors = [], []
+
+    def emit(self, record):
+        try:
+            self.written.append(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+    def handleError(self, record):
+        import sys
+        self.errors.append((record.msg, type(sys.exc_info()[1]).__name__))
+
+
+def test_pr_a_single_key_mapping_line_is_written_with_its_value():
+    """The PR's automated review: `log.info("one %(id)s", {"id": "abc"})` was silently dropped (the writer handed the
+    mapping itself to `makeRecord`, whose `args[0]` raised KeyError inside our own containment). A one-key mapping, a
+    one-key mapping whose key is the string "0", a two-key one, and a `later` value in a one-key mapping are each
+    written with their values through a real handler."""
+    import collections
+    from agent_comms import hostlog, session_host
+    probe = _Probe()
+    lg = logging.getLogger("agent_comms")
+    saved = lg.level
+    lg.setLevel(logging.DEBUG)
+    lg.addHandler(probe)
+    try:
+        session_host.log.info("one %(id)s", {"id": "abc"})
+        session_host.log.info("zero %(0)s", {"0": "nought"})
+        session_host.log.info("two %(a)s %(b)s", {"a": 1, "b": 2})
+        session_host.log.info("later %(v)s", {"v": hostlog.later(str.upper, "rendered")})
+        session_host.log.info("ordered %s", collections.OrderedDict(id=1))
+        assert hostlog.flush(5)
+    finally:
+        lg.removeHandler(probe)
+        lg.setLevel(saved)
+    assert probe.written == ["one abc", "zero nought", "two 1 2", "later RENDERED", "ordered OrderedDict"], \
+        (probe.written, probe.errors)
+    assert probe.errors == []
+
+
+def test_pr_a_mapping_that_cannot_be_formatted_fails_as_stock_logging_does():
+    """The neighbouring cells: each record reaches the handler, and where it cannot be formatted it fails there the
+    way stock `logging` fails for the same call (in `format`, so the handler's `handleError`), never vanishing inside
+    our own code:
+    - a mapping left EMPTY once its non-str keys are dropped at the call (`{0: "x"}`): handed over as `({},)`, which
+      logging keeps as a tuple, so `%(id)s` fails in `format` with TypeError (stock, with the key kept, fails there
+      with KeyError: the same path, `handleError`);
+    - a mapping missing the template's key: KeyError, as stock;
+    - an EMPTY mapping: stock keeps `({},)` as the args, so `%(id)s` of a tuple, TypeError, as stock;
+    - a one-element tuple whose element is a dict SUBCLASS (an OrderedDict): reduced to its type name at the call (no
+      code of the subclass runs), so `%(id)s` of a tuple, TypeError (stock would have used the mapping)."""
+    import collections
+    from agent_comms import hostlog, session_host
+    probe = _Probe()
+    lg = logging.getLogger("agent_comms")
+    saved = lg.level
+    lg.setLevel(logging.DEBUG)
+    lg.addHandler(probe)
+    try:
+        session_host.log.info("intkey %(id)s", {0: "x"})
+        session_host.log.info("missing %(id)s", {"other": 1})
+        session_host.log.info("empty %(id)s", {})
+        session_host.log.info("subclass %(id)s", collections.OrderedDict(id=1))
+        assert hostlog.flush(5)
+    finally:
+        lg.removeHandler(probe)
+        lg.setLevel(saved)
+    assert probe.written == [], probe.written
+    assert probe.errors == [("intkey %(id)s", "TypeError"), ("missing %(id)s", "KeyError"),
+                            ("empty %(id)s", "TypeError"), ("subclass %(id)s", "TypeError")], probe.errors
+
+
+def test_pr_a_record_that_cannot_be_made_is_counted_not_lost_silently():
+    """The general case: a record that fails between the dequeue and the first handler (here `makeRecord` refusing an
+    `extra` key that would overwrite a record attribute, which stock logging raises to the caller; and a logger filter
+    that raises) is counted as dropped, and the writer says once how many, as for the queue bound's drops."""
+    from agent_comms import hostlog, session_host
+    probe = _Probe()
+    lg = logging.getLogger("agent_comms")
+    saved = lg.level
+    lg.setLevel(logging.DEBUG)
+    lg.addHandler(probe)
+
+    class Raises(logging.Filter):
+        def filter(self, record):
+            if record.msg == "the filter raises":
+                raise RuntimeError("a filter failed")
+            return True
+    flt = Raises()
+    sh = logging.getLogger("agent_comms.session_host")
+    sh.addFilter(flt)
+    try:
+        session_host.log.info("an extra that clashes", extra={"message": "overwrites"})
+        session_host.log.info("the filter raises")
+        assert hostlog.flush(5)
+        session_host.log.info("the next line")
+        assert hostlog.flush(5)
+    finally:
+        sh.removeFilter(flt)
+        lg.removeHandler(probe)
+        lg.setLevel(saved)
+    notice = "1 deferred log line(s) were dropped (the queue was full, or a line could not be made a record)"
+    assert probe.written[-3:] == [notice, notice, "the next line"], (probe.written, probe.errors)  # (a notice owed
+    # is written before the next queued line: one per loss here)
 
 
 # ---------------------------------------------------------------- R13: the real exit path, a real SIGTERM

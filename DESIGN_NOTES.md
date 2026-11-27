@@ -17180,6 +17180,15 @@ On 567a0b1 (this round's tests copied in, each run alone, bounded):
   | `--only structured` | PASS, 36 |
   | `--only tree` | PASS, 143 |
 
+**After the PR's automated review.**
+- **The bug.** A one-key mapping line (`log.info("one %(id)s", {"id": "abc"})`) was silently dropped. The writer
+  handed the mapping itself to `makeRecord`, and `LogRecord`'s `args[0]` raised KeyError inside the writer's
+  containment.
+- **The fix.** The writer now hands the mapping over as `Logger._log` does, as a one-element tuple.
+- **The rule now.** A record that fails between the dequeue and the first handler (`makeRecord`, a logger filter)
+  is counted with the queue bound's drops. The writer says how many, in the notice "N deferred log line(s) were
+  dropped (the queue was full, or a line could not be made a record)".
+
 ## Host-side logging: one writer, review round 1
 
 This round covers the review of the one-writer build: R11 to R13 and the amendment A1 to A5. No stop decision, signal,
