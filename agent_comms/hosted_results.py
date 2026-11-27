@@ -268,6 +268,16 @@ def turn(c, child: dict, m: dict, *, ok: bool, delivered: bool, detail: str, tex
         # The parent's own steer into this turn, settled with it (hosted_steer.settle, in this transaction): its
         # outcome as a field, never added to the reply (H, "One result for N").
         fields["steer"] = {"outcome": s["outcome"], "why": s.get("why")}
+        own = s.get("result") if s["outcome"] == "next_turn" and isinstance(s.get("result"), dict) else None
+        if own is not None and not isinstance(fields.get("output"), dict):
+            # `next_turn` (Claude, step 3): S's own turn's result as fields, N's reply kept apart (`reply`: what the
+            # current renderer shows in its own markers, and what a verdict would read), and in the ordinary
+            # `text` that every renderer reads, the combined text (H). Never for a turn asked for data (F-5).
+            fields["steer"] |= {"ok": bool(own.get("ok")), "detail": str(own.get("detail") or "")[:DETAIL_MAX],
+                                "reply": str(own.get("reply") or "")}
+            fields["reply"] = fields["text"]
+            if fields["steer"]["reply"]:
+                fields["text"] = fields["text"] + "\n\n" + STEER_JOIN + "\n" + fields["steer"]["reply"]
     # The parent restarted this turn itself: the result is kept (for the lineage, and for a call of the parent's still
     # waiting for this turn), but it is not delivered as another turn of the parent's, decided before any limit of the
     # automatic delivery. A restart by the human still is delivered: the parent learns its task was interrupted.
@@ -361,7 +371,9 @@ def _line(i: int, count: int, x: dict) -> str:
 
 # The hub's line about a parent's steer into the turn a result is for (hosted_steer.py; DESIGN_NOTES part H). Never
 # inside the child-output markers: only the structured field carries the outcome's authority.
+STEER_JOIN = "(the reply of the steer's own turn follows)"     # the combined text's plain line (H): no authority
 STEER_LINES = {"in_turn": "Your steer into this turn: taken into it.",
+               "next_turn": "Your steer (sent while this turn ran) ran as a turn of its own after it; its reply follows.",
                "not_delivered": "Your steer into this turn: not delivered: send it again if you still want it.",
                "unconfirmed": ("Your steer into this turn: not confirmed: delivery could not be confirmed, and the agent "
                                "may have read it.")}
@@ -390,10 +402,17 @@ def render(results: list[dict], token: str | None = None, header: str | None = N
         if isinstance(x.get("output"), dict):
             out.append(output_schema.result_line(x["output"]))      # the one hub line; the reply below it
         steer = x.get("steer") if isinstance(x.get("steer"), dict) else None
-        if steer is not None and steer.get("outcome") in STEER_LINES:
+        own = steer is not None and steer.get("outcome") == "next_turn" and isinstance(x.get("reply"), str)
+        if steer is not None and steer.get("outcome") in STEER_LINES and not own:
             out.append(STEER_LINES[steer["outcome"]])       # the hub's line, outside the child's markers (H)
-        out += [f"<<<child-output {token}>>>", str(x.get("text") or "") or "(no output)",
+        out += [f"<<<child-output {token}>>>", str((x.get("reply") if own else x.get("text")) or "") or "(no output)",
                 f"<<<end child-output {token}>>>"]
+        if own:
+            # `next_turn`: N's reply above, then the hub's line, then S's own reply in its own markers (H).
+            if not steer.get("ok"):
+                out.append("The steer's own turn failed: " + _quoted(str(steer.get("detail") or "no reason given")))
+            out += [STEER_LINES["next_turn"], f"<<<child-output {token}>>>",
+                    str(steer.get("reply") or "") or "(no output)", f"<<<end child-output {token}>>>"]
     return "\n".join(out)
 
 
@@ -606,6 +625,13 @@ def view_one(x: dict, text: bool = False) -> dict:
                              else {}) | {"reply": reply_label(x, "whole" if text else None)}
     if isinstance(x.get("steer"), dict):
         out["steer"] = {"outcome": x["steer"].get("outcome"), "why": x["steer"].get("why")}    # the parent's steer
+        if x["steer"].get("outcome") == "next_turn":
+            out["steer"] |= {"ok": x["steer"].get("ok"), "detail": x["steer"].get("detail")}
+            if text:
+                # (should 3) a claim renders N's raw reply and S's in blocks of their own, S's failure said
+                out["steer"]["reply"] = x["steer"].get("reply") or ""
+                if isinstance(x.get("reply"), str):
+                    out["reply"] = x["reply"]
     if text:
         out["text"] = x.get("text") or ""
     return out

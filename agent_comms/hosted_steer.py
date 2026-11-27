@@ -16,7 +16,11 @@ one. One steer per N, one unsettled per session.
   host's extension, a replacement node's LOST end, `_settle` for a lost node, `_end` for a close, cascade or orphan,
   the re-upgrade sweep. One precedence: (1) a valid extension from the owning host on N's own end decides (`in_turn`
   only if S was ever listed); (2) without one, `unconfirmed` if S was ever listed, else `not_delivered`. After that
-  nothing revises N or S. (A committed `held` checkpoint is step 3's, Claude's: not built.)
+  nothing revises N or S. N's native fields: from a committed `held` checkpoint (Claude's hold, step 3) when N's
+  record has one, on every path; otherwise from the settling event or path (`native`).
+- The checkpoint (`checkpoint`, step 3): N's native end while its host holds it, write-once, for the exact assigned
+  node, a delivered N in flight and a listed, unsettled steer into it; refused once N is settled. Kept on N's record
+  as `held`, out of every view, verdict and claim, and cleared in the transaction that settles N.
 - Read by its sender only: the human through `show` and `GET .../messages/{N}?steer=1`, a parent through
   `board_session_status` (`view`).
 """
@@ -38,8 +42,10 @@ STEER_PREFIX = "host.steer."        # <session id>.<N>: the steer bound to messa
 STEER_PROTOCOL = 5                  # a node's `tree` that knows steers (node_sessions.SESSION_PROTOCOL)
 STEER_MAX_BYTES = 12_288            # the steer's text as `json.dumps` writes it (after a parent's frame), part D
 OUTCOMES = ("in_turn", "next_turn", "not_delivered", "unconfirmed")
-# What a host may say on N's end (the extension; `next_turn` is step 3's and is not taken from a node yet).
-HOST_OUTCOMES = ("in_turn", "not_delivered", "unconfirmed")
+# What a host may say on N's end (the extension). `next_turn` (step 3, Claude): S ran as a turn of its own after N, and
+# the extension carries that turn's own result.
+HOST_OUTCOMES = ("in_turn", "next_turn", "not_delivered", "unconfirmed")
+REPLY_LIMIT = 16 * 1024 + 200       # a reply as a node sends it (providers.cap_reply), with the cut's note
 WHY_RE = re.compile(r"[a-z_]{1,40}")
 NEVER_LISTED = "never_listed"       # the hub's own word: rule (2), S never reached a node
 NO_WORD = "no_word"                 # ... rule (2), listed, and no word of the owning host on N's end
@@ -245,7 +251,11 @@ def accept(c, r: dict, m: dict, text: str, kind: str, by: dict, who: str, rid: s
     """Store the steer for N (`m`), in the caller's write transaction, with its receipt when it has a request id."""
     s = {"session_id": r["session_id"], "into": m["n"], "kind": kind, "by": by, "created_at": now,
          "uuid": str(uuid.uuid4()), "text": text, "listed_at": None, "cancel": None, "outcome": None, "why": None,
-         "settled_at": None, "withdrawn_at": None, "updated_at": now}
+         "settled_at": None, "withdrawn_at": None, "updated_at": now,
+         # (Review round 2, ruling J) what the attempt is written under: the node said its session's adapter holds
+         # N's end (`held` among its modes, a Claude adapter that steers). Only such an attempt takes a checkpoint
+         # or `next_turn`, whatever the agent's runtime is called.
+         "holds": "held" in (r.get("modes") or [])}
     if rid is not None:
         s |= {"request_id": rid, "sent_by": by}
         keep = {k: v for k, v in (r.get("receipts") or {}).items()
@@ -286,10 +296,16 @@ def view(s: dict | None) -> dict | None:
     """The terminal steer status, as its sender reads it: never its text, never its uuid."""
     if not isinstance(s, dict):
         return None
-    return {"into": s.get("into"), "kind": s.get("kind"), "outcome": s.get("outcome"), "why": s.get("why"),
-            "state": "settled" if s.get("outcome") else "accepted", "listed": s.get("listed_at") is not None,
-            "created_at": s.get("created_at"), "settled_at": s.get("settled_at"),
-            "words": WORDS.get(s.get("outcome")) if s.get("outcome") else None}
+    out = {"into": s.get("into"), "kind": s.get("kind"), "outcome": s.get("outcome"), "why": s.get("why"),
+           "state": "settled" if s.get("outcome") else "accepted", "listed": s.get("listed_at") is not None,
+           "created_at": s.get("created_at"), "settled_at": s.get("settled_at"),
+           "words": WORDS.get(s.get("outcome")) if s.get("outcome") else None}
+    r = s.get("result")
+    if s.get("outcome") == "next_turn" and isinstance(r, dict):
+        # S's own turn's result, for its sender (its reply is S's, not N's: the session's `reply` stays N's)
+        out["result"] = {"ok": r.get("ok"), "detail": r.get("detail"), "denials": r.get("denials") or [],
+                         "reply": r.get("reply") or ""}
+    return out
 
 
 # ---------------------------------------------------------------- offering (the listing's write transaction)
@@ -401,33 +417,152 @@ def _offer_problem(board: Board, c, r: dict, m: dict, s: dict, tree: int, now: f
 
 
 def extension(ev: Any) -> dict | None:
-    """The steer object of a node's turn_ended, validated on its own: {"outcome", "why"}, else None (a malformed one is
-    ignored, never refused: N's own end is taken either way)."""
-    if not isinstance(ev, dict) or set(ev) - {"outcome", "why"}:
+    """The steer object of a node's turn_ended, validated on its own: {"outcome", "why"} (and for `next_turn`,
+    S's own `result`), else None (a malformed one is ignored, never refused: N's own end is taken either way)."""
+    if not isinstance(ev, dict) or set(ev) - {"outcome", "why", "result"}:
         return None
     if ev.get("outcome") not in HOST_OUTCOMES or not isinstance(ev.get("why"), str) or not WHY_RE.fullmatch(ev["why"]):
         return None
-    return {"outcome": ev["outcome"], "why": ev["why"]}
+    if (ev["outcome"] == "next_turn") != ("result" in ev):
+        return None
+    out = {"outcome": ev["outcome"], "why": ev["why"]}
+    if ev["outcome"] == "next_turn":
+        result = turn_fields(ev["result"])
+        if result is None or "message" in ev["result"] or not possible_next_turn(ev["why"], result):
+            return None
+        out["result"] = result
+    return out
+
+
+def possible_next_turn(why: str, result: dict) -> bool:
+    """(Review round 2, shoulds) The only `next_turn` shapes a host makes: S's own end (`own_turn`, the provider's
+    own result: `answered`), or S's proved turn cut (`own_turn_cut`: failed, not answered, no reply)."""
+    if why == "own_turn":
+        return result["answered"] is True
+    if why == "own_turn_cut":
+        return result["ok"] is False and result["answered"] is False and result["text"] == ""
+    return False
+
+
+def holds(s: dict | None) -> bool:
+    """The steer's attempt was written under the `held` capability (ruling J): only its N's end can be held, or its
+    S run as a turn of its own."""
+    return isinstance(s, dict) and s.get("holds") is True
+
+
+def _finite(meta: dict) -> dict:
+    """Optional metadata with every non-finite number left out, so it can never break serialising a report."""
+    import math
+    return {k: v for k, v in meta.items() if not (isinstance(v, float) and not math.isfinite(v))}
+
+
+def turn_fields(x: Any, *, answered: bool = False) -> dict | None:
+    """A turn's end as a node sends it (ok, detail, denials, meta, text, answered), checked like an event's, else
+    None. S's own result on `next_turn`, and the checkpoint (`checkpoint`: `answered`, true, is required there: N's
+    native end is the provider's own). Non-finite numbers in `meta` are left out."""
+    from .hosted import _TOOL_NAME
+    if not isinstance(x, dict) or set(x) - {"ok", "detail", "denials", "meta", "text", "answered", "message"}:
+        return None
+    if answered and x.get("answered") is not True:
+        return None
+    ok, detail, text = x.get("ok"), x.get("detail", ""), x.get("text", "")
+    denials, meta, answered = x.get("denials", []), x.get("meta", {}), x.get("answered", False)
+    if not isinstance(ok, bool) or not isinstance(answered, bool):
+        return None
+    if not isinstance(detail, str) or len(detail) > 300:
+        return None
+    if not isinstance(text, str) or len(text.encode("utf-8", "replace")) > REPLY_LIMIT:
+        return None
+    if (not isinstance(denials, list) or len(denials) > 50
+            or any(not isinstance(d, str) or not _TOOL_NAME.fullmatch(d) for d in denials)):
+        return None
+    if (not isinstance(meta, dict) or len(meta) > 20 or any(
+            not isinstance(k, str) or len(k) > 40 or not (
+                v is None or isinstance(v, (bool, int, float)) or (isinstance(v, str) and len(v) <= 200))
+            for k, v in meta.items())):
+        return None
+    return {"ok": ok, "detail": detail, "denials": list(denials), "meta": _finite(dict(meta)), "text": text,
+            "answered": answered}
+
+
+def native(m: dict) -> dict | None:
+    """N's committed checkpoint (`held`): N's native end (ok, detail, denials, meta, text, answered), or None."""
+    h = m.get("held") if isinstance(m, dict) else None
+    return h if isinstance(h, dict) else None
+
+
+def held_end(m: dict) -> dict:
+    """The end event N's committed checkpoint makes: N's native result (G's rule), with no host's word on S."""
+    h = native(m)
+    return {"kind": "turn_ended", "message": m["n"], "ok": h["ok"], "delivered": True, "detail": h["detail"],
+            "text": h["text"], "denials": h["denials"], "meta": h["meta"], "answered": h["answered"],
+            "restarted_by": None, "steer": None}
+
+
+CHECKPOINT_REFUSED = "the checkpoint does not fit message {n}: {why}"
+
+
+def checkpoint(c, r: dict, held: Any, now: float, by: str) -> None:
+    """The node's checkpoint of N's held native end (G, O): taken once, only from the session's assigned node (the
+    caller checked), for N delivered and in flight there, with a listed, unsettled steer into it, and never once N is
+    settled. Conflict otherwise (the node logs and drops it; it is never resent)."""
+    n = held.get("message") if isinstance(held, dict) else None
+    fields = turn_fields(held, answered=True)
+    if type(n) is not int or n < 1 or fields is None:
+        raise Conflict(CHECKPOINT_REFUSED.format(n=n, why="malformed"))
+    m = _get(c, hosted._msg_key(r["session_id"], n))
+    s = get(c, r["session_id"], n) if has_steers(r) else None
+    if s is not None and not holds(s):
+        raise Conflict(CHECKPOINT_REFUSED.format(n=n, why="its steer was not written under the held capability"))
+    why = ("no such message" if not isinstance(m, dict) else
+           "it is settled" if m.get("state") in hosted.SETTLED else
+           "it is not the turn in flight" if m.get("state") != "delivered" or r.get("in_flight") != n else
+           "it already has one" if native(m) is not None else
+           "it took no steer" if s is None else
+           "its steer is settled" if s.get("outcome") is not None else
+           "its steer was never listed" if s.get("listed_at") is None else None)
+    if why is not None:
+        raise Conflict(CHECKPOINT_REFUSED.format(n=n, why=why))
+    m |= {"held": fields, "updated_at": now}
+    _put(c, hosted._msg_key(r["session_id"], n), m, by, now)
 
 
 def settle(c, r: dict, n: Any, ext: dict | None, now: float) -> dict | None:
     """N (message `n` of session `r`) is being settled, in this transaction: its steer, if it has one, is settled by
     the one precedence rule. `ext`: the owning host's extension on N's own end (`extension`), or None on every other
-    path. Returns the steer as settled (or None). None at once, with no read, for a session that never took one."""
+    path. Returns the steer as settled (or None). None at once, with no read, for a session that never took one.
+    `next_turn` is taken only for a Claude session's steer (an impossible shape otherwise: ignored, rule 2)."""
     if not has_steers(r):
         return None
     s = get(c, r["session_id"], n)
+    if ext is not None and ext.get("outcome") == "next_turn" and not holds(s):
+        ext = None
     if s is None or s.get("outcome") is not None:
         return s
     return _settled(c, s, ext, now)
 
 
+def _clear_held(c, session_id: str, n: Any, now: float) -> None:
+    """A checkpoint left on an N that is settled (an older hub settled it during a downgrade): cleared."""
+    m = _get(c, hosted._msg_key(session_id, n)) if type(n) is int else None
+    if isinstance(m, dict) and m.get("state") in hosted.SETTLED and "held" in m:
+        m.pop("held", None)
+        m["updated_at"] = now
+        _put(c, hosted._msg_key(session_id, n), m, "hub", now)
+
+
 def _settled(c, s: dict, ext: dict | None, now: float) -> dict:
+    _clear_held(c, s["session_id"], s.get("into"), now)
     listed = s.get("listed_at") is not None
     if ext is not None and (ext["outcome"] == "not_delivered" or listed):
         outcome, why = ext["outcome"], ext["why"]
     else:
         outcome, why = ("unconfirmed", NO_WORD) if listed else ("not_delivered", NEVER_LISTED)
+    if outcome == "next_turn":
+        # S's own result, kept apart from N's and never added to it (G): its reply lives here, not in the session's.
+        r = ext["result"]
+        s["result"] = {"ok": r["ok"], "detail": r["detail"], "denials": r["denials"], "meta": r["meta"],
+                       "reply": r["text"]}
     s |= {"outcome": outcome, "why": why, "settled_at": now, "text": "", "updated_at": now}
     _put(c, _key(s["session_id"], s["into"]), s, "hub", now)
     return s
@@ -439,10 +574,12 @@ def stale(conn, session_id: str, r: dict | None = None) -> bool:
     if r is not None and not has_steers(r):
         return False
     for s in steers(conn, session_id):
+        m = _get(conn, hosted._msg_key(session_id, s["into"]))
         if s.get("outcome") is None:
-            m = _get(conn, hosted._msg_key(session_id, s["into"]))
             if not isinstance(m, dict) or m.get("state") in hosted.SETTLED:
                 return True
+        elif isinstance(m, dict) and m.get("state") in hosted.SETTLED and "held" in m:
+            return True     # (shoulds) step 2 settled both N and S during a downgrade: the checkpoint is stale
     return False
 
 
@@ -469,6 +606,8 @@ def settle_unsettled(c, r: dict, now: float) -> None:
             m = _get(c, hosted._msg_key(r["session_id"], s["into"]))
             if not isinstance(m, dict) or m.get("state") in hosted.SETTLED:
                 _settled(c, s, None, now)
+        else:
+            _clear_held(c, r["session_id"], s.get("into"), now)     # (shoulds) both settled by an older hub
 
 
 def cancel(c, session_id: str, n: int, now: float, by: str) -> None:

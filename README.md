@@ -626,7 +626,7 @@ every command takes `--json`. One session per agent and project at a time (child
 | mode | what the message does | Claude Code | Codex |
 | --- | --- | --- | --- |
 | `queue` (default) | its own turn: at once if the session is idle, after the turns ahead of it otherwise | yes | yes |
-| `steer` | puts your message into the turn in flight (one you sent, with nothing queued behind it, not one asked for its result as data; one steer per turn). It is no message of its own: the answer names the turn it went into, and that turn's result carries the steer's outcome: `in_turn` (taken into it), `not_delivered` (it never reached the agent: send it again, for example as a queued message) or `unconfirmed` (delivery could not be confirmed, and the agent may have read it) | not yet: refused (its adapter does not steer) | yes (`turn/steer` into a turn proved to be your message's) |
+| `steer` | puts your message into the turn in flight (one you sent, with nothing queued behind it, not one asked for its result as data; one steer per turn). It is no message of its own: the answer names the turn it went into, and that turn's result carries the steer's outcome: `in_turn` (taken into it), `next_turn` (Claude: it ran as a turn of its own right after it; the result carries its reply after the turn's), `not_delivered` (it never reached the agent: send it again, for example as a queued message) or `unconfirmed` (delivery could not be confirmed, and the agent may have read it) | yes, on Claude Code 2.1.330 with turn correlation on (other versions: refused, its adapter does not steer) | yes (`turn/steer` into a turn proved to be your message's) |
 | `restart` | interrupts the turn in flight and runs your message next; refused while other messages are queued for the session; the interrupted turn ends `failed`, "interrupted by a restart: message N replaced it" (one that finished by itself first, or whose CLI refused the interrupt, keeps its own outcome) | yes | yes |
 | `auto` | starts at once when the session is idle, else queues behind the turn in flight; it never restarts; the answer's `why` says which | yes | yes |
 
@@ -644,7 +644,10 @@ being cancelled or was asked for its result as data, something is queued behind 
 settled yet, the turn already took one, or the text is over 12,288 bytes as written to the agent. A restart is refused
 while a steer is unsettled. `--wait` prints the turn's reply and the steer's outcome; with `--output-schema` it is
 refused before anything is sent. `board session list` marks a session with a steer unsettled. Nothing is promised
-about what the model did with it: `in_turn` is evidence that Codex admitted it into that turn.
+about what the model did with it: `in_turn` is evidence that the agent admitted it into that turn. On Claude a steer
+can also miss the turn and run as Claude's next turn (`next_turn`): the turn's result then waits for that one (at most
+another turn timeout), the session's reply stays the turn's own, and `--wait` prints the steer's own reply after it
+(DESIGN_NOTES "Mid-turn steering, step 3: Claude steering, as built").
 
 **Before installing an older hub over one with mid-turn steering**, in this order:
 
@@ -677,6 +680,20 @@ about what the model did with it: `in_turn` is evidence that Codex admitted it i
 The older hub reads the same board.local.toml, so the key has to go at the cut-over itself. A steer left unsettled
 through a downgrade is settled `unconfirmed`, or `not_delivered` if it never reached a node, when the newer hub
 returns. Deploy hubs before nodes, as always.
+
+The steps above are for a target from before mid-turn steering. **Rolling back to the Codex-only steering hub**
+(step 2: it knows the `steer` switch and session protocol 5, but not Claude steering): keep `steer = false` through
+the node-first rollback exactly as in steps 1-3, but do not remove the key at the cut-over (step 4): that hub reads
+it. Decide then, explicitly, when to set `steer = true` again for Codex. Claude steering needs no step of its own,
+but know what the shared database keeps: a node writes a Claude steer only while the hub's own listing names `held`,
+which a step-2 hub never does, so after the cut-over no Claude steer is WRITTEN, whatever version the nodes run. A
+Claude session's record may still carry the `steer` (and `held`) modes its node last reported to the newer hub, and
+a step-2 hub with `steer = true` can ACCEPT a steer into such a session until the node's next report (which, to a
+hub that does not name `held`, carries neither: the node drops them as a pair, and resends a report the hub refused
+for them without them, so no turn's end is lost). Such a steer is never written: the node fences it, and it settles
+with its turn, `not_delivered` or `unconfirmed` by the rule above. Keeping `steer = false` until every Claude node
+has reported once to the step-2 hub avoids even that. A Claude steer already accepted before the cut-over settles by
+the same rule.
 
 A restart is refused with the reason when no turn is in flight, when the turn in flight is a wake or a
 result-delivery turn (the session finishes those untouched), when it is being cancelled, when other messages are

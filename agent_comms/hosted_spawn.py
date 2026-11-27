@@ -1896,6 +1896,8 @@ def taken(x: dict | None) -> dict | None:
         facts["output"] = output_schema.facts(x["output"])     # the verdict; the reply in `text` carries the block
     if isinstance(x.get("steer"), dict):
         facts["steer"] = {"outcome": x["steer"].get("outcome"), "why": x["steer"].get("why")}   # the caller's steer
+        if x["steer"].get("outcome") == "next_turn":
+            facts["steer"] |= {"ok": x["steer"].get("ok"), "detail": x["steer"].get("detail")}  # S's own turn
     return {"result": facts, "text": hosted_results.render([x], header=CLAIM_HEADER)}
 
 

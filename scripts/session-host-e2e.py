@@ -64,7 +64,8 @@ Then the send modes on a running turn (`--only steer` runs nothing else; DESIGN_
 for a Claude session (an agent of its own, whose runner may also run `sleep`) and a Codex one:
 S1/S4. A long turn (the stand-in holds it until the script releases it; a real model runs `sleep 12`), then
     `--mode steer` (DESIGN_NOTES "Mid-turn steering", step 2). Claude (S1): refused with the reason (its adapter does
-    not steer), nothing is sent, and the turn runs to its end. Codex (S4): taken as a steer into that turn (no message
+    not steer: this node runs with Claude steering off, as shipped, so with --claude-bin this proves the shipped
+    configuration on the real CLI), nothing is sent, and the turn runs to its end. Codex (S4): taken as a steer into that turn (no message
     of its own); its `turn/steer` is written once; `--mode steer --wait` (a retry with the same request id) prints
     the turn's reply and exits 0 with the steer `in_turn`.
 S2/S5. A long turn (`sleep 12` again), then `--mode restart --wait`: the long turn ends `interrupted by a restart:
@@ -102,7 +103,8 @@ Q2. M5 on a join: with the real CLI, a probe of its own app-server (the node's f
     a long turn A, then a turn/start J while A runs: the answer names A's turn and J's clientId item comes in it
     (printed raw). With the stand-in, through the node: a turn/start the thread joins (`join-own`), proved and
     steered (`in_turn`).
-Q3. The refusals: a Claude turn (its adapter does not steer); the cap (12,288 bytes); a second steer while one is
+Q3. The refusals: a Claude turn (its adapter does not steer; with a real CLI of a version that steers, step 3, it is
+    refused for having no turn in flight); the cap (12,288 bytes); a second steer while one is
     unsettled; a restart while it is unsettled; `--output-schema` with a steer (refused before sending);
     `board session list` marks it; after N's end no turn is in flight.
 Q4. A parent (the spawning agent's stand-in session, with a spawn grant) steers its Codex child through its own
@@ -116,6 +118,44 @@ Q7. (stand-in only, and only with `--only steering`: it takes 82 s) A partition 
     (the turn not proved yet): the hub is stopped (SIGSTOP) past the node's 75 s contact clock; once it is back and
     the turn proved, the steer is still never written; N completes and the steer is `not_delivered`.
 Q8. Stop; nothing is left; the user's Codex config.toml is unchanged (with --codex-bin).
+(Claude steering ships off by default, `[dispatch.sessions] claude_steer` absent. Every node of this script runs
+with that shipped default except the steering section's own (Q1-Q8 and Z0-Z4, `--only steering`), whose node
+configuration turns it on, `claude_steer = true`: Q3 expects a version that passed gate M8 to steer, and Z1-Z3 steer.)
+Then Claude steering, step 3 (with `--only steering` too; DESIGN_NOTES "Mid-turn steering, step 3: Claude steering,
+as built"), on a hub and a node of their own whose VERIFIED and STEER_MODES name the Claude CLI's version (that node
+process only): the stand-in's, or with --claude-bin the real one's (gate M8 as an e2e check, as M5 is for Codex):
+Z1. A human steer into a Claude tool turn: written once, with its own uuid, into N's owned bracket; N's result lists
+    N's uuid and S's: `in_turn`, exit 0.
+Z2. A human steer into a text-only turn: N's result lists only N; N stays in flight on the hub with its checkpoint
+    (`held`) while an `init` echoing exactly [S] opens S's own turn; then N settles once: N's reply, `next_turn`,
+    S's own reply after it, exit 0 (the raw frames printed: M8's evidence through the node).
+Z3. (stand-in only) A close while S's own turn runs: N's native end first, `next_turn` with S failed ("its own turn
+    was cut"), then the session ends.
+Z10. (stand-in, and the real CLI: gate M8 in a RESUMED process, ruling E) A session answers a first turn; the node
+    restarts, so its next process is started with `--resume`, as the node resumes any hosted session; a human steer
+    into that process's text-only turn: N's result lists exactly [N] and S's own turn exactly [S] (`next_turn`), or
+    N's lists exactly [N, S] (`in_turn`); the raw frames printed. With the real CLI three runs; with E2E_KEEP_FRAMES
+    naming a directory, each run's frames and lines are kept there (for the fixtures).
+Then, stand-in only (review round 1, ruling D), before Z4:
+Z5. A parent steers its Claude child with `board_session_send(mode=steer, wait=true)`, twice (two children): the
+    wait takes N's result with `next_turn`, S's own reply in a block of its own after the hub's line; the second S
+    fails as its own turn, and its failure detail is kept (in the facts and in the text).
+Z6. The node restarts while N is held and S's own turn runs: N's native end, `next_turn` with S cut; the session
+    goes on in a new process and S is never written again.
+Z8. The bound: with a turn timeout of 12 s (that node run only), S's own turn outlasts it: N's native end comes
+    with `next_turn`, S cut ("timed out"), within the bound (two turn timeouts plus 2 x kill_grace of N's end).
+Z9. A turn the CLI starts itself (a background notification) takes S in: `unconfirmed` (`consumed`), exit 6, N's
+    reply as it was.
+Z7. (only with `--only steering`: it takes 82 s) A partition while S's own turn runs: the hub is stopped past the
+    attempt's 75 s contact clock; the node cuts S's turn; once the hub is back, N's native end with `next_turn`, S
+    cut (its contact ran out).
+Z12. (review round 2) The node CRASHES (SIGKILL, no shutdown) while N is held with its checkpoint committed: the
+    node started again settles N by the checkpoint (N's own reply), S `unconfirmed`; the session goes on and S is
+    never written again.
+Z11. (only with `--only steering`: it takes 82 s) A partition with NO committed checkpoint: the hub is stopped right
+    after S is written, before N ends, past the attempt's contact clock; the checkpoint is never taken; once the hub
+    is back N settles by the node's own end, S cut.
+Z4. Stop; nothing is left; no steer text in the node's log.
 Last, parent and child sessions (`--only tree` runs nothing else; `--only claude`, `--only codex` and --with-board
 skip it). Everything above ran with child sessions OFF, as shipped. The hub and the node are then started again over
 the same temp directory with `[dispatch.sessions.spawn] enabled = true` on the hub, and on the node a worktree
@@ -307,10 +347,14 @@ MARKER = "E2E-BODY-MARKER-4c1e9a"
 BODY_WORDS = ("zebra", "quartz", "lantern")
 
 # The turn-correlation steps' node (X1-X4): the node, with VERIFIED set to argv[1] in this process only.
+from agent_comms.providers.claude import STEER_MODES   # noqa: E402  (Q3: which Claude versions steer, as shipped)
+
 NODE_VERIFIED = """
-import sys
+import os, sys
 from agent_comms.providers import claude
 claude.VERIFIED = frozenset(sys.argv[1].split(","))
+if os.environ.get("E2E_STEER_MODES"):       # Claude steering's e2e: gate M8's record for the CLI under test
+    claude.STEER_MODES = dict(x.split("=", 1) for x in os.environ["E2E_STEER_MODES"].split(","))
 from agent_comms.cli import main
 main(sys.argv[2:])
 """
@@ -742,6 +786,9 @@ codex = true
     def spawn(self, name: str, home: Path, *argv: str, **extra_env: str) -> subprocess.Popen:
         log = open(self.tmp / "logs" / f"{name}.log", "a")     # a restarted node goes on in the same file
         verified = getattr(self, "node_verified", None) if name == "node" else None
+        steers = getattr(self, "node_steer_modes", None) if name == "node" else None
+        if steers:
+            extra_env = extra_env | {"E2E_STEER_MODES": ",".join(f"{v}={m}" for v, m in sorted(steers.items()))}
         start = ["-c", NODE_VERIFIED, ",".join(sorted(verified))] if verified else ["-m", "agent_comms.cli"]
         proc = subprocess.Popen([sys.executable, *start, *argv], cwd=str(self.tmp), stdout=log,
                                 stderr=subprocess.STDOUT, env=self.env | {"AGENT_COMMS_HOME": str(home)} | extra_env)
@@ -1166,7 +1213,9 @@ codex = true
         running(sid, 1)
         pid = self.show(sid)["pid"]
         if label == "Claude":
-            # Step 2: Claude's adapter does not steer; the send is refused with the reason and nothing is made for it.
+            # Step 2, and the shipped configuration (this node runs with Claude steering off, `claude_steer` absent):
+            # Claude's adapter does not steer, real CLI or stand-in; the send is refused with the reason, as on main,
+            # and nothing is made for it.
             out, err, _ = self.board("session", "send", sid, steer, "--mode", "steer", ok=False)
             self.check(steer_no in err, "a steer is refused with the reason, and nothing is sent")
             self.check(len(self.show(sid)["messages"]) == 1, "no message was made for it")
@@ -1304,6 +1353,431 @@ codex = true
         if start is None:
             raise SystemExit("FAIL: no turn/start was written for the Codex session")
         return sid, start["id"], (start.get("params") or {}).get("clientUserMessageId")
+
+    # ------------------------------------------------------------ Claude steering, step 3 (--only steering)
+
+    Z_STEER = "Change of plan from me: include the codeword PINEAPPLE in your reply."
+
+    def _claude_root(self, text: str, model: list[str]) -> str:
+        out, _, _ = self.board("session", "start", str(self.project), text, "--agent", STEER_AGENT, *model, "--json")
+        return json.loads(out)["session"]["session_id"]
+
+    def _z_line(self, text: str) -> dict | None:
+        return next((x for x in reversed(self.written_lines()) if x["message"]["content"] == text), None)
+
+    def _z_steer(self, sid: str, rid: str, text: str) -> tuple[int, dict, str, dict | None]:
+        out, _, _ = self.board("session", "send", sid, text, "--mode", "steer", "--request-id", rid, "--json")
+        sent = json.loads(out)
+        self.check(sent["message"] is None and sent["steer"]["into"] == 1 and sent["steer"]["state"] == "accepted",
+                   "the steer is accepted as a steer into message 1")
+        deadline, line = time.monotonic() + 20, None
+        while line is None and time.monotonic() < deadline:
+            line = self._z_line(text)
+            time.sleep(0.05)
+        return 0, sent, out, line
+
+    def _z_wait(self, sid: str, rid: str, text: str) -> tuple[int, dict, str]:
+        rc, out, err = self.board_rc("session", "send", sid, text, "--mode", "steer", "--request-id", rid, "--wait",
+                                     "--json")
+        data = json.loads(out) if out.strip().startswith("{") else {}
+        return rc, data, err
+
+    def claude_steering_scenario(self) -> None:
+        """Z1-Z3 (the module text)."""
+        real = self.real
+        model = ["--model", "haiku"]
+        [version] = sorted(self.node_verified)
+        print(f"\n[Z0] a hub and a node of their own; the node runs with {version} in VERIFIED and STEER_MODES "
+              f"({self.node_steer_modes[version]}), that node process only; the Claude agent is "
+              + (f"the real CLI ({self.args.claude_bin})" if real else "the stand-in"))
+
+        print("\n[Z1] a human steer into a Claude tool turn: board session send <id> <text> --mode steer --wait")
+        hold = self.tmp / "z1-release"
+        n_text = ("Run this exact shell command once, with your Bash tool, and nothing else first: `sleep 10`. When it "
+                  "has finished, reply with one line: DONE followed by any codeword you were given.") if real \
+            else f"hold {hold} z1"
+        sid = self._claude_root(n_text, model)
+        self._running(sid, 1, real)
+        _, _, _, line = self._z_steer(sid, "z1", self.Z_STEER)
+        n_line = self._z_line(n_text)
+        print(f"  written: {json.dumps(line)[:240]}")
+        self.check(line is not None and isinstance(line.get("uuid"), str) and line["uuid"] != n_line.get("uuid"),
+                   "S was written once, as a user line with its own uuid")
+        if not real:
+            hold.touch()
+        rc, data, err = self._z_wait(sid, "z1", self.Z_STEER)
+        steer = data.get("steer") or {}
+        frames = self.transcript(sid)
+        n_res = next((f for f in frames if f.get("type") == "result"
+                      and n_line.get("uuid") in (f.get("user_message_uuids") or [])), {})
+        print(f"  exit {rc}; steer {steer.get('outcome')} ({steer.get('why')}); N's result echoes "
+              f"{n_res.get('user_message_uuids')}")
+        if real and steer.get("outcome") != "in_turn":
+            print("  (Claude put S elsewhere: the real CLI decides alone; Z2 measures the other path)")
+        else:
+            self.check(rc == 0 and steer.get("outcome") == "in_turn"
+                       and line["uuid"] in (n_res.get("user_message_uuids") or []),
+                       "in_turn: N's result lists N's uuid and S's; exit 0")
+        self.check(sum(1 for x in self.written_lines() if x["message"]["content"] == self.Z_STEER) == 1,
+                   "the retry with --wait sent nothing again")
+        self._close(sid)
+
+        print("\n[Z2] a human steer into a text-only turn: N's end is held; S runs as its own turn (next_turn)")
+        z2 = self.Z_STEER + " z2"
+        n_text = ("Write a story of about 500 words about a lighthouse keeper, then a last line: DONE followed by any "
+                  "codeword you were given. Use no tools.") if real else "think 4 z2"
+        s_text = z2 if real else "sleep 3 " + z2
+        sid = self._claude_root(n_text, model)
+        m = self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        self.check(m is not None, "message 1's turn is in flight")
+        time.sleep(1.0 if real else 0.3)
+        _, _, _, line = self._z_steer(sid, "z2", s_text)
+        n_line = self._z_line(n_text)
+        if not real:
+            # while S's own turn runs (3 s), N is still in flight on the hub, with its checkpoint
+            deadline, held = time.monotonic() + 20, None
+            while held is None and time.monotonic() < deadline:
+                held = self.held_of(sid, 1)
+                time.sleep(0.2)
+            self.check(held is not None and self.show(sid)["messages"][0]["state"] == "delivered",
+                       "N's native end is checkpointed (`held`) while N stays in flight")
+        rc, data, err = self._z_wait(sid, "z2", s_text)
+        steer = data.get("steer") or {}
+        frames = self.transcript(sid)
+        n_res = next((f for f in frames if f.get("type") == "result"
+                      and n_line.get("uuid") in (f.get("user_message_uuids") or [])), {})
+        s_init = next((f for f in frames if f.get("subtype") == "init"
+                       and line and (f.get("user_message_uuids") or []) == [line["uuid"]]), {})
+        s_res = next((f for f in frames if f.get("type") == "result"
+                      and line and (f.get("user_message_uuids") or []) == [line["uuid"]]), {})
+        print("  M8 raw evidence through the node:")
+        print(f"    N's result: uuids {n_res.get('user_message_uuids')} origin {n_res.get('origin')} "
+              f"num_turns {n_res.get('num_turns')}")
+        print(f"    S's init:   uuids {s_init.get('user_message_uuids')} origin {s_init.get('origin')}")
+        print(f"    S's result: uuids {s_res.get('user_message_uuids')} origin {s_res.get('origin')} "
+              f"num_turns {s_res.get('num_turns')}")
+        own = steer.get("result") or {}
+        print(f"  exit {rc}; steer {steer.get('outcome')} ({steer.get('why')}); N's reply {(data.get('reply') or '')[-60:]!r}; "
+              f"S's reply {(own.get('reply') or '')[-60:]!r}")
+        self.check(rc == 0 and steer.get("outcome") == "next_turn" and own.get("ok") is True and s_init and s_res
+                   and (n_res.get("user_message_uuids") or []) == [n_line.get("uuid")],
+                   "next_turn: N's result lists only N; an init echoing exactly [S] opened S's own turn; N settled "
+                   "once with S's own reply; exit 0")
+        self.check(self.show(sid)["reply"] == data.get("reply"), "the session's reply stays N's")
+        self.check(self.held_of(sid, 1) is None, "the checkpoint is cleared with N's settlement")
+        self._close(sid)
+
+        for i in range(1, 4 if real else 2):
+            self._z10_resumed(model, i)
+
+        if not real:
+            print("\n[Z3] a close while S's own turn runs: N's native end, next_turn with S cut, then the end")
+            sid = self._claude_root("think 2 z3", model)
+            self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+            time.sleep(0.3)
+            self._z_steer(sid, "z3", "sleep 30 " + self.Z_STEER + " z3")
+            deadline = time.monotonic() + 20
+            while self.held_of(sid, 1) is None and time.monotonic() < deadline:
+                time.sleep(0.2)
+            time.sleep(1.0)
+            self._close(sid)
+            st = self.steer_of(sid, 1)
+            m = self.show(sid)["messages"][0]
+            print(f"  N {m['state']} ({m.get('detail')!r}); steer {st.get('outcome')} ({st.get('why')}); "
+                  f"S's result {(st.get('result') or {}).get('detail')!r}")
+            self.check(m["state"] == "done" and st.get("outcome") == "next_turn"
+                       and str((st.get("result") or {}).get("detail")).startswith("its own turn was cut"),
+                       "N's native end, then next_turn with S failed: its own turn was cut")
+            self._z5_parent(model)
+            self._z6_restart(model)
+            self._z8_bound(model)
+            self._z9_cli_turn(model)
+            self._z12_crash(model)
+            if self.args.only == "steering":
+                self._z7_partition(model)
+                self._z11_partition_without_checkpoint(model)
+
+    def crash_node(self) -> None:
+        """SIGKILL the node (no shutdown, nothing reported), then start another over the same home and logs."""
+        proc = next(p for n, p in self.procs if n == "node")
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(40)
+        self.procs = [(n, p) for n, p in self.procs if p is not proc]
+        self.node_runs += 1
+        self.spawn("node", self.node_home, "node", "--hub", f"http://127.0.0.1:{self.node_port}", "--name", NODE,
+                   AGENT_COMMS_TOKEN=self.node_token)
+        self.wait_for("the node to connect again",
+                      lambda: self.log_text("node").count("connected to") >= self.node_runs)
+
+    def _z12_crash(self, model: list[str]) -> None:
+        print("\n[Z12] the node crashes (SIGKILL) while N is held with its checkpoint committed")
+        sid = self._claude_root("think 2 z12", model)
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        time.sleep(0.3)
+        text = "sleep 60 steer before the crash z12"
+        self._z_steer(sid, "z12", text)
+        held = self._z_held(sid)
+        self.check(held is not None and held.get("text") == "turn 1: THINK 2 Z12", "N's checkpoint is committed")
+        self.crash_node()
+        m = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 120)
+        st = self.steer_of(sid, 1)
+        print(f"  N {m and m['state']} {m and m.get('detail')!r}; steer {st.get('outcome')} ({st.get('why')})")
+        self.check(m is not None and m["state"] == "done" and self.show(sid)["reply"] == "turn 1: THINK 2 Z12"
+                   and st.get("outcome") == "unconfirmed",
+                   "the restarted node's LOST settles N by its checkpoint (N's own reply); S unconfirmed")
+        out, _, _ = self.board("session", "send", sid, "after the crash", "--wait")
+        self.check("AFTER THE CRASH" in out and len(self._z_framed(text)) == 1,
+                   "the session goes on in a new process, and S was never written again")
+        self._close(sid)
+
+    def _z11_partition_without_checkpoint(self, model: list[str]) -> None:
+        print("\n[Z11] (--only steering) a partition with no committed checkpoint: the hub stopped for 82 s from "
+              "before N's end")
+        sid = self._claude_root("think 4 z11", model)
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        time.sleep(0.3)
+        self._z_steer(sid, "z11", "sleep 150 steer across a partition z11")
+        hub = next(p for n, p in self.procs if n == "hub")
+        hub.send_signal(signal.SIGSTOP)
+        try:
+            time.sleep(82)
+        finally:
+            hub.send_signal(signal.SIGCONT)
+        self._z_cut(sid, "contact", "N's native end from the node's own report; next_turn with S cut: its contact")
+        self.check(self.held_of(sid, 1) is None, "no checkpoint was ever committed")
+        self._close(sid)
+
+    def _z10_resumed(self, model: list[str], i: int) -> None:
+        real = self.real
+        print(f"\n[Z10.{i}] M8 in a resumed process: the node restarts; a steer into the resumed process's turn")
+        first = "Reply with exactly the word: ready" if real else "ready"
+        out, _, _ = self.board("session", "start", str(self.project), first, "--agent", STEER_AGENT, *model,
+                               "--wait", "--json")
+        sid = json.loads(out)["session"]["session_id"]
+        resumes = self.resumes(sid)
+        self.restart_node()
+        n_text = ("Write a story of about 500 words about a lighthouse keeper, then a last line: DONE followed by any "
+                  f"codeword you were given. Use no tools. (z10 {i})") if real else f"think 4 z10 {i}"
+        s_text = f"{self.Z_STEER} z10 {i}" if real else f"sleep 2 steer into a resumed process z10 {i}"
+        self.board("session", "send", sid, n_text)
+        m = self.message(sid, 2, lambda m: m["state"] == "delivered", 90)
+        self.check(m is not None and self.resumes(sid) == resumes + 1,
+                   "message 2's turn is in flight in ONE new process, started with --resume")
+        time.sleep(1.5 if real else 0.3)
+        out, _, _ = self.board("session", "send", sid, s_text, "--mode", "steer", "--request-id", f"z10-{i}", "--json")
+        sent = json.loads(out)
+        self.check(sent["message"] is None and sent["steer"]["into"] == 2, "the steer is accepted into message 2")
+        rc, data, err = self._z_wait(sid, f"z10-{i}", s_text)
+        steer = data.get("steer") or {}
+        n_line, s_line = self._z_line(n_text) or {}, self._z_line(s_text) or {}
+        n_u, s_u = n_line.get("uuid"), s_line.get("uuid")
+        frames = self.transcript(sid)
+        n_res = next((f for f in frames if f.get("type") == "result" and n_u in (f.get("user_message_uuids") or [])),
+                     {})
+        s_init = next((f for f in frames if f.get("subtype") == "init" and (f.get("user_message_uuids") or []) == [s_u]),
+                      {})
+        s_res = next((f for f in frames if f.get("type") == "result" and (f.get("user_message_uuids") or []) == [s_u]),
+                     {})
+        print("  M8 raw evidence through the node (resumed process):")
+        print(f"    N's result: uuids {self._z_names(n_res.get('user_message_uuids'), n_u, s_u)} origin "
+              f"{n_res.get('origin')} num_turns {n_res.get('num_turns')}")
+        print(f"    S's init:   uuids {self._z_names(s_init.get('user_message_uuids'), n_u, s_u)} origin "
+              f"{s_init.get('origin')}")
+        print(f"    S's result: uuids {self._z_names(s_res.get('user_message_uuids'), n_u, s_u)} origin "
+              f"{s_res.get('origin')} num_turns {s_res.get('num_turns')}")
+        own = steer.get("result") or {}
+        print(f"  exit {rc}; steer {steer.get('outcome')} ({steer.get('why')}); S's reply "
+              f"{(own.get('reply') or '')[-60:]!r}")
+        if steer.get("outcome") == "in_turn":
+            self.check(rc == 0 and (n_res.get("user_message_uuids") or []) == [n_u, s_u],
+                       "in_turn: N's result lists exactly [N, S]; exit 0")
+        else:
+            self.check(rc == 0 and steer.get("outcome") == "next_turn" and own.get("ok") is True and s_init and s_res
+                       and (n_res.get("user_message_uuids") or []) == [n_u] and s_init.get("origin") is None,
+                       "next_turn: N's result lists exactly [N]; an init listing exactly [S] (no origin) opened S's "
+                       "own turn and a result listing exactly [S] ended it; exit 0")
+        self.check(self.held_of(sid, 2) is None, "no checkpoint left")
+        keep = os.environ.get("E2E_KEEP_FRAMES")
+        if keep:
+            start = next((k for k, f in enumerate(frames) if f.get("type") == "command_lifecycle"
+                          and f.get("command_uuid") == n_u), 0)
+            Path(keep).mkdir(parents=True, exist_ok=True)
+            (Path(keep) / f"resumed-{i}.json").write_text(json.dumps(
+                {"N": n_u, "S": s_u, "frames": frames[start:], "outcome": steer}, indent=1))
+        self._close(sid)
+
+    @staticmethod
+    def _z_names(uuids, n_u, s_u):
+        return None if uuids is None else ["N" if u == n_u else "S" if u == s_u else "other" for u in uuids]
+
+    def _z_framed(self, text: str) -> list[dict]:
+        """Every user line written to a Claude process whose text contains `text` (a parent's steer is framed)."""
+        return [x for x in self.written_lines() if text in str(x["message"]["content"])]
+
+    def _z_held(self, sid: str, seconds: float = 20) -> dict | None:
+        deadline, held = time.monotonic() + seconds, None
+        while held is None and time.monotonic() < deadline:
+            held = self.held_of(sid, 1)
+            time.sleep(0.2)
+        return held
+
+    def _z_cut(self, sid: str, words: str, what: str) -> None:
+        """N's native end with `next_turn`, S failed as cut (`words` in its detail): N done, its reply N's."""
+        m = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 120)
+        st = self.steer_of(sid, 1)
+        own = st.get("result") or {}
+        print(f"  N {m and m['state']}; steer {st.get('outcome')} ({st.get('why')}); S's result ok {own.get('ok')} "
+              f"{own.get('detail')!r}")
+        self.check(m is not None and m["state"] == "done" and st.get("outcome") == "next_turn"
+                   and own.get("ok") is False and str(own.get("detail")).startswith("its own turn was cut")
+                   and words in str(own.get("detail")), what)
+
+    def _z5_parent(self, model: list[str]) -> None:
+        print("\n[Z5] a parent steers its Claude child with board_session_send(mode=steer, wait=true): next_turn")
+        out, _, _ = self.board("session", "start", str(self.project), "ready", "--agent", SPAWN_AGENT, "--model",
+                               "haiku", "--wait", "--json")
+        rid = json.loads(out)["session"]["session_id"]
+        self.board("session", "grant", str(self.project), "--agent", SPAWN_AGENT, "--access", "workspace",
+                   "--hours", "1")
+        busy = self.tmp / "z5-parent"
+        # The parent is in a turn of its own meanwhile (as a parent that waits is): the child's result waits for it.
+        self.board("session", "send", rid, f"hold {busy} z5 parent")
+        self._running(rid, 2, False)
+        kids = []
+        for name, steer, ok in (("z5", "plum please z5", True), ("z5b", "fail-own z5b", False)):
+            [made] = self.mcp_calls(SPAWN_AGENT, [["board_session_spawn", {
+                "task": f"think 6 {name}", "child_agent": STEER_AGENT, "access": "read-only"}]], rid)
+            if made["error"]:
+                raise SystemExit(f"FAIL: the Claude child was refused: {made['text'][:600]}")
+            kid = json.loads(made["text"])["child"]["id"]
+            kids.append(kid)
+            self.message(kid, 1, lambda m: m["state"] == "delivered", 90)
+            time.sleep(0.5)
+            got: list = []
+            th = threading.Thread(target=lambda: got.append(self.mcp_calls(SPAWN_AGENT, [["board_session_send", {
+                "child": kid, "message": steer, "mode": "steer", "wait": True}]], rid)))
+            th.start()
+            th.join(120)
+            [sent] = got[0] if got else [{"error": True, "text": "no answer"}]
+            answer = json.loads(sent["text"]) if not sent["error"] else {}
+            facts = (answer.get("result") or {}).get("result") or {}
+            text = (answer.get("result") or {}).get("text") or ""
+            st = facts.get("steer") or {}
+            print(f"  {name}: status {answer.get('steer_status')}; result steer {st}"
+                  + (f"; ERROR {sent['text'][:600]}" if sent["error"] else ""))
+            lines = self._z_framed(steer)
+            self.check(len(lines) == 1 and "A message sent while your turn was running" in json.dumps(lines[0]),
+                       f"{name}: the parent's text went once, in the follow-up frame that says what it is")
+            self.check((answer.get("steer_status") or {}).get("outcome") == "next_turn"
+                       and st.get("outcome") == "next_turn" and st.get("ok") is ok,
+                       f"{name}: wait=true took N's result with the steer's outcome next_turn, S's own turn "
+                       + ("succeeded" if ok else "failed"))
+            head, _, tail = text.partition("\nYour steer (sent while this turn ran) ran as a turn of its own after "
+                                           "it; its reply follows.\n<<<child-output ")
+            self.check(f"THINK 6 {name.upper()}" in head and "<<<end child-output " in head and tail
+                       and ("PLUM PLEASE Z5" in tail if ok else "FAIL-OWN Z5B" in tail),
+                       f"{name}: N's reply in its block; the hub's line; S's own reply in a block of its own after it")
+            if not ok:
+                self.check("detail" in st and "The steer's own turn failed: " in head,
+                           f"{name}: S's failure detail is kept, in the facts and in the text")
+        busy.touch()
+        self.board("session", "close", rid)
+        self.check(all(self.wait_ended(x, 40)["state"] == "ended" for x in [rid, *kids]), "closed, with its children")
+
+    def _z6_restart(self, model: list[str]) -> None:
+        print("\n[Z6] the node restarts while N is held and S's own turn runs")
+        sid = self._claude_root("think 2 z6", model)
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        time.sleep(0.3)
+        text = "sleep 60 steer before the restart z6"
+        self._z_steer(sid, "z6", text)
+        self.check(self._z_held(sid) is not None, "N is held (its checkpoint on the hub)")
+        time.sleep(1.0)
+        self.restart_node()
+        self._z_cut(sid, "", "N's native end; next_turn with S cut at the node's stop")
+        out, _, _ = self.board("session", "send", sid, "after the restart", "--wait")
+        self.check("AFTER THE RESTART" in out and len(self._z_framed(text)) == 1,
+                   "the session goes on in a new process, and S was never written again")
+        self._close(sid)
+
+    def _z8_bound(self, model: list[str]) -> None:
+        print("\n[Z8] the bound: S's own turn outlasts a 12 s turn timeout (this node run only)")
+        conf = self.node_home / "board.toml"
+        before = conf.read_text()
+        conf.write_text(before.replace("[dispatch]\n", "[dispatch]\ntimeout_minutes = 0.2\n", 1))
+        try:
+            self.restart_node()
+            sid = self._claude_root("think 2 z8", model)
+            self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+            time.sleep(0.3)
+            self._z_steer(sid, "z8", "sleep 90 steer past the bound z8")
+            self.check(self._z_held(sid) is not None, "N is held")
+            t0 = time.monotonic()
+            self._z_cut(sid, "timed out", "N's native end; next_turn with S cut by the turn timeout")
+            took = time.monotonic() - t0
+            print(f"  N settled {took:.1f} s after its checkpoint was seen")
+            self.check(took <= 2 * 12 + 2 * 5 + 5, "within the bound: two turn timeouts plus 2 x kill_grace")
+            self._close(sid)
+        finally:
+            conf.write_text(before)
+            self.restart_node()
+
+    def _z9_cli_turn(self, model: list[str]) -> None:
+        print("\n[Z9] a turn the CLI starts itself takes S in: unconfirmed (consumed)")
+        sid = self._claude_root("think 2 bg 0.3 1 take z9", model)
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        time.sleep(0.3)
+        text = "steer taken by the cli z9"
+        self._z_steer(sid, "z9", text)
+        rc, data, err = self._z_wait(sid, "z9", text)
+        steer = data.get("steer") or {}
+        frames = self.transcript(sid)
+        took = [f for f in frames if f.get("type") == "result" and (f.get("origin") or {}).get("kind")
+                == "task-notification" and "STEER TAKEN BY THE CLI Z9" in str(f.get("result"))]
+        print(f"  exit {rc}; steer {steer.get('outcome')} ({steer.get('why')}); N's reply {data.get('reply')!r}")
+        self.check(took and rc == 6 and (steer.get("outcome"), steer.get("why")) == ("unconfirmed", "consumed")
+                   and "THINK 2 BG" in str(data.get("reply")),
+                   "the CLI's own turn took S: unconfirmed (consumed), exit 6; N's reply as it was")
+        self._close(sid)
+
+    def _z7_partition(self, model: list[str]) -> None:
+        print("\n[Z7] (--only steering) a partition while S's own turn runs: the hub is stopped for 82 s")
+        sid = self._claude_root("think 2 z7", model)
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        time.sleep(0.3)
+        self._z_steer(sid, "z7", "sleep 150 steer across a partition z7")
+        self.check(self._z_held(sid) is not None, "N is held")
+        time.sleep(1.0)
+        hub = next(p for n, p in self.procs if n == "hub")
+        hub.send_signal(signal.SIGSTOP)
+        try:
+            time.sleep(82)
+        finally:
+            hub.send_signal(signal.SIGCONT)
+        self._z_cut(sid, "contact", "N's native end; next_turn with S cut: the attempt's contact ran out")
+        self._close(sid)
+
+    def hub_rows(self, key: str) -> list:
+        """One board_state value of the hub's database, read by another process (read only)."""
+        code = ("import json, sys\nfrom agent_comms.config import Settings\nfrom agent_comms.core import Board\n"
+                "b = Board(Settings.load())\n"
+                "rows = [json.loads(v) for (v,) in b.conn.execute('SELECT value FROM board_state WHERE key = ?', "
+                "(sys.argv[1],))]\nprint(json.dumps(rows))")
+        r = subprocess.run([sys.executable, "-c", code, key], cwd=str(self.tmp), capture_output=True, text=True,
+                           timeout=60, env=self.env | {"AGENT_COMMS_HOME": str(self.hub_home)})
+        if r.returncode != 0:
+            raise SystemExit(f"could not read the hub's database:\n{r.stderr[-2000:]}")
+        return json.loads(r.stdout)
+
+    def held_of(self, sid: str, n: int) -> dict | None:
+        """N's checkpoint as the hub keeps it (its database, read only)."""
+        rows = self.hub_rows(f"host.msg.{sid}.{n}")
+        m = rows[0] if rows else {}
+        return m.get("held") if isinstance(m, dict) else None
+
+    def steer_of(self, sid: str, n: int) -> dict:
+        rows = self.hub_rows(f"host.steer.{sid}.{n}")
+        return rows[0] if rows else {}
 
     def steering_scenario(self) -> None:
         """Q1-Q7 (the module text)."""
@@ -1487,9 +1961,15 @@ codex = true
                                "--wait", "--json")
         cl = json.loads(out)["session"]["session_id"]
         rc, _, err = self.board_rc("session", "send", cl, self.STEER_TEXT, "--mode", "steer")
-        self.check(rc != 0 and "cannot steer into a running turn (its node says so)" in err
-                   and len(self.show(cl)["messages"]) == 1,
-                   "Claude: refused with the reason (its adapter does not steer), nothing is made")
+        if self.real and self.cli_version() in STEER_MODES:
+            # Step 3: a verified process of a version that passed gate M8 steers (Z1-Z3); with nothing in flight
+            # the steer is refused as idle, and nothing is made.
+            self.check(rc != 0 and "no turn is in flight" in err and len(self.show(cl)["messages"]) == 1,
+                       "Claude (a version that steers): refused with nothing in flight, nothing is made")
+        else:
+            self.check(rc != 0 and "cannot steer into a running turn (its node says so)" in err
+                       and len(self.show(cl)["messages"]) == 1,
+                       "Claude: refused with the reason (its adapter does not steer), nothing is made")
         self._close(cl)
         sid, _, _ = self._codex_root(self.LONG if real else f"hold {hold} q3", model)
         self._running(sid, 1, real)
@@ -2039,7 +2519,7 @@ codex = true
         hub = (self.hub_home / "board.toml").read_text()
         hub = hub.replace(f"agents = {toml_list([AGENT, CODEX_AGENT, STEER_AGENT, CORR_AGENT])}", "agents = " + toml_list(
             [AGENT, CODEX_AGENT, FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, SPAWN_AGENT, WORK_AGENT,
-             CHECK_CODEX, DENIED_CODEX]))
+             CHECK_CODEX, DENIED_CODEX, STEER_AGENT]))
         hub = hub.replace(f"projects = {toml_list([str(self.project)])}",
                           f"projects = {toml_list([str(self.project), str(self.project_mode)])}")
         (self.hub_home / "board.toml").write_text(hub + "\n[dispatch.sessions.spawn]\nenabled = true\n"
@@ -2057,7 +2537,9 @@ codex = true
             self.git("commit", "-q", "-m", "init")
 
     def node_settings(self, allow_full: bool) -> None:
-        """The node's board.toml for the tree scenario."""
+        """The node's board.toml for the tree scenario (and the steering section's, which alone switches Claude
+        steering on: `claude_steer_on`)."""
+        self.node_allow_full = allow_full
         exe = str(self.tmp / "bin" / "claude")
         quiet = ["--setting-sources=", "--strict-mcp-config"] if self.real else []
         # The two runners that load a settings fixture: the fixture itself through --settings, and of the settings
@@ -2075,6 +2557,8 @@ codex = true
                    "--allowedTools=mcp__agent-comms"]
         # A1: the work account's runner: the ordinary one, through the wrapper that records its environment.
         work = [str(self.tmp / "bin-work" / "claude"), "-p", "{prompt}", "--permission-mode", "dontAsk", *quiet]
+        # Z1-Z3 (Claude steering): the send-mode runner, `sleep` allowed (a turn that waits in a tool call)
+        steering = [exe, "-p", "{prompt}", "--permission-mode", "dontAsk", *quiet, "--allowedTools", "Bash(sleep:*)"]
         (self.node_home / "board.toml").write_text(f"""[conversations]
 enabled = false
 
@@ -2090,6 +2574,7 @@ worktree_dir = {json.dumps(str(self.worktrees))}
 {RESTRICTED_AGENT} = {toml_list(restricted)}
 {SPAWN_AGENT} = {toml_list(spawner)}
 {WORK_AGENT} = {toml_list(work)}
+{STEER_AGENT} = {toml_list(steering)}
 {CODEX_AGENT} = {toml_list(self.codex_runner())}
 {CHECK_CODEX} = {toml_list(self.board_codex_runner(CHECK_CODEX, approve=True))}
 {DENIED_CODEX} = {toml_list(self.board_codex_runner(DENIED_CODEX, approve=False))}
@@ -2104,6 +2589,7 @@ worktree_dir = {json.dumps(str(self.worktrees))}
 [dispatch.sessions]
 enabled = true
 codex = true
+{"claude_steer = true" if getattr(self, "claude_steer_on", False) else ""}
 allow_full_access = {"true" if allow_full else "false"}
 max_live = 8
 """)
@@ -3926,8 +4412,12 @@ def main() -> int:
                           "the user's own Claude settings files (~/.claude/settings.json, settings.local.json) are "
                           "what they were before the run: the settings fixtures live in the temp directory only")
         if steering:
-            # Its own hub and node, with child sessions on (the tree scenario's settings), after the others stopped.
+            # Its own hub and node, with child sessions on (the tree scenario's settings), after the others stopped;
+            # the one node of this script with Claude steering switched on (`claude_steer = true`): every earlier
+            # section ran with the shipped default.
             run.enable_tree()
+            run.claude_steer_on = True
+            run.node_settings(run.node_allow_full)
             run.start_services()
             run.steering_scenario()
             print("\n[Q8] stopping the node (SIGTERM) and the hub")
@@ -3935,6 +4425,18 @@ def main() -> int:
             run.check(run.leftovers() == [], "no session process is left behind")
             if run.real_codex:
                 run.check_codex_config(config_before)
+            # Claude steering (step 3): its own hub and node, VERIFIED and STEER_MODES naming the CLI under test.
+            run.node_verified = {run.cli_version()}
+            run.node_steer_modes = {v: "next_turn" for v in run.node_verified}
+            try:
+                run.start_services()
+                run.claude_steering_scenario()
+                print("\n[Z4] stopping the node (SIGTERM) and the hub")
+                run.stop()
+                run.check(run.leftovers() == [], "no session process is left behind")
+                run.check(run.Z_STEER not in run.log_text("node"), "no steer text in the node's log")
+            finally:
+                run.node_verified = run.node_steer_modes = None
         print("\nPASS")
         return 0
     except SystemExit as e:

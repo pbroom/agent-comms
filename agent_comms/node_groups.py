@@ -57,6 +57,36 @@ class Groups:
                 if token in groups:
                     groups[token][0] = self.STOPPING
 
+    RESERVED, ALREADY, BUSY, MISSING = "reserved", "already", "busy", "missing"
+
+    def try_stopping(self, token: Hashable) -> str:
+        """`stopping`, only if the registry is free at once (review rounds 8 and 9, rulings C1, D3 and E1: a held
+        Claude end's stop never waits behind a spawn that holds the registry across process creation). What happened:
+        RESERVED (this call marked the group STOPPING), ALREADY (it was STOPPING before: a barrier this call did not
+        make), BUSY (the registry is held: nothing was recorded), MISSING (no entry for the token: a registry miss,
+        not a verified exit; as main's `stopping`, nothing is recorded)."""
+        if not self.lock.acquire(blocking=False):
+            return self.BUSY
+        try:
+            for groups in self.entries.values():
+                if token in groups:
+                    if groups[token][0] == self.STOPPING:
+                        return self.ALREADY
+                    groups[token][0] = self.STOPPING
+                    return self.RESERVED
+            return self.MISSING
+        finally:
+            self.lock.release()
+
+    def unreserve(self, token: Hashable) -> None:
+        """(Review round 9, ruling E1) Undo a reservation `try_stopping` made (RESERVED) when the stop it was for could
+        not be committed: back to LIVE. Only ever called for the caller's own RESERVED result, so a barrier that was
+        there before is never touched."""
+        with self.lock:
+            for groups in self.entries.values():
+                if token in groups and groups[token][0] == self.STOPPING:
+                    groups[token][0] = self.LIVE
+
     def gone(self, token: Hashable) -> None:
         """The whole group is gone: leader reaped, no member left."""
         with self.lock:

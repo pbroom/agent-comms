@@ -1251,7 +1251,8 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
 STEER_EXIT = {"not_delivered": 5, "unconfirmed": 6}     # `send --mode steer --wait` (DESIGN_NOTES part H)
 STEER_UNSETTLED_EXIT = 7    # ... and no terminal steer status to report (S2-11, S2-12): never a success
 STEER_SETTLE_POLLS = 12     # after N's end, how many more polls the steer's own status is waited for
-STEER_WORDS = {"in_turn": "taken into the turn", "not_delivered": "not delivered: send it again if you still want it",
+STEER_WORDS = {"in_turn": "taken into the turn", "next_turn": "it ran as a turn of its own after it",
+               "not_delivered": "not delivered: send it again if you still want it",
                "unconfirmed": "not confirmed: delivery could not be confirmed, and the agent may have read it"}
 
 
@@ -1267,8 +1268,9 @@ def _kept(settings: Settings, token: str, path: str) -> dict | None:
 
 def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> None:
     """`board session send --mode steer`: the steer's answer, and with --wait the result of the turn it went into
-    (message N) and the steer's outcome: exit 0 when that turn completed, 1 when not, 5 when the steer was not
-    delivered (this call's text is printed, never a retry's), 6 when it is not confirmed."""
+    (message N) and the steer's outcome: exit 0 when that turn completed (and, for `next_turn`, the steer's own turn
+    after it), 1 when not, 5 when the steer was not delivered (this call's text is printed, never a retry's), 6 when
+    it is not confirmed. For `next_turn` the steer's own reply is printed after N's."""
     from urllib.parse import quote
     s, st = r["session"], r["steer"]
     created = r.get("created") is not False
@@ -1297,9 +1299,10 @@ def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> N
         if known in STEER_EXIT:
             note = (f"message {st['into']} is no longer kept on the hub; the steer's outcome, from the send's answer: "
                     f"{STEER_WORDS.get(known, known)}")
-        elif known == "in_turn":
-            # (R4-09) S's outcome is known; only N's own result, and so the exit it would give, is not.
-            note = (f"the steer's outcome is known from the send's answer: {STEER_WORDS['in_turn']}; message "
+        elif known in ("in_turn", "next_turn"):
+            # (R4-09; should 3 for next_turn) S's outcome is known; only N's own result (and S's own turn's, for
+            # next_turn), and so the exit it would give, is not.
+            note = (f"the steer's outcome is known from the send's answer: {STEER_WORDS[known]}; message "
                     f"{st['into']} is no longer kept on the hub, so its own result and exit status are not available")
         else:
             note = f"message {st['into']} is no longer kept on the hub, and neither is the steer's outcome"
@@ -1336,14 +1339,23 @@ def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> N
         elif m["state"] == "done":
             print(f"(a later turn's reply replaced this one; the transcript has it: {s['transcript']})")
         print(f"steer: {STEER_WORDS.get(outcome, outcome or 'not settled')}", file=sys.stderr)
+        own = sv.get("result") if outcome == "next_turn" and isinstance(sv.get("result"), dict) else None
+        if own is not None:
+            if not own.get("ok"):
+                print(f"the steer's own turn failed: {own.get('detail') or 'no reason given'}", file=sys.stderr)
+            if own.get("reply"):
+                print("(the reply of the steer's own turn follows)")
+                print(own["reply"])
         if outcome == "not_delivered" and created:
             print("the steer's text, to send again:\n" + text, file=sys.stderr)
     if outcome in STEER_EXIT:
         raise SystemExit(STEER_EXIT[outcome])
-    if outcome != "in_turn":
+    if outcome not in ("in_turn", "next_turn"):
         raise SystemExit(STEER_UNSETTLED_EXIT)      # no terminal status: never exit 0 with "not settled"
     if m["state"] != "done":
         raise SystemExit(1)
+    if outcome == "next_turn" and not (sv.get("result") or {}).get("ok"):
+        raise SystemExit(1)     # the steer's own turn did not complete
 
 
 def _login_link(settings: Settings, token: str) -> str:

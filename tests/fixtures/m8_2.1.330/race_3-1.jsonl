@@ -1,0 +1,28 @@
+{"probe": "N"}
+{"command_uuid": "00000000-0000-4000-8000-00000000000e", "session_id": "00000000-0000-4000-8000-00000000a8a8", "state": "queued", "type": "command_lifecycle"}
+{"command_uuid": "00000000-0000-4000-8000-00000000000e", "session_id": "00000000-0000-4000-8000-00000000a8a8", "state": "started", "type": "command_lifecycle"}
+{"capabilities": ["interrupt_receipt_v1", "interrupt_cancel_queued_v1", "interrupt_send_now_v1", "interrupt_requeue_taken_v1", "msg_lifecycle_v1", "request_marker_lists_v1", "ask_user_question_unanswered_v1", "lifecycle_wakeup_source_v1", "sdk_mcp_tools_list_changed", "sdk_mcp_manifests", "mcp_read_resource_v1", "mcp_tool_ui_meta_v1", "ui_surface_v1", "mcp_call_result_not_for_model_v1", "mcp_call_check_permissions_v1", "voice_call_talk_line_v1", "withdrawn_files_note_v2", "withdrawn_tools_v1", "ui_pane_widget_v1", "reload_plugins_refuse_if_busy_v1", "get_usage_detached_v1", "silent_resend_files_v1"], "claude_code_version": "2.1.330", "permissionMode": "dontAsk", "session_id": "00000000-0000-4000-8000-00000000a8a8", "subtype": "init", "type": "system", "user_message_uuids": ["00000000-0000-4000-8000-00000000000e"]}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "type": "assistant"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "subtype": "task_started", "type": "system"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "type": "user"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "type": "assistant"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "type": "assistant"}
+{"probe": "S"}
+{"command_uuid": "00000000-0000-4000-8000-00000000005e", "session_id": "00000000-0000-4000-8000-00000000a8a8", "state": "queued", "type": "command_lifecycle"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "subtype": "task_started", "type": "system"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "subtype": "task_notification", "type": "system"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "type": "user"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "type": "assistant"}
+{"is_error": false, "num_turns": 2, "result": "DONE", "session_id": "00000000-0000-4000-8000-00000000a8a8", "stop_reason": "end_turn", "subtype": "success", "terminal_reason": "completed", "type": "result", "user_message_uuid": "00000000-0000-4000-8000-00000000000e", "user_message_uuids": ["00000000-0000-4000-8000-00000000000e"]}
+{"command_uuid": "00000000-0000-4000-8000-00000000000e", "session_id": "00000000-0000-4000-8000-00000000a8a8", "state": "completed", "type": "command_lifecycle"}
+{"command_uuid": "00000000-0000-4000-8000-00000000005e", "session_id": "00000000-0000-4000-8000-00000000a8a8", "state": "started", "type": "command_lifecycle"}
+{"capabilities": ["interrupt_receipt_v1", "interrupt_cancel_queued_v1", "interrupt_send_now_v1", "interrupt_requeue_taken_v1", "msg_lifecycle_v1", "request_marker_lists_v1", "ask_user_question_unanswered_v1", "lifecycle_wakeup_source_v1", "sdk_mcp_tools_list_changed", "sdk_mcp_manifests", "mcp_read_resource_v1", "mcp_tool_ui_meta_v1", "ui_surface_v1", "mcp_call_result_not_for_model_v1", "mcp_call_check_permissions_v1", "voice_call_talk_line_v1", "withdrawn_files_note_v2", "withdrawn_tools_v1", "ui_pane_widget_v1", "reload_plugins_refuse_if_busy_v1", "get_usage_detached_v1", "silent_resend_files_v1"], "claude_code_version": "2.1.330", "permissionMode": "dontAsk", "session_id": "00000000-0000-4000-8000-00000000a8a8", "subtype": "init", "type": "system", "user_message_uuids": ["00000000-0000-4000-8000-00000000005e"]}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "type": "assistant"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "subtype": "task_notification", "type": "system"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "type": "assistant"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "type": "assistant"}
+{"is_error": false, "num_turns": 1, "result": "PINEAPPLE", "session_id": "00000000-0000-4000-8000-00000000a8a8", "stop_reason": "end_turn", "subtype": "success", "terminal_reason": "completed", "type": "result", "user_message_uuid": "00000000-0000-4000-8000-00000000005e", "user_message_uuids": ["00000000-0000-4000-8000-00000000005e"]}
+{"command_uuid": "00000000-0000-4000-8000-00000000005e", "session_id": "00000000-0000-4000-8000-00000000a8a8", "state": "completed", "type": "command_lifecycle"}
+{"capabilities": ["interrupt_receipt_v1", "interrupt_cancel_queued_v1", "interrupt_send_now_v1", "interrupt_requeue_taken_v1", "msg_lifecycle_v1", "request_marker_lists_v1", "ask_user_question_unanswered_v1", "lifecycle_wakeup_source_v1", "sdk_mcp_tools_list_changed", "sdk_mcp_manifests", "mcp_read_resource_v1", "mcp_tool_ui_meta_v1", "ui_surface_v1", "mcp_call_result_not_for_model_v1", "mcp_call_check_permissions_v1", "voice_call_talk_line_v1", "withdrawn_files_note_v2", "withdrawn_tools_v1", "ui_pane_widget_v1", "reload_plugins_refuse_if_busy_v1", "get_usage_detached_v1", "silent_resend_files_v1"], "claude_code_version": "2.1.330", "permissionMode": "dontAsk", "session_id": "00000000-0000-4000-8000-00000000a8a8", "subtype": "init", "type": "system"}
+{"session_id": "00000000-0000-4000-8000-00000000a8a8", "type": "assistant"}
+{"is_error": false, "num_turns": 1, "origin": {"kind": "task-notification", "producer": "session-task", "runId": "0mwwhf0us-52e7575a"}, "result": "NOTED", "session_id": "00000000-0000-4000-8000-00000000a8a8", "stop_reason": "end_turn", "subtype": "success", "terminal_reason": "completed", "type": "result"}

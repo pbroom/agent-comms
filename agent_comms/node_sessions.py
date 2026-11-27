@@ -87,15 +87,31 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, NamedTuple, Callable
 
 import httpx
 
 from . import session_access, session_worktrees
 from .dispatch import DispatchConfig
-from .session_host import STEER_CONTACT_SECONDS, HostEvent, SessionHost, received_under
+from .session_host import (STEER_CONTACT_SECONDS, WATCH_THREADS, HostEvent, SessionHost, flush_watch_logs,
+                           received_under)
 
-log = logging.getLogger("agent_comms.node_sessions")
+log = logging.getLogger("agent_comms.node_sessions")   # (ruling W2.3: diverted on a watchdog's thread, session_host)
+
+
+def _finite(meta: dict) -> dict:
+    """Optional metadata with every non-finite number left out, and every string made valid Unicode (`_clean`): it
+    could not be serialised in a report otherwise."""
+    import math
+    return {_clean(k): _clean(v) for k, v in meta.items() if not (isinstance(v, float) and not math.isfinite(v))}
+
+
+def _clean(v):
+    """(Review round 2, shoulds) A string with invalid Unicode (a lone surrogate) made encodable: each such code
+    point replaced. Anything else as it is."""
+    if isinstance(v, str):
+        return v.encode("utf-8", "replace").decode("utf-8") if not v.isascii() else v
+    return v
 
 TICK_SECONDS = 0.2          # between passes while any session has work
 SHUTDOWN_BOUND_MAX = 3600.0     # hosted.SHUTDOWN_BOUND_MAX (named here, so the node does not import the hub's module)
@@ -139,6 +155,7 @@ SESSION_PROTOCOL = 5        # `tree` on every fetch and hello: 2 spawn, 3 the ho
 STEER_OFFER_AGE = 20.0          # ... and an offer is used only from a fetch younger than this when its answer is read
 STEER_STATUS_SECONDS = 20.0     # while a steer is held, the session's status is posted at least this often
 STEER_MAX_BYTES = 12_288        # hosted_steer.STEER_MAX_BYTES (named here, so the node does not import the hub's module)
+CHECKPOINT_SECONDS = 5.0        # Claude steering: the checkpoint's own call, at most this long (it never waits for more)
 SEQ_FILE = "node-session-seq.json"         # {"seq": the highest report stamp this node has issued}
 WORKTREES_FILE = "node-session-worktrees.json"   # session id -> {path, checkout}: a child session's own worktree
 SWEEP_SECONDS = 3600.0      # how often the worktrees of sessions that are gone are looked at again
@@ -181,6 +198,15 @@ class _Stopping(threading.Event):
         super().set()
 
 
+class Checkpoint(NamedTuple):
+    """(Review round 4, ruling U) A queued checkpoint, immutable: the session, its incarnation on the host, N, and
+    the payload posted. Its identity lives in the entry, never in a side map."""
+    sid: str
+    gen: Any
+    n: int
+    payload: dict
+
+
 class SessionRunner:
     def __init__(self, client: httpx.Client, config: DispatchConfig, log_dir: Path, *, host: SessionHost | None = None,
                  clock: Callable[[], float] = time.monotonic, self_stop_seconds: float = 90.0,
@@ -189,11 +215,17 @@ class SessionRunner:
         self.client, self.log_dir, self.clock = client, Path(log_dir), clock
         self.config = config
         self.host = host or SessionHost(config, self.log_dir, clock=clock, **host_kw)
+        # (Review round 5, ruling X) the host keeps what it published until this node took it (`_deliver`): every
+        # handoff is a put by the event's identity, then the source's removal; `receipts` are the identities taken
+        # and not yet removed from their source (a second put of one is a no-op)
+        self.host.keep_outbox = True
+        self.receipts: set = set()
         self.host.turn_gate = self._turn_allowed      # a child's turn is held to its parent when it is WRITTEN, too
         self.host.admit = lambda s: self._admit(s, starting=True)    # every process start takes a slot here
         self.host.may_start = self._may_start       # ... and none, nor any new turn, past the self-stop deadline
         self.host.may_start_query = self._may_start_query   # the same, with no side effect (turn correlation's)
         self.host.steer_authority = self._steer_authority     # ... and no steer byte without the node's write authority
+        self.host.steer_capable = self._steer_capable         # ... nor a Claude one unless the hub names `held`
         # The node's acknowledged EVIDENCE (the module text): when the last hub-acknowledged hello was SENT (node.py
         # says it, `note_hello`), per session the send time of the last acknowledged report and the turn in flight its
         # answer named, and every acknowledgement in order (`ack_log`: seq, sent, received, the session a report was
@@ -241,6 +273,12 @@ class SessionRunner:
                              f"{self.shutdown_bound:g} s to stop a session's process after the hub last heard from it, "
                              f"and the hub waits at most {SHUTDOWN_BOUND_MAX:g} s")
         self.pending: list[tuple[str, dict]] = []     # (session id, event) not yet taken by the hub, oldest first
+        self.checkpoints: dict[str, dict] = {}       # Claude steering: a held end's checkpoint, sent once (`_checkpoint`)
+        # (Review round 2, ruling K) The checkpoint sender's own queue: at most one per session, posted by its own
+        # thread (`_send_checkpoints`), never by the loop that drives ordinary reports. Dropped at shutdown.
+        self.checkpoint_queue: dict[str, dict] = {}
+        self.checkpoint_cond = threading.Condition()
+        self.checkpoint_thread: threading.Thread | None = None
         self.queue: dict[str, list[dict]] = {}        # session id -> the hub's queued messages not yet handed over
         self.handed: dict[str, int] = self._load_handed()
         self.ending: set[str] = set()                 # sessions this node reported (or is reporting) ended
@@ -248,6 +286,9 @@ class SessionRunner:
         # session id -> (state, pid, resume, the provider's own id when it is not the session id) as of the last pass
         self.status: dict[str, tuple] = {}
         self.reported: dict[str, tuple] = {}          # ... as the hub last took it
+        # (Review round 5, ruling Y) the modes the hub acknowledged for each session (the accepted rung's), which a
+        # fallback may have sent with less than the session wants: corrected by an explicit report after a listing
+        self.acked_modes: dict[str, list] = {}
         self.last_busy: dict[str, float] = {}         # session id -> when it last had a turn or a message
         self.recovered: dict[str, dict] = {}
         self.version: str | None = None
@@ -360,7 +401,8 @@ class SessionRunner:
 
     # ------------------------------------------------------------ hub calls
 
-    def _call(self, method: str, path: str, *, gen: int | None = None, spare_422: bool = False, **kw) -> Any:
+    def _call(self, method: str, path: str, *, gen: int | None = None, spare_422: bool = False, spare: bool = False,
+              **kw) -> Any:
         # The contact counts from when the call was SENT: the hub records it at or after that (hosted.note_contact),
         # so the node's self-stop clock never runs behind the hub's (`shutdown_bound`).
         sent = self.clock()
@@ -374,15 +416,32 @@ class SessionRunner:
             # outcome) forgets only THOSE: a refusal of it that comes after a newer listing leaves that one's (R4-03).
             # `spare_422`: a 422 forgets nothing here; the caller decides what it says (R5-05).
             code = getattr(getattr(sys.exc_info()[1], "response", None), "status_code", None)
-            if not (spare_422 and code == 422) and (gen is None or gen == self.features_gen):
+            # `spare` (ruling R): a 400 or 422 that a report's fallback will answer with less forgets nothing.
+            if (not (spare_422 and code == 422) and not (spare and code in (400, 422))
+                    and (gen is None or gen == self.features_gen)):
                 self.hub_features, self.features_known = set(), False
             raise
         self._renew_contact(sent)
         return r.json()
 
-    def _add(self, session_id: str, event: dict) -> None:
+    def _add(self, session_id: str, event: dict, ident: tuple | None = None) -> None:
         if session_id not in self.dropped:
-            self.pending.append((session_id, event))
+            self._commit(ident, lambda: self.pending.append((session_id, event)), self.pending.pop)
+        elif ident is not None:
+            self.receipts.add(ident)        # (a dropped session's event is taken, and goes nowhere)
+
+    def _commit(self, ident: tuple | None, apply: Callable[[], None], undo: Callable[[], Any]) -> None:
+        """(Review round 6, ruling X) THE commit of an accepted event, ordinary or a checkpoint, under the runner
+        lock like every caller: its queue entry, then its receipt; if the receipt cannot be made the entry is undone,
+        so a failure leaves neither and a retry takes it exactly once."""
+        apply()
+        if ident is None:
+            return
+        try:
+            self.receipts.add(ident)        # (the receipt and the queue entry, together)
+        except BaseException:
+            undo()
+            raise
 
     @staticmethod
     def _event(e: HostEvent) -> dict:
@@ -398,6 +457,11 @@ class SessionRunner:
                 d["restarted_by"] = int(e.restarted_by)     # the provider said that restart's interrupt ended it
             if isinstance(e.steer, dict):
                 d["steer"] = dict(e.steer)      # the host's word on the steer into this turn (never waits: `_takes`)
+                if isinstance(d["steer"].get("result"), dict):      # (Claude: S's own result, finite numbers only)
+                    res = d["steer"]["result"]
+                    d["steer"]["result"] = dict(res) | {
+                        "meta": _finite(dict(res.get("meta") or {})), "text": _clean(res.get("text", "")),
+                        "detail": _clean(res.get("detail", ""))}
         elif e.kind == "approval_requested":
             d["denials"] = list(e.denials)
         elif e.kind == "ended":
@@ -422,15 +486,104 @@ class SessionRunner:
         return "restarted_by" not in event or "restart" in self.hub_features or self.features_known
 
     def _emit(self, events: list[HostEvent]) -> None:
-        if self.watched_steer:  # (a steer attempt's watched ends first, as in `pass_once`)
-            events, self.watched_steer = self.watched_steer + list(events), []
-        if self.watched:        # (under the lock, like every caller of this: what the watchdog stopped comes first)
-            events, self.watched = self.watched + list(events), []
+        """Everything published and not yet taken, in publication order, across the host's outbox and the
+        watchdog's lists (`_deliver`), then any event given here that no outbox published (no source to remove it
+        from). An event a host call returned is in the host's outbox: it is taken from there, once."""
+        self._deliver(late=True)
         for e in events:
-            if e.kind == "ended":
-                self.ending.add(e.session_id)
-                self.queue.pop(e.session_id, None)
-            self._add(e.session_id, self._event(e))
+            if e.ident is None:
+                self._put(e)
+
+    def _deliver(self, late: bool) -> None:
+        """(Review round 5, ruling X) THE handoff from every source to the report queue: the host's outbox, the
+        watchdog's `watched_steer` and (`late`: after the listing is reconciled, as on main) its `watched`. Always
+        the event published first, whatever its lane; each is put (`_put`, by its identity: a second put is a
+        no-op), then removed from its source, then its receipt is forgotten. An exception anywhere leaves the event
+        in its source, in its lane; a retry puts nothing twice."""
+        while True:
+            heads = []
+            e = self.host.outbox_head()
+            if e is not None:
+                heads.append((e.ident[2], 0, e))
+            if self.watched_steer:
+                heads.append((self.watched_steer[0].ident[2] if self.watched_steer[0].ident else 0, 1,
+                              self.watched_steer[0]))
+            if late and self.watched:
+                heads.append((self.watched[0].ident[2] if self.watched[0].ident else 0, 2, self.watched[0]))
+            if not heads:
+                return
+            _, src, e = min(heads, key=lambda h: (h[0], h[1]))
+            self._put(e)
+            if src == 0:
+                self.host.ack(e)
+            elif src == 1:
+                self.watched_steer.pop(0)
+            else:
+                self.watched.pop(0)
+            if e.ident is not None:
+                self.receipts.discard(e.ident)
+
+    def _dispatch(self, events: list[HostEvent]) -> None:
+        for e in events:
+            self._put(e)
+
+    def _put(self, e: HostEvent) -> None:
+        """(Review round 3, ruling M; round 5, ruling X) THE one way a host event reaches the hub: a checkpoint
+        (`held`) to the checkpoint sender, every other event into the report queue; taken by its identity: one
+        already taken (its receipt is held until its source removed it) is not taken again."""
+        if e.ident is not None and e.ident in self.receipts:
+            return
+        if e.kind == "held":
+            self._checkpoint(e, e.ident)    # (Claude steering: a report of its own, never one of the events)
+            return
+        item = self._event(e)
+        if e.kind == "ended":
+            self.ending.add(e.session_id)
+            self.queue.pop(e.session_id, None)
+        self._add(e.session_id, item, e.ident)
+
+    def _checkpoint(self, e: HostEvent, ident: tuple | None = None) -> None:
+        """The checkpoint of a held end (Claude steering, part G): sent alone, in a report of its own, after that
+        session's pending events, only when the hub's last listing named `steer` and what it takes is known. It never
+        waits, never holds, reorders or joins an ordinary event, and is dropped (logged) on refusal or failure, never
+        resent."""
+        if e.message_id is None or not e.message_id.isdigit() or e.session_id in self.dropped:
+            return
+        if not (self._pair(self.hub_features) and self.features_known):
+            # (Review round 1, ruling C) A feature of its own: a step-2 hub names `steer` but takes no checkpoint.
+            log.info("session %s: the checkpoint of message %s is not sent: the hub has not said it takes it",
+                     e.session_id, e.message_id)
+            return
+        s = self.host.sessions.get(e.session_id)
+        entry = Checkpoint(e.session_id, s.gen if s is not None else None, int(e.message_id), {
+                           "message": int(e.message_id), "ok": bool(e.ok), "detail": _clean(e.detail[:300]),
+                           "denials": list(e.denials), "meta": _finite(dict(e.meta)), "text": _clean(e.text),
+                           "answered": bool(e.answered)})
+        before = self.checkpoints.get(e.session_id)
+
+        def undo():
+            if before is None:
+                self.checkpoints.pop(e.session_id, None)
+            else:
+                self.checkpoints[e.session_id] = before
+        self._commit(ident, lambda: self.checkpoints.__setitem__(e.session_id, entry), undo)
+
+    def _post_checkpoints(self, ready: dict) -> None:
+        """The checkpoints taken out of the queue by `_flush` (each one's session had nothing pending before it),
+        posted OUTSIDE the report lock, one try each, with CHECKPOINT_SECONDS at most: its own call, so its failure,
+        refusal or stall changes nothing else (no feature knowledge forgotten, no contact renewed, no report of
+        another session stripped or held up longer than that). Ruling C."""
+        for sid, entry in ready.items():
+            if self.checkpoint_thread is not None and not self._checkpoint_due(entry):
+                continue        # (ruling P) rechecked immediately before the POST
+            try:
+                r = self.client.request("POST", f"/api/nodes/sessions/{entry.sid}",
+                                        json={"events": [], "held": dict(entry.payload)}, timeout=CHECKPOINT_SECONDS)
+                r.raise_for_status()
+            except Exception as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                log.warning("session %s: the checkpoint of message %s was not taken (%s); it is not sent again",
+                            entry.sid, entry.n, code if code is not None else type(e).__name__)
 
     def _flush(self, final: bool = False) -> bool:
         """Post what the hub has not taken yet, per session and in order. False: the hub could not be reached (the
@@ -441,7 +594,142 @@ class SessionRunner:
         with self.report_lock:
             if self.stopping.is_set() and not final:
                 return False
-            return self._post_pending()
+            ok = self._post_pending()
+            # (Claude steering) the checkpoints whose sessions have nothing pending before them (part G), taken out
+            # of the queue here and posted after the lock is let go (ruling C)
+            ready = {sid: self.checkpoints.pop(sid) for sid in list(self.checkpoints)
+                     if not any(x == sid for x, _ in self.pending)}
+        if ready and not self.stopping.is_set():
+            if self.checkpoint_thread is not None:
+                with self.checkpoint_cond:
+                    self.checkpoint_queue.update(ready)     # (at most one per session: a later one replaces it)
+                    self.checkpoint_cond.notify()
+            else:
+                self._post_checkpoints(ready)       # (no sender thread: a node driven pass by pass, as in tests)
+        return ok
+
+    @staticmethod
+    def _pair(features) -> bool:
+        """(Review round 4, ruling R) THE one predicate of Claude steering's capability: the hub names `steer` AND
+        `held`. The report projection (`_modes_for`), the write gate (`_steer_capable`) and the checkpoint gates
+        (`_checkpoint`, `_checkpoint_due`) all ask this, never `held` alone."""
+        return "steer" in features and "held" in features
+
+    @staticmethod
+    def _modes_for(modes, features) -> list:
+        """What the session's modes say to a hub with these features (review round 3, ruling O): `steer` only to a
+        hub that steers; a Claude session's `steer` and `held` (its adapter holds N's end) as a PAIR, both or
+        neither, and only to a hub that names both: never `["restart", "held"]`."""
+        claude = "held" in modes
+        pair = SessionRunner._pair(features)
+        return [m for m in modes if (m not in ("steer", "held") if claude and not pair
+                                     else m != "steer" or "steer" in features)]
+
+    @staticmethod
+    def _rungs(body: dict) -> list[dict]:
+        """(Review round 4, ruling R) The payloads one report may go as, each computed from the ORIGINAL body and each
+        removing strictly more than the one before: (i) as built; (ii) without what only a hub that names `held`
+        understands: a Claude session's `steer` and `held` modes (the pair) and a `next_turn` extension, keeping what
+        step 2's contract takes (a Codex `steer` extension included); (iii) main's plain retry (review round 5,
+        ruling Y): rung (ii) without any steer extension, its modes as rung (ii)'s, exactly as main retries a
+        refused steer report. A rung that would remove nothing more is not tried."""
+        two = SessionRunner._rung_two(body)
+        three = {k: v for k, v in two.items() if k != "events"} | {
+            "events": [{k: v for k, v in e.items() if k != "steer"} for e in two["events"]]}
+        rungs = [body]
+        for r in (two, three):
+            if r != rungs[-1]:
+                rungs.append(r)
+        return rungs
+
+    @staticmethod
+    def _rung_two(body: dict) -> dict:
+        """Rung (ii): the body without what only a hub that names `held` understands (the Claude pair in the modes, a
+        `next_turn` extension). Equal to the body: the report is one main could have sent (ruling Y, round 6)."""
+        out = {k: v for k, v in body.items() if k not in ("events", "modes")}
+        out["events"] = [{k: v for k, v in e.items() if not (k == "steer" and isinstance(v, dict)
+                                                              and v.get("outcome") == "next_turn")}
+                         for e in body["events"]]
+        if "modes" in body:
+            claude = "held" in (body.get("modes") or [])
+            out["modes"] = [m for m in body["modes"] if not (m == "held" or (claude and m == "steer"))]
+        return out
+
+    def _post_report(self, sid: str, body: dict, events: list) -> tuple[float, Any, dict]:
+        """(Review round 4, ruling R) THE one fallback for a report the hub rejects (400, 422): its rungs
+        (`_rungs`), in order, each tried at once, keeping the report's events (their identity in the queue: what is
+        sent is dropped only after an acknowledgement, by the caller). A rejection changes nothing the node believes
+        about the hub: no feature is forgotten (it only asks for a fresh listing); the one exception is main's own
+        step-2 rule, on main's own path only (R5-05; review round 5, ruling Y+): a 422 of a payload that differs from
+        the accepted one ONLY by its steer extensions, under the same listing, forgets `steer`. The success of any
+        rung is reported to the caller exactly as a first attempt's, with the payload the hub acknowledged:
+        (sent, answer, payload). All rejected: the last rejection is raised."""
+        path = f"/api/nodes/sessions/{sid}"
+        gen = self.features_gen
+        rungs = self._rungs(body)
+        # (Review round 6, ruling Y) main's literal legacy rung: a report main could have sent (nothing in it only a
+        # `held` hub understands), refused as built with a 422, and taken as main's plain retry
+        mains = self._rung_two(body) == body
+        refused: tuple[dict, Any] | None = None     # the last rejected payload and its status
+        for k, payload in enumerate(rungs):
+            sent = self.clock()     # its SEND time: a hub-acknowledged report renews the write authority from it
+            last = k == len(rungs) - 1
+            try:
+                answer = self._call("POST", path, json=json.loads(json.dumps(payload)), gen=gen,
+                                    spare=not last)
+            except Exception as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if last or code not in (400, 422):
+                    if k:
+                        self.last_sync = float("-inf")      # (ruling R) ask the hub again what it takes
+                    raise
+                if any("steer" in x for x in payload["events"]):
+                    # (said once per report, as main says it: R8-04)
+                    self._say_422(sid, tuple(e for e, x in zip(events, body["events"]) if "steer" in x))
+                else:
+                    log.warning("the hub refused the report for session %s (%s) with its steering modes: sending it "
+                                "again without them", sid, code)
+                refused = (payload, code)
+                continue
+            if k:
+                self.last_sync = float("-inf")      # (ruling R) a fresh listing says what the hub takes now
+                if mains and last and refused is not None and refused[1] == 422 and gen == self.features_gen:
+                    # (R5-05, main's step-2 rule, on main's path only: rulings Y+ and Y of round 6) a report main could
+                    # have sent, refused as built with a 422, and main's plain retry got through: only `steer` is
+                    # forgotten, for that listing's features. (For such a report the ladder is exactly main's: as
+                    # built, then without its steer extensions; so the two differ by those extensions only.)
+                    self.hub_features = self.hub_features - {"steer"}
+            return sent, answer, payload
+        raise AssertionError("no rung")   # (unreachable: the last rung raises or returns)
+
+    def _send_checkpoints(self) -> None:
+        """The checkpoint sender's thread (ruling K): one queued checkpoint at a time, each rechecked at dispatch
+        (`_checkpoint_due`) and posted with its own timeout; ordinary reports never wait for it. Ends with shutdown;
+        what is still queued then is dropped (nothing waits for it)."""
+        while not self.stopping.is_set():
+            with self.checkpoint_cond:
+                if not self.checkpoint_queue:
+                    self.checkpoint_cond.wait(0.5)
+                    continue
+                sid = next(iter(self.checkpoint_queue))
+                held = self.checkpoint_queue.pop(sid)
+            self._post_checkpoints({sid: held})     # (rechecked there, immediately before the POST: ruling P)
+        with self.checkpoint_cond:
+            self.checkpoint_queue.clear()
+
+    def _checkpoint_due(self, entry: "Checkpoint") -> bool:
+        """At dispatch (rulings K, P, U): the hub's current capability still names the pair, and the session, its
+        incarnation and N are still the ones the queued entry itself was made for (hosted here, not dropped, N's end
+        still held). Else it is dropped. (A POST already under way when these change can still arrive: the hub's
+        checkpoint is write-once and refused once N is settled, so it can replace neither an accepted checkpoint nor
+        a terminal end.)"""
+        if self.stopping.is_set():
+            return False        # (ruling P) never once shutdown began
+        if not (self._pair(self.hub_features) and self.features_known) or entry.sid in self.dropped:
+            return False
+        s = self.host.sessions.get(entry.sid)
+        h = s.held if s is not None else None
+        return h is not None and h.end.message_id == str(entry.n) and s.gen == entry.gen
 
     wall_ns = staticmethod(time.time_ns)
 
@@ -500,37 +788,15 @@ class SessionRunner:
                 body |= {k: v for k, v in self.tree.get(sid, {}).items() if v is not None}
                 if "restart" in self.hub_features:
                     # what its adapter can do with a turn in flight now (`steer` only to a hub that steers)
-                    body["modes"] = [m for m in status[4] if m != "steer" or "steer" in self.hub_features]
+                    # (Review round 2, ruling J) a Claude session's steering (`steer` with `held`) only to a hub
+                    # whose listing names `held`: a step-2 hub never sees a Claude steer offered
+                    body["modes"] = self._modes_for(status[4], self.hub_features)
             named = bool(self.hub_features)     # (a failed call forgets them: `_call`)
             try:
-                sent = self.clock()     # its SEND time: a hub-acknowledged report renews the write authority from it
-                path = f"/api/nodes/sessions/{sid}"
-                if not any("steer" in x for x in body["events"]):
-                    answer = self._call("POST", path, json=body)        # main's call
-                else:
-                    # A report carrying a steer outcome: main's call, and after a 422 (a hub that named `steer`
-                    # refuses it now: rolled back) one plain retry at once, in this very flush, synchronous, with
-                    # main's per-call timeout (S2-07, R4-03). Each attempt has its own payload, built from `body`,
-                    # which neither changes; both are made under this listing's features (`gen`), so a refusal
-                    # never forgets those of a newer listing. In the final flush exactly the same.
-                    gen = self.features_gen
-                    first = json.loads(json.dumps(body))
-                    try:
-                        answer = self._call("POST", path, json=first, gen=gen, spare_422=True)
-                    except Exception as e:
-                        if getattr(getattr(e, "response", None), "status_code", None) != 422:
-                            raise
-                        self._say_422(sid, tuple(e for e, x in zip(events, body["events"]) if "steer" in x))
-                        plain = {k: v for k, v in body.items() if k != "events"}
-                        plain["events"] = [{k: v for k, v in x.items() if k != "steer"} for x in body["events"]]
-                        sent = self.clock()
-                        answer = self._call("POST", path, json=plain, gen=gen)
-                        # (R5-05) The plain retry got through: this hub takes everything else this listing said, so
-                        # only `steer` is forgotten, and only while that listing's features stand. (A failed retry
-                        # forgot every feature in `_call`, as main does for a failed report.)
-                        if gen == self.features_gen:
-                            self.hub_features = self.hub_features - {"steer"}
+                sent, answer, taken = self._post_report(sid, body, events)
                 self._ack_report(sid, sent, answer)
+                if "modes" in taken:
+                    self.acked_modes[sid] = list(taken["modes"])    # (ruling Y) what the hub acknowledged
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if code not in (400, 404, 422):
@@ -659,19 +925,16 @@ class SessionRunner:
             # The queue and the stop flags held here may be out of date (the human may just have closed a session):
             # turns already running go on, nothing new is handed over until a fetch has succeeded again.
             self.fresh = False
+        flush_watch_logs()      # (ruling W) what the watchdog's thread logged
         with self.lock, self.host.one_drain_budget():   # (R5-04) one drain deadline for this whole hold of the lock
             if self.stopping.is_set():
                 return ok
             now = self.clock()
-            if self.watched_steer:
-                # What the watchdog drained or decided about a steer attempt (N's native end, a cut) goes into the
-                # report queue BEFORE the listing is reconciled, so no synthetic LOST of N can come ahead of it (S2-06).
-                for e in self.watched_steer:
-                    if e.kind == "ended":
-                        self.ending.add(e.session_id)
-                        self.queue.pop(e.session_id, None)
-                    self._add(e.session_id, self._event(e))
-                self.watched_steer = []
+            # What the watchdog drained or decided about a steer attempt (N's native end, a cut: `watched_steer`)
+            # and what the host published and nobody took (a tick that raised after publishing) go into the report
+            # queue BEFORE the listing is reconciled, so no synthetic LOST of N can come ahead of them (S2-06, ruling
+            # M), in publication order, each put by its identity before its source lets it go (ruling X).
+            self._deliver(late=False)
             if data is not None:
                 self._reconcile(data, fetch_sent)       # (its closes and cancels share the hold's drain deadline)
                 # Contact is back and a listing is applied (a close or a cancel the hub decided meanwhile has been,
@@ -710,6 +973,7 @@ class SessionRunner:
         named = data.get("features")
         features = {f for f in named if isinstance(f, str)} if isinstance(named, list) else set()
         steer_aware = "steer" in features
+        held_aware = self._pair(features)   # (rulings J, R) a Claude session's steer only from a hub naming the pair
         listed = {v["session_id"]: v for v in data["sessions"]
                   if isinstance(v, dict) and isinstance(v.get("session_id"), str)}
         # Roots first, then each level under the one above it: a child is only opened under a parent that is open
@@ -819,11 +1083,11 @@ class SessionRunner:
                                     "detail": LOST + (FRESH_START if s.fresh_start else ""),
                                     "delivered": m.get("state") == "delivered"})
             self.queue[sid] = queue
-            self._steer_listed(sid, view, fetch_sent, steer_aware)
+            self._steer_listed(sid, view, fetch_sent, steer_aware and (held_aware or not self.host.holds(sid)))
         for sid, s in self.host.sessions.items():
             live = self.host.steer_live(sid)
             if live is not None and sid not in listed:
-                if steer_aware:
+                if steer_aware and (held_aware or not self.host.holds(sid)):
                     self.host.steer_revoke(sid, live[1], "omitted")     # not listed at all: an omission too
                 else:
                     self.host.steer_fence(sid)
@@ -832,7 +1096,7 @@ class SessionRunner:
                 self.dropped.add(sid)
                 self.status.pop(sid, None)
                 self.reported.pop(sid, None)
-                self.host.close(sid, "the hub no longer lists this session")
+                self._emit(self.host.close(sid, "the hub no longer lists this session"))   # (its own: dropped below)
         for sid in [x for x in self.queue if x not in listed]:
             del self.queue[sid]
         self.ending &= set(listed)
@@ -852,12 +1116,20 @@ class SessionRunner:
         self.version = data.get("version") if isinstance(data.get("version"), str) else None
         if "restart" in features and "restart" not in self.hub_features:
             self.reported.clear()       # a hub that takes `modes` now: every session says it again
-        elif "steer" in features and "steer" not in self.hub_features:
-            # ... and one that takes `steer` in them now: only a session whose report gains it says it again (S2-09);
-            # a Claude session's status, unchanged, is not resent.
+        elif (("steer" in features and "steer" not in self.hub_features)
+              or (("held" in features) != ("held" in self.hub_features))):
+            # ... and one that takes `steer` in them now (S2-09), or whose `held` came or went (round 3, ruling O):
+            # only a session whose reported modes change says them again.
             for sid, st in self.status.items():
-                if "steer" in st[4]:
+                if self._modes_for(st[4], features) != self._modes_for(st[4], self.hub_features):
                     self.reported.pop(sid, None)
+        for sid, st in self.status.items():
+            # (Review round 5, ruling Y+) the hub acknowledged LESS than this listing's features say the session has
+            # (a fallback sent less): a report is sent for that purpose, the session quiet or not. (A listing that
+            # names less than before changes nothing here, as on main: what it no longer takes is fenced.)
+            if sid in self.acked_modes and "restart" in features and (
+                    set(self.acked_modes[sid]) < set(self._modes_for(st[4], features))):
+                self.reported.pop(sid, None)
         self.hub_features, self.features_known = features, True
         self.features_gen += 1
         for sid in [x for x in self.report_ack if x not in self.host.sessions]:
@@ -1132,8 +1404,10 @@ class SessionRunner:
             if s.busy or s.inbox:
                 self.last_busy[sid] = now
             if s.ended and s.child is None:
+                self._deliver(late=False)       # (ruling M) before it is forgotten
                 self.host.forget(sid)
-                for d in (self.status, self.reported, self.last_busy, self.queue, self.sent, self.tree,
+                self.receipts = {r for r in self.receipts if r[0] != sid}     # (ruling X: its sources are gone)
+                for d in (self.status, self.reported, self.acked_modes, self.last_busy, self.queue, self.sent, self.tree,
                           self.parent_of):
                     d.pop(sid, None)
                 with self.ack_lock:
@@ -1240,6 +1514,12 @@ class SessionRunner:
         self-stop, nor stopping. The contact itself is the attempt's own record (SteerSlot.contact_ok); the record's
         own `stopping` is set under its lock when the node begins to stop (`_Stopping`)."""
         return not self._silent() and not self.stopping.is_set()
+
+    def _steer_capable(self, s) -> bool:
+        """(Review round 2, ruling J) Asked at every write of a steer's bytes (the write gate only, never as the
+        attempt's authority: a hold is not cut because a fetch failed and the features are unknown for a while): a
+        Claude steer (its adapter holds N's end) is written only while the hub's current listing names `held`."""
+        return not self.host.holds(s.session_id) or (self._pair(self.hub_features) and self.features_known)
 
     def _steer_listed(self, sid: str, view: dict, fetch_sent: float | None, aware: bool = True) -> None:
         """The listing's word on this session's steer: an offer (passed on, with whether authority held for it) or
@@ -1373,34 +1653,61 @@ class SessionRunner:
         SIGKILL after each grace. Under the loop's lock, which the loop holds only for local work, never across a
         hub call. What the self-stop reports waits in `watched` for the loop's next `_emit`. A deadline met later than
         `shutdown_bound` allows it (the watch interval plus LOCK_SLACK_SECONDS: the loop held its lock for longer,
-        limit e) is said in the log, once, with how late it was."""
+        limit e) is said in the log, once, with how late it was.
+
+        (Review round 6, ruling N1; round 7, ruling R7-1) The pass is main e6b421f's exactly: ONE locked section, taken
+        with main's unbounded wait, with main's order (the self-stop, the due SIGKILLs, the steer deadlines),
+        eligibility and dating inside it. So no SIGKILL can come between a stop's registration and its SIGTERM, nor
+        reach a process that replaced the one it was meant for, and the next pass's kill scan keeps main's cadence.
+        (Review round 5, ruling W) On this thread the host saves nothing, writes no transcript, runs no log handler
+        and formats no traceback (all deferred to the loop). Each step is on its own: one that raises never keeps
+        the next from running."""
         with self.lock:
             if self.stopping.is_set():
                 return          # shutdown stops everything itself
             now = self.clock()
             allowed = self.watch_seconds + LOCK_SLACK_SECONDS
             due = self._self_stop_due()
-            if self._silent(now):
-                stopped = self.host.stop_turns(self._self_stop_detail())
-                if stopped and now - due > allowed:
-                    log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session loop held "
-                                "its lock that long (limit e)", now - due)
-                self.watched += stopped     # (main's, a steer's end too: the shutdown simplification)
-            for sid, at in self.host.kill_due():
-                if now - at > allowed:
-                    log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline: the session "
-                                "loop held its lock that long (limit e)", sid, now - at)
+            try:
+                if self._silent(now):
+                    # (rulings S and X) its own events only, put into `watched` (their lane) inside the call, before
+                    # anything here can raise: what the outbox held stays there for the loop's handoff
+                    stopped = self.host.stop_turns(self._self_stop_detail(), own=True, into=self.watched)
+                    if stopped and now - due > allowed:
+                        log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session loop "
+                                    "held its lock that long (limit e)", now - due)
+            except Exception:
+                log.exception("hosted sessions: the self-stop failed")
+            try:
+                for sid, at in self.host.kill_due():
+                    if now - at > allowed:
+                        log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline: the "
+                                    "session loop held its lock that long (limit e)", sid, now - at)
+            except Exception:
+                log.exception("hosted sessions: the due SIGKILLs failed")
             # Then, after every deadline of main's has been met (a cut's drain must never delay them, R4-06): loss
-            # is one-way, and a half-written steer frame past its limit is cut.
-            self._steer_watch(now)
-            self.watched_steer += self.host.steer_deadlines()
+            # is one-way, and a half-written steer frame past its limit is cut (a Codex one: main's step 2; a Claude
+            # one is left to the loop, which reads N's end first: ruling W). Still in this one section (review round
+            # 7, ruling R7-1): the pass has main's lock structure exactly. The Claude part of this step waits for
+            # nothing (rulings W and C1: no save, transcript write, log handler, drain or registry wait on this
+            # thread; an expired hold whose checkout cannot be reserved at once is left as it is, for a later pass).
+            try:
+                self._steer_watch(now)
+                self.host.steer_deadlines(into=self.watched_steer, watchdog=True)
+            except Exception:
+                log.exception("hosted sessions: the steer deadlines failed")
 
     def _watch(self) -> None:
-        while not self.stopping.wait(self.watch_seconds):
-            try:
-                self.enforce_deadlines()
-            except Exception:
-                log.exception("hosted sessions: the deadline watchdog failed a pass")
+        me = threading.get_ident()
+        WATCH_THREADS.add(me)       # (ruling W) the host defers every save, transcript line and log line made here
+        try:
+            while not self.stopping.wait(self.watch_seconds):
+                try:
+                    self.enforce_deadlines()
+                except Exception:
+                    log.exception("hosted sessions: the deadline watchdog failed a pass")
+        finally:
+            WATCH_THREADS.discard(me)
 
     # ------------------------------------------------------------ the thread
 
@@ -1417,10 +1724,17 @@ class SessionRunner:
                 self.stopping.wait(RETRY_SECONDS)   # otherwise the next pass waits at the hub (long-poll)
 
     def start(self) -> None:
+        self.start_checkpoint_sender()      # (round 3, ruling P) before the driving thread: no inline window
         self.thread = threading.Thread(target=self.run_forever, name="hosted-sessions", daemon=True)
         self.thread.start()
         self.watch_thread = threading.Thread(target=self._watch, name="hosted-sessions-deadlines", daemon=True)
         self.watch_thread.start()
+
+    def start_checkpoint_sender(self) -> None:
+        """The checkpoint sender's own thread (ruling K)."""
+        self.checkpoint_thread = threading.Thread(target=self._send_checkpoints, name="hosted-sessions-checkpoints",
+                                                  daemon=True)
+        self.checkpoint_thread.start()
 
     def signal(self) -> None:
         """The first step of a shutdown: SIGTERM to every session process, now. No waiting and no reporting, so the
@@ -1469,7 +1783,12 @@ class SessionRunner:
                 self.handed[sid] = min(self.handed.get(sid, n), n)
             if back:
                 self._save_handed()
-            events = self.host.stop_all()
+            try:
+                self.host.stop_all()
+            except Exception:
+                # (Ruling M; review round 5, ruling X) what stop_all decided, whether it returned or raised, is in the
+                # host's outbox until the node takes it: delivered below, by `_emit`'s one handoff
+                log.exception("hosted sessions: the shutdown of the session processes failed part way")
         # A flush the loop began before `stopping` may still be on its way: wait for it (a hub call is bounded by the
         # client's timeout) rather than post beside it. If it never returns, nothing is reported from here and the
         # next node process reports the lost turns.
@@ -1478,7 +1797,19 @@ class SessionRunner:
             return
         self.report_lock.release()
         with self.lock:             # the loop is past its last pass: `pending` and `status` are shutdown's now
-            self._emit(events)
+            for attempt in (1, 2):
+                # (Review round 6, ruling X) the final handoff, tried once more if it raises; exhausted, what was not
+                # taken stays where it was published (this process reports no more of it: the next node process
+                # reports those turns as lost), and shutdown goes on
+                try:
+                    self._emit([])          # (ruling X: the outbox, the watchdog's lists, in publication order)
+                    break
+                except Exception:
+                    if attempt == 2:
+                        log.exception("hosted sessions: the shutdown's last events could not be queued for the hub; "
+                                      "the next node process reports those turns as lost")
+                    else:
+                        log.warning("hosted sessions: the shutdown's handoff of its last events failed: once more")
             self.status = {sid: (s.state, None, bool(s.resume), self._own_id(s), ()) for sid, s in
                            self.host.sessions.items() if not s.ended and sid not in self.dropped}
             for sid, s in self.host.sessions.items():

@@ -1,0 +1,14 @@
+# The output of scripts/steering-mutation-check.py (review round 10): only round 10's rows (G1 and H2; G2 is tests
+# only, with no code row). On 790a25a two rows were MISSED: the switch, and the attempt's recorded Claude identity.
+# Both terms are redundant in every reachable state, so no scenario tells them apart; c6b40d3 pins each term
+# directly. The whole set (139 rows) last ran in round 6. Run on c6b40d3: all 4 caught.
+
+commit c6b40d3
+CAUGHT  G1 the predicate-false path is main's  (exit 1)
+CAUGHT  G1 the predicate asks the switch  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
+CAUGHT  G1 the predicate asks for a Claude attempt or a hold  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
+CAUGHT  H2 the predicate reads the attempt, not the advertised holds  test_r10_h2_a_claude_attempt_keeps_its_path_after_the_adapter_stops_advertising
+rows: 4
+stale or broken: []
+missed: []
+exit 0
