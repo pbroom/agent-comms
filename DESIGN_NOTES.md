@@ -16764,3 +16764,127 @@ exception's message) is now reduced to its type's name.
 - The watchdog's lines wait for a runner-lock release, a host lock's release or a line of the waiting thread's own;
   on a node whose loop has stopped they are written at exit (2 s bound) or not at all.
 - `BaseException` from a handler (KeyboardInterrupt, SystemExit) is not swallowed.
+
+## Host-side logging: review round 1
+
+Sol returned CHANGES on ff393a3: two blockers and one should, plus a pre-check of the rulings and an amendment. Both
+blockers were the same kind. The invariant had been built for three named locks and for the watchdog thread, and a
+fourth lock (the report lock) and a second background thread (the checkpoint sender) fell outside it. This round
+fixes the kind. Still logging only: no stop decision, signal, signal order, save or registry change.
+
+### R1. Every lock a line can be logged under is a boundary
+
+- **The defect.** An ordinary or steer report refused with 400 or 422 is sent again at its next rung
+  (`_post_report`). Its line was written while `_flush` owned `report_lock`. A blocking handler held up the retry and
+  the final report, and a handler that re-entered `_flush` deadlocked.
+- **The invariant now** covers ANY lock of the host-side modules under which a line can be logged, callbacks and
+  nested calls included. Each such lock is a `hostlog.HostLock`: the boundary is entered before the lock is taken and
+  left after it is let go, so it is outside the whole critical section, and an inner release drains nothing. A
+  Condition keeps its native lock, and hostlog's own queue condition is never a boundary.
+- **The lock table** (every lock, condition or event constructed in `session_host`, `node_sessions`, `node`,
+  `node_groups`, `providers/*` and `hostlog`; `node.py` and the providers construct none):
+
+  | Lock | Can a line be logged while it is held? | What it is |
+  | --- | --- | --- |
+  | runner lock `SessionRunner.lock` | yes: every host call of a pass, the watchdog's pass, shutdown | `HostLock` |
+  | report lock `SessionRunner.report_lock` | yes: `_post_pending`, `_post_report`'s fallback, `_stamp` | `HostLock` (new) |
+  | ack lock `SessionRunner.ack_lock` | yes: `steer_offer` and `attempts` (entry points), an attempt's `ack` | `HostLock` (new) |
+  | latch lock `SessionRunner.latch_lock` | no: a comparison and an assignment | native (reviewed) |
+  | checkpoint condition `SessionRunner.checkpoint_cond` | no: the queue's update, pop or clear; wait; notify | native (reviewed) |
+  | the stopping event `_Stopping` | no: `set` calls `steer_stopping` before the event's own lock | native (reviewed) |
+  | cutoff lock `SessionHost._steer_stop_lock` | yes | `HostLock` |
+  | an attempt's record lock `SteerSlot.lock` | yes: the write gate's callbacks (`steer_capable`, `may_start`, the provider's modes) | `HostLock` (new) |
+  | usage lock `SessionHost.usage_lock` | no: the usage dict copied or updated; `clean_usage` logs nothing | native (reviewed) |
+  | registry lock `Groups.lock` | yes: the spawn callbacks | `HostLock` |
+  | hostlog's queue condition `_cond` | no: never held across a handler, a log call or other code | native |
+
+- **R1.3, the ack lock.** Under ff393a3 an exit under the ack lock could write: `attempts()`'s boundary exit, at depth
+  0 under a native lock. That is the same defect. The ack lock is now a boundary, so no exit under it drains.
+- **Tests.**
+  - `test_every_lock_of_the_host_side_modules_is_a_boundary_or_reviewed` is static. It finds every
+    `threading.Lock/RLock/Condition/Semaphore/Event/Barrier` in those modules (a base class included) and fails on one
+    that is neither wrapped in `hostlog.HostLock(...)` nor on the reviewed list above, and on a stale list entry.
+  - `test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time`.
+  - The guard (tests/hostlog_guard.py) now checks every lock of the table: the runner's five (an RLock or a Condition
+    by its own `_is_owned`, a plain lock instrumented), the host's two, the registry, and each held attempt's record
+    lock at the moment a handler is entered.
+  - `test_a_refused_reports_fallback_writes_its_line_after_the_report_lock[ordinary|steer-400|422-blocks|raises|reenters]`:
+    the real fallback, through `_flush` and `_post_report` with the hub answering 400 or 422 once. The line is written
+    after the retries went, with no lock held. A blocking handler holds up neither the retry nor the final report, a
+    raising one changes nothing, and one that re-enters `_flush` does not deadlock.
+  - On ff393a3 all 12 fail. Eight fail on "the retries were sent before any handler was entered", and the four
+    `reenters` cases deadlock (each run alone, bounded at 40 s).
+
+### R2. Only the loop (or a standalone caller) drains; every background thread is enqueue-only
+
+- **The defect.** A checkpoint POST that failed made the checkpoint sender the drainer. A handler stalled there held
+  the loop at its runner-lock exit, even when the loop had logged nothing.
+- **ONE predicate**, `hostlog.may_drain()`: the thread is inside no boundary, and it is not in `hostlog.ENQUEUE_ONLY`.
+  `hostlog.enqueue_only()` registers a thread for its whole body. Both of the node's background threads run inside
+  it: the deadline watchdog (`_watch`) and the checkpoint sender (`_send_checkpoints`).
+  - `session_host.WATCH_THREADS` is again session_host's own set and keeps its meaning (no save, transcript lines
+    kept in memory). Only the watchdog is in it.
+  - The checkpoint sender is NOT in `WATCH_THREADS`: that would defer its saves, and it makes none anyway. It is in
+    `ENQUEUE_ONLY` only.
+- **The thread table** (every `threading.Thread(...)` in the host-side modules, pinned by a static test):
+
+  | Thread | Target | Drains? |
+  | --- | --- | --- |
+  | `hosted-sessions` | `run_forever` | yes: the loop |
+  | `hosted-sessions-deadlines` | `_watch` | no: enqueue-only (and in `WATCH_THREADS`) |
+  | `hosted-sessions-checkpoints` | `_send_checkpoints` | no: enqueue-only |
+  | the process's own thread (`node.run`, hellos, dispatched runs, shutdown) | not started here | yes |
+
+- **What a second thread waits for while another drains** (the amendment's A2):
+  - with no record of its own pending, nothing;
+  - otherwise only its own records, for at most `hostlog.WAIT_SECONDS` (2 s). Then it returns, and the active drainer
+    writes them.
+  - Uncontended, a public call still returns with its lines with the handlers (`caplog`).
+  - A host lock let go at depth 0 writes everything queued when no drainer is active, so the loop writes the
+    background threads' lines.
+  - `atexit` waits for another drainer for at most 2 s. That deadline cannot interrupt a handler the exit drain
+    itself entered.
+  - Since background threads never drain, the loop's pass is never held by a background thread's handler.
+  - When the LOOP writes a record into a handler that blocks, it blocks there, outside every lock, as a synchronous
+    log call on main would. There is no separate writer thread in this PR (A4).
+- **Tests.**
+  - `test_a_failed_checkpoint_is_written_by_the_loop_and_never_holds_it` (A4). (i) The checkpoint POST fails with a
+    blocking handler installed: the sender returns without entering the handler, and the loop is not held. (ii) The
+    loop's next pass writes the line into that blocked handler holding no lock of the table, and the watchdog's
+    SIGTERM and SIGKILL still go. On ff393a3 it fails at (i): the sender enters the handler.
+  - `test_every_thread_the_host_side_modules_start_is_reviewed_and_every_background_one_is_enqueue_only` (static),
+    and `test_the_background_threads_register_as_enqueue_only_when_they_run`.
+  - `test_a_thread_waits_for_its_own_records_behind_a_stalled_drainer_only_up_to_the_deadline`.
+
+### R3. An exception's reviewed facts, rendered by the writer
+
+- **What it is.** `hostlog.facts(e)` keeps the exception's type name plus, for a known class, one integer, read at
+  the call from the instance's own storage, never through a property and never by `str`:
+  - an `httpx.HTTPStatusError`'s status code (`vars(e)["response"]`, then that Response's own `status_code`);
+  - an `OSError`'s `errno`, read through `OSError`'s own member descriptor;
+  - a `subprocess.CalledProcessError`'s `returncode`.
+- **Rendering.** The WRITER renders the result ("HTTPStatusError status=502", "OSError errno=61"), once per record,
+  before the handlers. Nothing is rendered at the call (A3). Any other class gives its type's name only. No URL, no
+  host name, no text.
+- **Where.** The 15 call sites that passed an exception object now pass `hostlog.facts(e)`. The two that already
+  passed `type(e).__name__` are unchanged; one of them is pinned by the protected test_codex_steering.
+- **Tests.** `test_facts_are_reviewed_integers_rendered_by_the_writer` covers each class, an unknown class, nothing
+  rendered at the call and no secret in the line. `test_facts_never_call_a_hostile_exceptions_own_code` uses an
+  OSError subclass whose `__str__`, `__repr__`, `__getattribute__` and `response` raise or return secrets: none of
+  them is touched.
+
+### R4. Nothing formatted at the call; the nested-drain pin; `HostLock`
+
+- **The Claude version.** `providers/claude.shown_version(version)` is now `_shown(version[:64], len(version))`. The
+  log call only slices and counts, and passes `hostlog.later(_shown, head, length)`, which the writer renders. The
+  protected test_claude_correlation's c9, c10 and c11 are unchanged and green.
+- **`test_nothing_is_formatted_at_a_log_call`** is static. Every log call in the five migrated modules, and the call
+  sites of the wrappers `_say_held` and `_say_wait`, has a literal message (or a template passed through a wrapper).
+  No argument may be an f-string, `%` or `+` on text, `.format`, `.join`, `str`/`repr`, or a call outside a reviewed
+  set (`getattr`, `len`, `type`, `isinstance`, `.get`, `hostlog.facts`, `hostlog.later`). It checks 116 calls.
+- **The nested-drain pin** (`test_a_handler_that_logs_and_calls_back_into_the_host_does_not_deadlock`) now asserts
+  that the call returns within 1 s (below `WAIT_SECONDS`), on a thread. The mutant, a nested drain that waits on
+  itself, waits `WAIT_SECONDS` at each nested exit, so the pin FAILS instead of hanging.
+- **`HostLock`.** Its docstring now says it is not a general replacement for a lock, and that no
+  `threading.Condition` may be built on it. `locked()` no longer misreports an RLock that the calling thread holds:
+  it asks `_is_owned()` first.

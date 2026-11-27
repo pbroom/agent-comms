@@ -398,7 +398,7 @@ class Node:
                     self._remove_browser_output(rid, out_dir)
                 return
         except Exception as e:
-            log.warning("could not start run %s: %s", rid, e)
+            log.warning("could not start run %s: %s", rid, hostlog.facts(e))
             if made:
                 self._remove_browser_output(rid, out_dir)
             self._report(rid, "ended", error=f"{type(e).__name__}: {e}"[:300])
@@ -597,7 +597,7 @@ def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
                 try:
                     node.tick()
                 except httpx.HTTPError as e:
-                    log.warning("hub unreachable: %s", e)
+                    log.warning("hub unreachable: %s", hostlog.facts(e))
                 time.sleep(poll_seconds or config.poll_seconds)
         except KeyboardInterrupt:
             shut_down(node)

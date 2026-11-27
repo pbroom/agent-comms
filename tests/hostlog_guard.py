@@ -71,23 +71,50 @@ def runner_lock():
     return (hostlog.HostLock(inner) if hostlog is not None else inner), inner
 
 
+class _Owned:
+    """Whether the calling thread owns `lock`: an RLock or a Condition says so itself (`_is_owned`); a plain Lock is
+    instrumented (`own`)."""
+
+    def __init__(self, obj, attr):
+        lock = getattr(obj, attr)
+        inner = lock._lock if hostlog is not None and isinstance(lock, hostlog.HostLock) else lock
+        if hasattr(inner, "_is_owned"):
+            self.mine = lock._is_owned
+        else:
+            self.mine = own(obj, attr).mine
+
+
+# Every lock of the host-side modules (DESIGN_NOTES "Host-side logging: review round 1", the lock table): the runner's
+# and the host's, by attribute; each held steer attempt's record lock is looked at when a handler is entered.
+RUNNER_LOCKS = ("lock", "report_lock", "latch_lock", "ack_lock", "checkpoint_cond")
+HOST_LOCKS = ("_steer_stop_lock", "usage_lock")
+
+
 class Guard:
-    """The handler: `mode` "record" (records only), "blocks" (stalls a little at every record) or "raises"."""
+    """The handler: `mode` "record" (records only), "blocks" (stalls a little at every record) or "raises". It
+    records, at every entry, which lock of the host-side modules the ENTERING thread holds."""
 
     def __init__(self, host=None, runner=None, mode="record", extra=()):
         self.locks = list(extra)
         if runner is not None:
-            self.locks.append(("runner", own(runner, "lock")))
+            names = {"lock": "runner", "report_lock": "report", "latch_lock": "latch", "ack_lock": "ack",
+                     "checkpoint_cond": "checkpoint"}
+            self.locks += [(names[a], _Owned(runner, a)) for a in RUNNER_LOCKS if hasattr(runner, a)]
             host = runner.host
         if host is not None:
-            self.locks.append(("cutoff", own(host, "_steer_stop_lock")))
-            self.locks.append(("registry", own(host.groups, "lock")))
+            names = {"_steer_stop_lock": "cutoff", "usage_lock": "usage"}
+            self.locks += [(names[a], _Owned(host, a)) for a in HOST_LOCKS if hasattr(host, a)]
+            self.locks.append(("registry", _Owned(host.groups, "lock")))
+        self.host = host
         self.mode, self.seen, self.violations = mode, [], []
         guard = self
 
         class H(logging.Handler):
             def emit(self, rec):
                 held = [name for name, lock in guard.locks if lock.mine()]
+                if guard.host is not None and any(s.steer is not None and s.steer.lock._is_owned()
+                                                  for s in list(guard.host.sessions.values())):
+                    held.append("slot")
                 guard.seen.append((rec.name, rec.getMessage(), held))
                 if held:
                     guard.violations.append((rec.getMessage(), held))

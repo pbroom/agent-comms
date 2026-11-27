@@ -412,7 +412,7 @@ def test_a_handler_that_logs_and_calls_back_into_the_host_does_not_deadlock(henv
     deadlock; the nested drains leave their records to the ACTIVE drainer, which writes them before the outer call
     returns."""
     import threading
-    from agent_comms import session_host
+    from agent_comms import hostlog, session_host
     open_session(henv)
     henv.host.send(SID, "go")
     calls = []
@@ -427,7 +427,9 @@ def test_a_handler_that_logs_and_calls_back_into_the_host_does_not_deadlock(henv
         done = threading.Event()
         t = threading.Thread(target=lambda: (henv.host.tick(), done.set()), daemon=True)
         t.start()
-        assert done.wait(5), "no deadlock"
+        # (Bounded below WAIT_SECONDS: a nested drain that waited on itself would wait that long at each nested
+        # exit, so its mutant FAILS here instead of hanging the run.)
+        assert done.wait(min(1.0, hostlog.WAIT_SECONDS / 2)), "no deadlock, no wait on itself"
         assert calls and "from the handler" in rec.messages(), "written by the active drainer before it returned"
 
 
@@ -499,14 +501,12 @@ def test_no_drain_inside_a_boundary_even_when_asked():
 
 def test_the_watchdogs_lines_are_written_at_the_runner_locks_release_not_by_an_entry_that_logged_nothing(env):
     """B4: what the watchdog queued is written by the loop when it lets go of the runner lock; an entry point that
-    logged nothing itself (`attempts`, which the node's acknowledgement path calls under its ack lock) writes and
-    waits for nothing."""
+    logged nothing itself (`attempts`) writes and waits for nothing."""
     from agent_comms import node_sessions
     runner = env.node.sessions
     with _Records() as rec:
         _on_watch_thread(lambda: node_sessions.log.warning("the watchdog's line"))
-        with runner.ack_lock:
-            runner.host.attempts()
+        runner.host.attempts()
         assert rec.records == [], "not by an entry that logged nothing"
         with runner.lock:
             pass
@@ -531,8 +531,452 @@ def test_a_drain_with_another_drainer_stalled_is_bounded_when_asked():
             assert entered.wait(5)
             _on_watch_thread(lambda: session_host.log.warning("waits"))
             started = _time.monotonic()
-            assert hostlog.drain(timeout=0.2, everything=True) is False
+            assert hostlog.drain(everything=True, timeout=0.2, wait_all=True) is False
             assert _time.monotonic() - started < 2
         finally:
             stall.set()
             t.join(5)
+
+
+# ---------------------------------------------------------------- review round 1: R1 (every lock) and R2 (threads)
+
+
+def _refused_once(env, kind, code):
+    """A report refused once with `code` at its first rung and taken at the next. `ordinary`: a Claude session's
+    status report, whose modes name the steer pair (no event carries a steer outcome); `steer`: a Claude `next_turn`
+    and a Codex `in_turn`, each in its own report. (runner, the POSTs made, the sessions refused)."""
+    from test_claude_steering import _claude_next_turn_and_codex_steer_pending, _posts, cinit, written
+    from test_hosted_tree import proc_of
+    runner = env.node.sessions
+    if kind == "steer":
+        a, b, runner = _claude_next_turn_and_codex_steer_pending(env)
+        sids = {a, b}
+    else:
+        sid = start(env, "a turn")["session_id"]
+        tick(env)
+        child = proc_of(env, sid)[1]
+        child.emit(cinit(sid, written(child)[-1]["uuid"]))
+        tick(env)
+        assert "held" in runner.host.modes(sid)
+        runner.reported.pop(sid, None)      # (its status goes again)
+        sids = {sid}
+    refused = set()
+
+    def refuse(path, body):
+        sid = path.rsplit("/", 1)[-1]
+        if sid in sids and sid not in refused and (kind == "steer" or "held" in (body.get("modes") or [])):
+            refused.add(sid)
+            return code
+        return None
+    return runner, _posts(runner, refuse), sids
+
+
+@pytest.mark.parametrize("mode", ["blocks", "raises", "reenters"])
+@pytest.mark.parametrize("code", [400, 422])
+@pytest.mark.parametrize("kind", ["ordinary", "steer"])
+def test_a_refused_reports_fallback_writes_its_line_after_the_report_lock(env, kind, code, mode):
+    """R1 (review round 1): a report refused with 400 or 422 and sent again at its next rung (`_post_report`, under
+    `_flush`'s report lock): its line is written once no lock of the host-side modules is held, after the retry was
+    sent; a handler that blocks holds up neither the retry nor the final report, one that raises changes nothing, and
+    one that re-enters `_flush` does not deadlock."""
+    import threading
+    runner, seen, sids = _refused_once(env, kind, code)
+    release, entered, at_entry, reentered = threading.Event(), threading.Event(), [], []
+
+    def act(r):
+        if "the hub refused the report" not in r.getMessage() or entered.is_set():
+            return
+        at_entry.append(len(seen))
+        entered.set()
+        if mode == "raises":
+            raise RuntimeError("a log handler failed")
+        if mode == "reenters":
+            reentered.append(runner._flush())
+        else:
+            release.wait(10)
+    with Guard(runner=runner) as g, _Records(act=act):
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (runner._flush(), done.set()), daemon=True)
+        t.start()
+        try:
+            assert entered.wait(5), "the refusal's line was written"
+            assert mode == "blocks" or done.wait(5), "no deadlock"
+            assert at_entry[0] == len(sids) * 2, "the retries were sent before any handler was entered"
+        finally:
+            release.set()
+        assert done.wait(5)
+    assert not g.violations, g.violations
+    assert [p for p, _ in seen].count(next(iter(sids))) == 2
+    assert not [x for x, _ in runner.pending if x in sids], "the final report went"
+    if mode == "reenters":
+        assert reentered == [True]
+
+
+def test_a_failed_checkpoint_is_written_by_the_loop_and_never_holds_it(env):
+    """R2 (review round 1; the amendment's A4): the checkpoint sender's POST fails with a blocking handler installed:
+    (i) the sender returns without entering the handler (it is enqueue-only) and the loop is not held by it; (ii) the
+    loop's next pass writes the line into that blocked handler holding no lock of the host-side modules, and the
+    watchdog's SIGTERM and SIGKILL still go meanwhile."""
+    import threading
+    import httpx
+    runner = env.node.sessions
+    a, ca, n, s_uuid = claude_steered(env)
+    b, cb, mb = _ordinary_turn_in_flight(env, project=P2)
+    cb.exits_on_terminate = False
+    real = runner.client.request
+    posting, go, failed = threading.Event(), threading.Event(), threading.Event()
+
+    def request(method, url, *x, **kw):
+        if (kw.get("json") or {}).get("held") is not None:
+            posting.set()
+            go.wait(10)         # (it fails once the loop's passes are over: no loop pass writes it meanwhile)
+            failed.set()
+            raise httpx.ConnectError("the hub is away")
+        return real(method, url, *x, **kw)
+    runner.client.request = request
+    release, entered, where = threading.Event(), threading.Event(), []
+
+    def act(r):
+        if "was not taken" in r.getMessage():
+            where.append(threading.current_thread())
+            entered.set()
+            release.wait(10)
+    with Guard(runner=runner) as g, _Records(act=act):
+        runner.start_checkpoint_sender()
+        try:
+            ca.emit(cresult(a, n, text="N's reply"))
+            tick(env, times=2)
+            assert posting.wait(5), "the sender is posting the checkpoint"
+            go.set()
+            assert failed.wait(5), "the checkpoint POST failed"
+            assert _wait(lambda: runner.checkpoint_thread.is_alive() and not runner.checkpoint_queue)
+            assert not entered.wait(0.5), ("(i) the sender entered no handler: it is enqueue-only", where)
+            loop = threading.Thread(target=lambda: tick(env), daemon=True)
+            loop.start()
+            assert entered.wait(5) and where == [loop], "(ii) the loop's drain writes it"
+            env.clock.advance(runner.self_stop_seconds + 1)
+            ident = _on_watch_thread(runner.enforce_deadlines)
+            assert cb.terminated, "the watchdog's SIGTERM, while the loop's handler is blocked"
+            env.clock.advance(runner.host.kill_grace + 1)
+            _on_watch_thread(runner.enforce_deadlines)
+            assert cb.killed, "and its SIGKILL"
+            assert ident not in [t.ident for t in where]
+        finally:
+            release.set()
+            runner.stopping.set()
+            runner.checkpoint_thread.join(5)
+    assert not g.violations, g.violations
+
+
+def _wait(pred, seconds=5.0):
+    import time as _time
+    deadline = _time.monotonic() + seconds
+    while _time.monotonic() < deadline:
+        if pred():
+            return True
+        _time.sleep(0.02)
+    return pred()
+
+
+HOST_SIDE = ["session_host.py", "node_sessions.py", "node.py", "node_groups.py", "providers/__init__.py",
+             "providers/claude.py", "providers/codex.py", "hostlog.py"]
+LOCK_KINDS = {"Lock", "RLock", "Condition", "Semaphore", "BoundedSemaphore", "Event", "Barrier"}
+# (Review round 1, R1) The locks of the host-side modules under which no line can be logged, each with why; every
+# other lock constructed there is a boundary (`hostlog.HostLock`). DESIGN_NOTES "Host-side logging: review round 1"
+# has the whole table.
+NOT_BOUNDARIES = {
+    ("session_host.py", "self.usage_lock"): "held only to copy or update the usage dict (clean_usage logs nothing)",
+    ("node_sessions.py", "self.latch_lock"): "held only for a comparison and an assignment",
+    ("node_sessions.py", "self.checkpoint_cond"): "held only to queue, pop or clear checkpoints, and to wait or notify",
+    ("node_sessions.py", "class _Stopping"): "an Event: its lock is held only inside set/wait (steer_stopping first)",
+    ("hostlog.py", "_cond"): "the queue's own lock: never held across a handler, a log call or foreign code",
+}
+
+
+def _module(rel):
+    import ast
+    from pathlib import Path
+    import agent_comms
+    path = Path(agent_comms.__file__).parent / rel
+    return ast.parse(path.read_text()), path
+
+
+def _parents(tree):
+    import ast
+    up = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            up[child] = node
+    return up
+
+
+def _owner(node, up):
+    """Where a lock is constructed: the assignment's target, or `class X` for a base class."""
+    import ast
+    at = node
+    while at in up:
+        parent = up[at]
+        if isinstance(parent, ast.ClassDef) and at in parent.bases:
+            return f"class {parent.name}"
+        if isinstance(parent, ast.Assign):
+            return ast.unparse(parent.targets[0])
+        if isinstance(parent, ast.AnnAssign):
+            return ast.unparse(parent.target)
+        at = parent
+    return None
+
+
+def test_every_lock_of_the_host_side_modules_is_a_boundary_or_reviewed():
+    """R1 (review round 1): every `threading` lock, condition, event or semaphore constructed in the host-side modules
+    is either wrapped as a boundary (`hostlog.HostLock(...)`) or on the reviewed list of those under which no line can
+    be logged; a lock added later cannot fall outside the invariant silently, and the list has no stale entry."""
+    import ast
+    found = set()
+    for rel in HOST_SIDE:
+        tree, path = _module(rel)
+        up = _parents(tree)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                    and node.value.id == "threading" and node.attr in LOCK_KINDS):
+                continue
+            parent = up.get(node)
+            call = parent if isinstance(parent, ast.Call) and parent.func is node else None
+            wrapper = up.get(call) if call is not None else None
+            if isinstance(wrapper, ast.Call) and call in wrapper.args:
+                name = ast.unparse(wrapper.func)
+                if name in ("hostlog.HostLock", "HostLock"):
+                    continue        # a boundary
+                if name == "threading.Condition":
+                    continue        # (a Condition's own lock: the Condition is what is reviewed)
+            key = (rel, _owner(node, up))
+            assert key in NOT_BOUNDARIES, f"{path.name}:{node.lineno}: {key[1]} is a lock outside the invariant"
+            found.add(key)
+    assert found == set(NOT_BOUNDARIES), set(NOT_BOUNDARIES) - found
+
+
+def test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time(env):
+    """R1 (review round 1): the runner's lock, report lock and ack lock, the host's cutoff lock, the registry's lock and
+    a steer attempt's record lock are boundaries (`HostLock`) as constructed."""
+    from agent_comms import hostlog
+    from agent_comms.session_host import SteerSlot
+    runner = env.node.sessions
+    for lock in (runner.lock, runner.report_lock, runner.ack_lock, runner.host._steer_stop_lock,
+                 runner.host.groups.lock, SteerSlot("u", "1", "t").lock):
+        assert isinstance(lock, hostlog.HostLock)
+
+
+# (Review round 1, R2) Every thread the host-side modules start: the loop drains; every other one is enqueue-only.
+THREADS = {"hosted-sessions": ("run_forever", "the loop: it drains"),
+           "hosted-sessions-deadlines": ("_watch", "enqueue-only"),
+           "hosted-sessions-checkpoints": ("_send_checkpoints", "enqueue-only")}
+
+
+def test_every_thread_the_host_side_modules_start_is_reviewed_and_every_background_one_is_enqueue_only():
+    """R2 (review round 1): every `threading.Thread(...)` in the host-side modules is on the reviewed list; each one
+    other than the loop runs its whole body inside `hostlog.enqueue_only()`."""
+    import ast
+    found, bodies = {}, {}
+    for rel in HOST_SIDE:
+        tree, path = _module(rel)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                bodies[node.name] = node
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "threading.Thread":
+                kw = {k.arg: k.value for k in node.keywords}
+                assert "name" in kw and isinstance(kw["name"], ast.Constant), f"{path.name}:{node.lineno}: unnamed"
+                found[kw["name"].value] = ast.unparse(kw["target"]).rsplit(".", 1)[-1]
+    assert {n: t for n, (t, _) in THREADS.items()} == found
+    for name, (target, kind) in THREADS.items():
+        if kind != "enqueue-only":
+            continue
+        withs = [w for w in ast.walk(bodies[target]) if isinstance(w, ast.With)
+                 and any(ast.unparse(i.context_expr) == "hostlog.enqueue_only()" for i in w.items)]
+        assert withs, f"{target} is not enqueue-only"
+
+
+def test_the_background_threads_register_as_enqueue_only_when_they_run(env):
+    """R2: the deadline watchdog and the checkpoint sender, started as the node starts them, are in
+    `hostlog.ENQUEUE_ONLY` while they run, and out of it once they end."""
+    import threading
+    from agent_comms import hostlog
+    runner = env.node.sessions
+    runner.watch_seconds = 0.05
+    runner.start_checkpoint_sender()
+    watch = threading.Thread(target=runner._watch, daemon=True)
+    watch.start()
+    try:
+        assert _wait(lambda: runner.checkpoint_thread.ident in hostlog.ENQUEUE_ONLY
+                     and watch.ident in hostlog.ENQUEUE_ONLY)
+    finally:
+        runner.stopping.set()
+        runner.checkpoint_thread.join(5)
+        watch.join(5)
+        runner.stopping.clear()
+    assert runner.checkpoint_thread.ident not in hostlog.ENQUEUE_ONLY and watch.ident not in hostlog.ENQUEUE_ONLY
+
+
+def test_a_thread_waits_for_its_own_records_behind_a_stalled_drainer_only_up_to_the_deadline(monkeypatch):
+    """R2 (the amendment's A2): while another thread's drain is stalled in a handler, a thread with nothing of its own
+    pending waits for nothing; one with a record of its own waits for it at most WAIT_SECONDS, then returns; the
+    active drainer writes that record once its handler returns."""
+    import threading
+    import time as _time
+    from agent_comms import hostlog, session_host
+    monkeypatch.setattr(hostlog, "WAIT_SECONDS", 0.3)
+    stall, entered = threading.Event(), threading.Event()
+
+    def act(r):
+        if r.getMessage() == "stalls":
+            entered.set()
+            stall.wait(10)
+    with _Records(act=act) as rec:
+        t = threading.Thread(target=lambda: session_host.log.warning("stalls"), daemon=True)
+        t.start()
+        try:
+            assert entered.wait(5)
+            t0 = _time.monotonic()
+            with hostlog.BOUNDARY:
+                pass
+            assert _time.monotonic() - t0 < 0.2, "nothing of its own: no wait"
+            t0 = _time.monotonic()
+            session_host.log.warning("mine")
+            waited = _time.monotonic() - t0
+            assert 0.25 <= waited < 2, waited
+            assert "mine" not in rec.messages()
+        finally:
+            stall.set()
+            t.join(5)
+    assert rec.messages() == ["stalls", "mine"], "written by the active drainer"
+
+
+# ---------------------------------------------------------------- R3: an exception's reviewed facts
+
+
+def test_facts_are_reviewed_integers_rendered_by_the_writer(monkeypatch):
+    """R3 (review round 1; the amendment's A3): `hostlog.facts` keeps an exception's type name and, for a known class,
+    an integer read at the call (an HTTP status error's status code, an OSError's errno, a subprocess's return code);
+    the WRITER renders them; nothing is rendered at the call, and no exception text is ever read."""
+    import errno as _errno
+    import subprocess
+    import httpx
+    from agent_comms import hostlog, session_host
+    rendered = []
+    real = hostlog._render_facts
+    monkeypatch.setattr(hostlog, "_render_facts", lambda *a: (rendered.append(a), real(*a))[1])
+    req = httpx.Request("POST", "http://secret-host.example/api/nodes/sessions/x?token=SECRET")
+    refused = _errno.ECONNREFUSED
+    cases = [
+        (httpx.HTTPStatusError("SECRET text", request=req, response=httpx.Response(502, request=req)),
+         "HTTPStatusError status=502"),
+        (ConnectionRefusedError(refused, "SECRET text"), f"ConnectionRefusedError errno={refused}"),
+        (OSError("SECRET text"), "OSError"),
+        (subprocess.CalledProcessError(3, ["SECRET", "argv"], output="SECRET"), "CalledProcessError returncode=3"),
+        (httpx.ConnectError("SECRET text", request=req), "ConnectError"),
+        (ValueError("SECRET text"), "ValueError"),
+    ]
+
+    def logs():
+        for e, _ in cases:
+            session_host.log.warning("it failed: %s", hostlog.facts(e))
+    with _Records() as rec:
+        _on_watch_thread(logs)
+        assert rendered == [], "nothing rendered at the call"
+        hostlog.drain(everything=True)
+    assert rec.messages() == [f"it failed: {want}" for _, want in cases]
+    assert len(rendered) == len(cases) and not any("SECRET" in m for m in rec.messages())
+
+
+def test_facts_never_call_a_hostile_exceptions_own_code():
+    """R3: an exception whose `__str__`, `__repr__` and attributes raise or return secrets: `facts` reads none of them
+    (its type's name and its errno, read with no code of its own); the line is written."""
+    from agent_comms import hostlog, session_host
+    touched = []
+
+    class Hostile(OSError):
+        def __str__(self):
+            touched.append("str")
+            return "SECRET"
+
+        __repr__ = __str__
+
+        def __getattribute__(self, name):
+            touched.append(name)
+            raise AssertionError("read")
+
+        @property
+        def response(self):
+            touched.append("response")
+            return "SECRET"
+    e = Hostile(7, "SECRET")
+    touched.clear()
+    with _Records() as rec:
+        session_host.log.warning("it failed: %s", hostlog.facts(e))
+    assert rec.messages() == ["it failed: Hostile errno=7"] and touched == []
+
+
+# ---------------------------------------------------------------- R4: nothing formatted at the call
+
+
+LOG_METHODS = {"debug", "info", "warning", "error", "exception", "critical"}
+ALLOWED_CALLS = {"getattr", "len", "type", "isinstance", "hostlog.facts", "hostlog.later"}
+
+
+def _formats(node):
+    """What in a log call's argument would format at the call: an f-string, `%` or `+` on text, `.format`, `.join`,
+    `str`/`repr`/`format`, any call not on the reviewed list."""
+    import ast
+    for n in ast.walk(node):
+        if isinstance(n, ast.JoinedStr):
+            return "an f-string"
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Mod):
+            return "%-formatting"
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add) and any(
+                isinstance(x, ast.Constant) and isinstance(x.value, str) for x in (n.left, n.right)):
+            return "text concatenation"
+        if isinstance(n, ast.Call):
+            f = ast.unparse(n.func)
+            if f in ALLOWED_CALLS or (isinstance(n.func, ast.Attribute) and n.func.attr == "get"):
+                continue
+            return f"a call to {f}"
+    return None
+
+
+def test_nothing_is_formatted_at_a_log_call():
+    """R4 (review round 1): in the migrated modules every log call's message is a literal (or a template passed
+    through a wrapper) and no argument formats at the call; the wrappers' own call sites (`_say_held`, `_say_wait`)
+    are checked the same way."""
+    import ast
+    wrappers = {"_say_held": 4, "_say_wait": 1}
+    checked = 0
+    for rel in ["session_host.py", "node_sessions.py", "node.py", "providers/claude.py", "providers/codex.py"]:
+        tree, path = _module(rel)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            f = node.func
+            if isinstance(f.value, ast.Name) and f.value.id == "log" and f.attr in LOG_METHODS | {"log"}:
+                at = 1 if f.attr == "log" else 0
+            elif f.attr in wrappers:
+                at = wrappers[f.attr]
+            else:
+                continue
+            msg, args = node.args[at], node.args[at + 1:]
+            where = f"{path.name}:{node.lineno}"
+            assert (isinstance(msg, ast.Constant) and isinstance(msg.value, str)) or isinstance(msg, ast.Name), where
+            for a in args + [k.value for k in node.keywords]:
+                bad = _formats(a)
+                assert bad is None, f"{where}: {bad}: {ast.unparse(a)}"
+            checked += 1
+    assert checked > 100
+
+
+def test_a_later_value_is_rendered_by_the_writer_only(monkeypatch):
+    """R4: the Claude version is sliced and counted at the call and escaped by the writer (`hostlog.later`)."""
+    from agent_comms import hostlog
+    from agent_comms.providers import claude
+    calls = []
+    real = claude.re.sub
+    monkeypatch.setattr(claude.re, "sub", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    value = hostlog.later(claude._shown, "2.1.330\n"[:64], 8)
+    assert calls == []
+    assert str(value) == claude.shown_version("2.1.330\n") and calls == [1, 1]

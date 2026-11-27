@@ -3337,12 +3337,14 @@ def _on_watchdog(runner, fn=None):
     done, ident, err = threading.Event(), [], []
 
     def run():
+        from agent_comms import hostlog
         ident.append(threading.get_ident())
         reg = getattr(session_host, "WATCH_THREADS", None)
         if reg is not None:
             reg.add(ident[0])
         try:
-            (fn or runner.enforce_deadlines)()
+            with hostlog.enqueue_only():        # (as `_watch` registers its thread: it never drains)
+                (fn or runner.enforce_deadlines)()
         except BaseException as e:      # noqa: BLE001 (the thread's own; the test reads it)
             err.append(e)
         finally:

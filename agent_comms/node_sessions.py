@@ -238,7 +238,7 @@ class SessionRunner:
         self.last_fetch: tuple | None = None
         # The evidence above, between the loop, node.py's hellos and the watchdog: its own short lock, never the
         # host's (R2-09). Order: the host's lock (where held), then this, then an attempt's.
-        self.ack_lock = threading.RLock()
+        self.ack_lock = hostlog.HostLock(threading.RLock())     # (a boundary: host-side logging, review round 1, R1)
         # (R8-04, R9-01) The steer diagnostics, each bounded by construction:
         # - a held attempt's reasons (another turn, not the held attempt): session -> (its uuid, the reasons said),
         #   at most one entry per open session, of at most two reasons; gone with the slot (a new attempt is said
@@ -315,7 +315,8 @@ class SessionRunner:
         # listing from a fetch SENT after that moment has been applied (`_may_start`, `pass_once`).
         self.latched_at: float | None = None
         self.latch_lock = threading.Lock()            # the latch, between the loop's calls, the loop and the watchdog
-        self.report_lock = threading.Lock()           # the report queue: one flush at a time, shutdown's last
+        # the report queue: one flush at a time, shutdown's last (a boundary: host-side logging, review round 1, R1)
+        self.report_lock = hostlog.HostLock(threading.Lock())
         self.seq = self._load_seq()                   # the last report's stamp (`_stamp`), an earlier process's included
         self.seq_unsaved = False                      # the last attempt to put it on disk failed (said once)
         self.hub_seq = 0                              # the highest stamp the hub says it applied, for any session
@@ -365,7 +366,7 @@ class SessionRunner:
         try:
             self._write_private(self.log_dir / WORKTREES_FILE, self.worktrees)
         except OSError as e:
-            log.warning("could not record the session worktrees in %s (%s)", WORKTREES_FILE, e)
+            log.warning("could not record the session worktrees in %s (%s)", WORKTREES_FILE, hostlog.facts(e))
 
     def _load_seq(self) -> int:
         try:
@@ -729,7 +730,13 @@ class SessionRunner:
     def _send_checkpoints(self) -> None:
         """The checkpoint sender's thread (ruling K): one queued checkpoint at a time, each rechecked at dispatch
         (`_checkpoint_due`) and posted with its own timeout; ordinary reports never wait for it. Ends with shutdown;
-        what is still queued then is dropped (nothing waits for it)."""
+        what is still queued then is dropped (nothing waits for it). (Host-side logging, review round 1, R2) It is
+        enqueue-only: its lines (a failed checkpoint's) wait for the loop, so a stalled handler never holds it, and it
+        never makes the loop wait behind it."""
+        with hostlog.enqueue_only():
+            self._checkpoint_loop()
+
+    def _checkpoint_loop(self) -> None:
         while not self.stopping.is_set():
             with self.checkpoint_cond:
                 if not self.checkpoint_queue:
@@ -774,7 +781,8 @@ class SessionRunner:
             self.seq_unsaved = False
         except OSError as e:
             if not self.seq_unsaved:
-                log.warning("could not record the report stamp in %s (%s); reporting goes on", SEQ_FILE, e)
+                log.warning("could not record the report stamp in %s (%s); reporting goes on", SEQ_FILE,
+                            hostlog.facts(e))
             self.seq_unsaved = True
         return self.seq
 
@@ -824,7 +832,7 @@ class SessionRunner:
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if code not in (400, 404, 422):
-                    log.warning("could not report session %s: %s", sid, e)
+                    log.warning("could not report session %s: %s", sid, hostlog.facts(e))
                     self._drop_sent(sent_items)
                     return False
                 if code == 422 and named and sid not in self.refused:
@@ -941,7 +949,7 @@ class SessionRunner:
                     self.last_fetch = (fetch_sent, received, snapshot[0], snapshot[1], self.ack_seq)
                 self.last_sync = self.clock()
             except Exception as e:
-                log.warning("could not fetch hosted sessions: %s", e)
+                log.warning("could not fetch hosted sessions: %s", hostlog.facts(e))
                 ok = False
         if data is not None:
             self.fresh = True
@@ -1060,7 +1068,7 @@ class SessionRunner:
                                        runtime=view.get("runtime"), model=view.get("model"), resume=resume,
                                        **self._tree_open(sid, view))
                 except Exception as e:
-                    log.warning("cannot host session %s: %s", sid, e)
+                    log.warning("cannot host session %s: %s", sid, hostlog.facts(e))
                     self._ended_without_process(sid, f"this node cannot host the session: {type(e).__name__}: {e}")
                     continue
                 self.last_busy[sid] = self.clock()
@@ -1600,7 +1608,7 @@ class SessionRunner:
             now = self.clock()
             if now - self._said_bad.get(sid, float("-inf")) >= BAD_OFFER_LOG_SECONDS:
                 self._said_bad[sid] = now
-                log.warning("session %s: a steer offer could not be taken: %s", sid, err)
+                log.warning("session %s: a steer offer could not be taken: %s", sid, hostlog.facts(err))
 
     def _say_held(self, sid: str, held: Any, why: str, level: int, msg: str, *args) -> None:
         """(R8-04, R9-01) A reason about the held attempt, said once per attempt: kept with that attempt only."""
@@ -1730,13 +1738,14 @@ class SessionRunner:
 
     def _watch(self) -> None:
         me = threading.get_ident()
-        WATCH_THREADS.add(me)       # (ruling W) the host defers every save and transcript line made here; no drain
+        WATCH_THREADS.add(me)       # (ruling W) the host defers every save and transcript line made here
         try:
-            while not self.stopping.wait(self.watch_seconds):
-                try:
-                    self.enforce_deadlines()
-                except Exception:
-                    log.exception("hosted sessions: the deadline watchdog failed a pass")
+            with hostlog.enqueue_only():        # (review round 1, R2) and it never drains: the loop writes its lines
+                while not self.stopping.wait(self.watch_seconds):
+                    try:
+                        self.enforce_deadlines()
+                    except Exception:
+                        log.exception("hosted sessions: the deadline watchdog failed a pass")
         finally:
             WATCH_THREADS.discard(me)
 
@@ -1849,4 +1858,4 @@ class SessionRunner:
             if not self._flush(final=True):
                 log.warning("could not report the session shutdown")
         except Exception as e:
-            log.warning("could not report the session shutdown: %s", e)
+            log.warning("could not report the session shutdown: %s", hostlog.facts(e))

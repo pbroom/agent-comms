@@ -99,14 +99,14 @@ from typing import Any, Callable
 from . import hostlog, node_groups, providers, runner_preflight, session_access
 from .dispatch import (DispatchConfig, _signal_group, _within, child_env, probe_process, process_start,
                        render_argv, spawn_piped, stop_verified, with_writable_roots)
-from .hostlog import WATCH_THREADS
 from .providers import Event, ProviderSession, validate_model, validate_session_id
 
-# (Review round 5, ruling W) The threads that run the node's deadline watchdog (node_sessions registers its own; the
-# set is hostlog's). On them the host only reads clocks and memory, takes the cutoff lock, makes a claim, sends
-# signals and appends events already built: a state save is left for the loop (`_save_due`) and a transcript line
-# waits in memory (`tee_pending`). Its log lines are deferred records like every host-side line (hostlog: no
-# watchdog thread ever drains; the loop's next drain writes them).
+# (Review round 5, ruling W) The threads that run the node's deadline watchdog (node_sessions registers its own). On
+# them the host only reads clocks and memory, takes the cutoff lock, makes a claim, sends signals and appends events
+# already built: a state save is left for the loop (`_save_due`) and a transcript line waits in memory
+# (`tee_pending`). (Its log lines are deferred records like every host-side line; that the watchdog never drains is
+# hostlog's own registry, `hostlog.ENQUEUE_ONLY`, not this one.)
+WATCH_THREADS: set[int] = set()
 
 
 def on_watch() -> bool:
@@ -230,7 +230,9 @@ class SteerSlot:
     session_id: str = ""
     cover_until: float | None = None
     stopping: bool = False          # the node is stopping: set under `lock` (`steer_stopping`), never written then
-    lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
+    # (Host-side logging, review round 1, R1) a lock a line can be logged under (callbacks of the write gate): a
+    # boundary (hostlog.HostLock)
+    lock: Any = field(default_factory=lambda: hostlog.HostLock(threading.RLock()), repr=False, compare=False)
     # (R9-02) The process this attempt was taken for. The slot goes when that process is let go of
     # (`_release_steer`); a cut is only ever made for the current process's own slot.
     process: Any = field(default=None, repr=False, compare=False)
@@ -832,7 +834,7 @@ class SessionHost:
                 os.close(fd)
             os.replace(tmp, path)
         except OSError as e:
-            log.warning("could not record the providers' session ids in %s (%s)", PROVIDER_FILE, e)
+            log.warning("could not record the providers' session ids in %s (%s)", PROVIDER_FILE, hostlog.facts(e))
 
     def keep_provider_ids(self, session_ids) -> None:
         """Drop the recorded provider ids of every session not named here (the hub no longer lists them)."""
@@ -1009,7 +1011,7 @@ class SessionHost:
                     (self.sessions_dir / name).unlink()
                     log.info("removed %s: its session is gone", name)
                 except OSError as e:
-                    log.warning("could not remove %s (%s)", name, e)
+                    log.warning("could not remove %s (%s)", name, hostlog.facts(e))
 
     def _drop_files(self, session_id: str) -> None:
         for kind in self.PRIVATE_FILES:
@@ -2864,7 +2866,7 @@ class SessionHost:
                 return
             s.group_token, s.group_key = token, k
         except Exception as e:
-            log.warning("could not start session %s: %s", s.session_id, e)
+            log.warning("could not start session %s: %s", s.session_id, hostlog.facts(e))
             self._end(s, f"could not start: {type(e).__name__}: {e}", now, out)
             return
         s.child, s.ready, s.stopping_since, s.killed = child, False, None, False
@@ -2881,7 +2883,7 @@ class SessionHost:
             os.fchmod(fd, 0o600)
             s.transcript_fd = fd
         except OSError as e:
-            log.warning("session %s: no transcript (%s)", s.session_id, e)
+            log.warning("session %s: no transcript (%s)", s.session_id, hostlog.facts(e))
         self._save_state()
         log.info("started session %s for %s (pid %s)", s.session_id, s.agent, getattr(child, "pid", None))
 
@@ -2897,7 +2899,7 @@ class SessionHost:
         except OSError as e:
             if not s.tee_failed:
                 s.tee_failed = True
-                log.warning("session %s: could not write its transcript (%s)", s.session_id, e)
+                log.warning("session %s: could not write its transcript (%s)", s.session_id, hostlog.facts(e))
 
     def _flush_tee(self, s: Session) -> None:
         """(Ruling W) What the watchdog's thread read is written to the transcript here, on the loop's thread."""
@@ -2908,7 +2910,7 @@ class SessionHost:
             except OSError as e:
                 if not s.tee_failed:
                     s.tee_failed = True
-                    log.warning("session %s: could not write its transcript (%s)", s.session_id, e)
+                    log.warning("session %s: could not write its transcript (%s)", s.session_id, hostlog.facts(e))
 
     def _write(self, s: Session, now: float, out: list[HostEvent]) -> None:
         if s.child is None:
