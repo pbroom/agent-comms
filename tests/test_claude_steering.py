@@ -4457,6 +4457,63 @@ def test_r7_2_both_shutdown_entry_points_signal_every_group_with_a_stalling_hand
     assert ok, (ca.terminated, cb.terminated, ca.killed, cb.killed)
 
 
+def test_r7_a1_the_loop_sends_a_deferred_stop_by_itself(env):
+    """Ruling A1 (a mutation row): a held end's stop deferred on the watchdog's thread (the registry was busy) is
+    sent by the loop's next tick once the registry is free, with no watchdog pass needed."""
+    import threading
+    a, ca, n, s_uuid = claude_steered(env)
+    runner = env.node.sessions
+    host = runner.host
+    ca.emit(cresult(a, n, text="N's reply"))
+    tick(env)
+    sa = host.sessions[a]
+    ca.exits_on_terminate = False
+    sa.steer.cover_until = env.clock() - 1
+    release, held = threading.Event(), threading.Event()
+
+    def spawn_holding_the_registry():
+        with host.groups.lock:
+            held.set()
+            release.wait(10)
+    threading.Thread(target=spawn_holding_the_registry, daemon=True).start()
+    assert held.wait(3)
+    t, done, ident, err = _on_watchdog(runner)
+    assert done.wait(5) and not err, err
+    assert sa.stop_due and not ca.terminated
+    release.set()
+    _wait_for(lambda: host.groups.lock.acquire(blocking=False) and (host.groups.lock.release() or True), 3)
+    host.tick()
+    assert ca.terminated == 1 and sa.stopping_since is not None and not sa.stop_due
+
+
+def test_r7_2_what_a_process_wrote_last_reaches_its_transcript_at_shutdown(henv, monkeypatch, tmp_path):
+    """Ruling R7-2 (a mutation row): the deferral ends with the bulk SIGKILL pass: the per-session cleanup after it
+    writes a process's last output to its transcript (it is not held back as a watchdog's lines are)."""
+    import os as _os
+    (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
+    fd = _os.open(tmp_path / "t1", _os.O_WRONLY | _os.O_CREAT, 0o600)
+    s1.transcript_fd = fd
+    c1.emit(plain(text="the last words"))
+    henv.host.stop_all()
+    assert b"the last words" in (tmp_path / "t1").read_bytes()
+
+
+def test_r7_2_a_stop_all_that_raises_still_saves_for_real(henv, monkeypatch):
+    """Ruling R7-2 (a mutation row): the span raises (the wait for the groups): logging is restored first, so the
+    final save is a real one (the state file is written), never left deferred."""
+    (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
+    host = henv.host
+    c1.exits_on_terminate = False
+    host._state_path().unlink(missing_ok=True)
+
+    def bad(_):
+        raise OSError("failed")
+    host.sleep = bad
+    with pytest.raises(OSError):
+        host.stop_all()
+    assert host._state_path().exists(), "the final save was made"
+
+
 def test_r7_a2_stop_all_restores_the_callers_prior_diversion(henv, monkeypatch):
     """Ruling A2: `stop_all` run on a thread that was already diverting (a watchdog's) leaves it diverting."""
     from agent_comms import session_host
