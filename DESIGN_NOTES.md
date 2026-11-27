@@ -17179,3 +17179,174 @@ On 567a0b1 (this round's tests copied in, each run alone, bounded):
   | `--only correlation` | PASS, 24 |
   | `--only structured` | PASS, 36 |
   | `--only tree` | PASS, 143 |
+
+## Host-side logging: one writer, review round 1
+
+This round covers the review of the one-writer build: R11 to R13 and the amendment A1 to A5. No stop decision, signal,
+signal order or save changed. The changes are confined to `hostlog`'s queue, its writer's start, and `node.run`'s
+start of the writer.
+
+**Superseded** in "Host-side logging: one writer":
+- "It is started at the first record, and again if it is found dead" (W1). The start policy is now the one under
+  A4 below.
+- "the process exits as ever". After the final wait, the queue is sealed (R11).
+
+### R11. The seal
+
+- `final_flush` (the node's one final wait, and `atexit`'s) makes its idle decision and seals the queue under
+  `_cond`, in ONE step. No record can slip in between "idle" and "sealed".
+- An enqueue after the seal is rejected silently. It is counted nowhere (no "dropped" line), raises nothing, starts
+  no thread and creates no waiter.
+- The seal is one-way. Only the tests' `_reset` lifts it. `atexit` uses the same seal: when `node.run` has already
+  sealed, `_at_exit` does nothing. A standalone process is sealed by its own `atexit`.
+- The idle check is exact (A1): `busy` is set when the writer dequeues a record (or the pending drop notice) and is
+  cleared only after the last handler for it has returned. A pending drop notice counts as work. So "idle" means
+  that nothing is queued, nothing is in a handler, and no notice is owed.
+
+**What can enqueue late**, after the final wait. Each one is rejected, so none of them can keep a non-daemon resource
+alive or re-open a wait:
+- the checkpoint sender (`_send_checkpoints`), whose POST fails or returns after the exit began;
+- the deadline watchdog (`_watch`), at its next tick;
+- a session loop (`run_forever`) whose join expired at shutdown;
+- an httpx call in flight on one of those threads, whose failure is logged when it returns. httpx's own `httpx`
+  logger is direct stdlib logging (below);
+- a late reaper: the host-side modules start none. `notify.py`'s Popen reaper logs through the stdlib logger
+  `agent_comms.notify`, not through `hostlog` (below).
+
+**Outside the guarantee**, stated plainly:
+- A seal cannot rescue a handler that is already stuck when `logging.shutdown()` runs. If the final wait found the
+  writer idle and a handler then blocks on a later direct stdlib call, `logging.shutdown()` waits on that handler's
+  lock, as on main.
+- Threads a handler starts itself are not the writer and are not covered.
+- Direct stdlib logging is not covered. That includes `httpx`, `notify.py`, the hub, the CLI, and any library
+  logger. It reaches handlers on the calling thread, as on main.
+
+### R12 and A2. A writer that cannot start never fails a host operation
+
+- No `hostlog` log call raises into the host for an `Exception`. The snapshot and the enqueue sit inside `_keep`'s
+  `except Exception`, and the start sits inside `_start_writer`'s.
+- When the writer cannot start, records stay queued up to `QUEUE_MAX`. They are then dropped by the usual rule, and
+  the "dropped" line is written once a writer runs. Waiters are released: `_acknowledge` returns at once when no
+  writer is running or a start is pending, so nobody waits for a writer that is not running.
+- Retries are rate-limited: a failed start is not tried again within `RESTART_SECONDS` (1 s), except by a forced
+  start (`node.run`'s first start, and the tests' `_reset`).
+- The start runs OUTSIDE `_cond` (A2):
+  - the claim (`starting`) is taken under the lock;
+  - `Thread.start()` runs with the lock let go;
+  - the claim is cleared under the lock however the start ends, and waiters are woken.
+  - A producer that sees a pending start enqueues and returns without waiting.
+- The seal accounts for a start in two ways:
+  - The final wait first makes its own start attempt (`final_flush` → `start_writer()`, the last safe start point).
+    It then waits while a start is pending.
+  - When no writer runs and no start is pending (the OS refused it), no handler of ours can be entered or stuck. So
+    the final wait returns True at once, without spending its budget. The node then exits normally, traceback and
+    `logging.shutdown()` kept, and the queued lines are lost (0b59440). Before this, it waited the full 2 s and
+    took the stalled `os._exit`.
+
+### A4. The writer is started eagerly, never by an enqueue
+
+- `node.run` starts the writer EAGERLY, as its first statement inside `enqueue_only()`: before the `httpx` client,
+  `Node.recover()` and the sessions' recovery, outside every host lock. This is forced, so an earlier failure in the
+  same process does not delay it.
+- The retry point is the pass boundary: `_run`'s loop calls `hostlog.start_writer()` at the top of each pass, on the
+  main thread, at depth 0, holding no host lock. It is a no-op while the writer runs.
+- An enqueue never starts or restarts the writer. So no lifecycle thread's log call does, and no log call made
+  under a host lock does. This holds by construction: `_enqueue` has no start call, and the row "A4 an enqueue
+  never starts the writer" puts one back. A test counts `Thread.start()` for the writer's name in two places:
+  - while the runner lock, the cutoff lock and the registry lock are held, with none expected;
+  - on a lifecycle thread, with none expected.
+
+  After each lock's release, at depth 0, the standalone lazy start is expected.
+- A lazy start remains only for standalone callers (a test, or a command calling the host directly), at their
+  depth-0 exit in `_acknowledge`, holding no host lock.
+
+### A5. The scope of "no raise"
+
+The containment is scoped to `Exception`. A `KeyboardInterrupt` or `SystemExit` arriving during an enqueue or a
+start propagates, as it must for SIGTERM (`on_term` raises `KeyboardInterrupt`). It leaves no lock held: every lock
+is a `with`. It leaves no claim stuck: the claim is cleared in a `finally`. Two tests check this:
+- a `KeyboardInterrupt` raised by the writer's `Thread.start()` (a standalone caller's lazy start);
+- a `SystemExit` inside the record's snapshot, on a lifecycle thread. Afterwards the depth is back to 0, nothing is
+  queued, and the next line is written.
+
+### R13. The exit guarantee, exactly as built
+
+**One bounded final wait on the node's exit path; nothing else in production waits for the writer.** That wait is
+`_exit_if_stalled` → `hostlog.final_flush(EXIT_FLUSH_SECONDS = 2 s)`, after `run`'s last signal and report, on
+the normal return and on every exception out of `_run`. Lifecycle threads never wait. `atexit`'s wait runs only
+where nothing sealed before it, which in production means a process that is not the node.
+
+- **What is a model and what is real.** The in-process SIGTERM matrix (W7.4) models the UNWIND: `on_term` raising
+  `KeyboardInterrupt` at the point the loop has reached. It does not deliver a signal.
+  `test_r13_a_real_sigterm_ends_the_node_within_the_bound_with_mains_status` covers delivery. It runs `node.run`
+  in a child process against a stub hub (hello answers; every later call fails, so the loop logs
+  `hub unreachable`) with a handler that blocks forever on that line. After the child prints that the blocked
+  handler was entered, the test sends a REAL SIGTERM to its own child. The child must exit within 10 s with main's
+  status for a SIGTERM shutdown (0), and never reach the line after `run`.
+- **Status, compared with main:**
+
+  | How the run ends | main | here, writer idle at the final wait | here, writer stuck |
+  | --- | --- | --- | --- |
+  | normal return; SIGTERM or Ctrl-C shutdown (`on_term` → `KeyboardInterrupt`, caught in `_run`) | 0 | 0 | 0, by `os._exit(0)` |
+  | `SystemExit(n)` | n | n | n |
+  | an ordinary exception (the CLI turns `ValueError` into `SystemExit("error: …")`) | 1 | 1 | 1 |
+  | an uncaught `KeyboardInterrupt` (a second SIGINT outside `_run`'s handling) | killed by SIGINT: -2 to a parent, 130 in a shell | as main | 130 |
+
+  With the writer stuck on main, the process does not exit at all: the main thread is the one stuck in the handler.
+- **Where `os._exit` loses something** (writer stuck only):
+  - the traceback of an escaping exception, and the CLI's `error: …` message;
+  - `atexit` hooks and `logging.shutdown()` (no handler is flushed or closed);
+  - buffered stdout/stderr that was not flushed;
+  - the lines still queued behind the stuck handler.
+  - It cannot reproduce death by signal: an uncaught `KeyboardInterrupt` exits 130, not -SIGINT.
+
+  Every child was signalled and every report and save made before that point, which is why the exit is safe.
+
+### Reproduction, mutation check and runs
+
+- **Reproduction.** This round's tests (tests/test_hostlog.py) were run on e8b79d8, copied in and each run alone
+  with a bound:
+  - R11: the late-line subprocess (the checkpoint sender's warning just after the final wait, into a handler that
+    blocks holding its lock) hangs: `TimeoutExpired`. The after-the-seal and atomicity tests fail on missing names
+    (no seal, no `_idle_by`).
+  - R12: `RuntimeError: can't start new thread` escapes the log call, in the first test and in the final-wait test.
+    The stop-and-save test fails on a missing name (`RESTART_SECONDS`).
+  - A4: the writer is started by an enqueue under a host lock (`['start'] == []` fails for the first lock).
+  - A5: the start-interrupt test fails on missing names (`start_writer`, the claim). The snapshot-interrupt test
+    passes there: an acceptance pin, since the snapshot's `except Exception` was already so scoped.
+  - R13: passes there too. It is an acceptance test of the exit path, which this round does not change.
+- **Changes after the first build (bed5cf7)**, found while writing these notes and running the rows:
+  - 0b59440: the final wait does not wait for a writer that cannot start (R12, above).
+  - 1cecd77: A5's snapshot test and its row.
+  - e9a145c: the R11 atomicity test made deterministic, and the R12 retry point pinned (below).
+- **Mutation rows.** The script has 197 rows, none stale:
+  - 9 new: R11 ×2, R12 ×3, A4 ×2, A5 ×2.
+  - 4 re-anchored: "W1 a dead writer is replaced", "W5 flush is bounded", "C1 the node's main thread is a lifecycle
+    thread", and the R11 seal row after 0b59440.
+  - On bed5cf7, 39 rows ran (every `hostlog` row, every writer row, the lock and registration rows, and this
+    round's): all 39 CAUGHT. "R12 a failed start is contained" was caught only by the run's exit status (a
+    teardown ERROR, no test named).
+  - On 1cecd77, the 4 rows changed since: 3 CAUGHT. "R11 the seal is one step with the idle decision" was MISSED.
+    The atomicity test was racy: with the seal moved into a second critical section, the deciding thread usually
+    re-took the lock before the producer. The test now wraps `_cond` so that a re-entry by the deciding thread after
+    "idle" first lets the producer in. The mutant fails on every run (3 of 3 by hand, on export10), and the correct
+    code passes.
+  - The first R12 test now also calls both production start points with the writer refused, so its row names that
+    test.
+- **Runs** on e9a145c, stand-ins only; the real CLIs were not run:
+
+  | Run | Result |
+  | --- | --- |
+  | full suite, serial | 5492 passed, 10 skipped, 0 failed, 12 min 31 s (load 3 to 5.5), the end-to-end wrapper included |
+  | full suite, `-n auto` (the inner loop, before bed5cf7) | 5489 passed, 1 failed (below), 10 skipped, 4 min 11 s (load about 5) |
+  | full stand-in e2e | PASS, 395 checks, 243 s |
+  | `--only steer` | PASS, 27 |
+  | `--only steering` | PASS, 115 |
+  | `--only correlation` | PASS, 24 |
+  | `--only structured` | PASS, 36 |
+  | `--only tree` | PASS, 143 |
+
+  The `-n auto` failure was `test_r7_a3_a_deferred_line_carries_the_exception_type_only`. The writer now runs from
+  the start of each test, so it wrote the line before the test attached its handler. That was a race in the test,
+  not a product change. The test now attaches the handler first (bed5cf7); it passed 5 of 5 alone and passes in the
+  serial run.

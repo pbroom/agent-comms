@@ -185,3 +185,75 @@ exit 0
 
 commit 7a6a5f5
 CAUGHT  W3 nobody waits inside a boundary (the predicate)  test_a_thread_holding_a_host_lock_never_waits
+
+# Host-side logging: one writer, review round 1 (DESIGN_NOTES "Host-side logging: one writer, review round 1").
+# 9 new rows (R11 x2, R12 x3, A4 x2, A5 x2) and 4 re-anchored (W1, W5, C1 after the eager start; the R11 seal
+# row after 0b59440); 197 rows, none stale. On bed5cf7, 39 rows (every hostlog row, the writer, lock and
+# registration rows, and this round's): all caught ("R12 a failed start is contained" by the exit status only,
+# a teardown error). On 1cecd77, the 4 rows changed since: the R11 seal row MISSED (the atomicity test was racy).
+# On e9a145c (the test made deterministic, the R12 start points pinned) those rows are caught, each by a named test.
+
+commit bed5cf7
+CAUGHT  W2 a lifecycle thread never waits (the predicate)  test_r6_n3_no_handler_runs_for_a_provider_logger_on_the_watchdogs_thread
+CAUGHT  R7-2 stop_all is an entry point (successor)  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[s_turn]
+CAUGHT  A3 the exception's type only (successor)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  C1 registry busy: no stop committed (re-anchored)  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  A2 the runner lock is a host lock (successor)  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  A2 the registry lock is a host lock (successor)  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  A2 the host's public methods are entry points (successor)  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  W3 nobody waits inside a boundary (the predicate)  test_a_thread_holding_a_host_lock_never_waits
+CAUGHT  L the level is checked at the call  test_a_line_the_logger_would_not_emit_is_not_kept
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's caller is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's time is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  R1 the report lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R1 the ack lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R1 a steer attempt's record lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R2 the checkpoint sender is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R2 the watchdog is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R3 an errno is read with no code of the exception's  test_facts_never_call_a_hostile_exceptions_own_code
+CAUGHT  R7 a CalledProcessError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  R7 an HTTPStatusError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  W1 the writer is a lifecycle thread (a handler that logs never waits)  test_handlers_are_entered_only_on_the_writer_thread_at_depth_0
+CAUGHT  W1 a dead writer is replaced (re-anchored)  test_a_dead_writer_is_restarted_and_there_is_only_ever_one
+CAUGHT  W1 a handler raising anything is skipped per handler  test_a_handler_that_raises_anything_is_skipped_and_the_writer_goes_on
+CAUGHT  C3 a waiter on an evicted record is released  test_a_waiter_on_a_record_the_bound_evicted_is_released_at_once
+CAUGHT  C3 the stall latch  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  C3 the latch clears on a later completion  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  W5 flush is bounded (re-anchored)  test_flush_is_bounded_with_a_blocked_writer
+CAUGHT  C4 a stalled writer does not hold the exit  test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock[stalled]
+CAUGHT  C1 the node's main thread is a lifecycle thread (re-anchored)  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  W2 the session loop is a lifecycle thread  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  R11 the seal is one step with the idle decision  test_r11_the_seal_and_the_idle_decision_are_one_step
+CAUGHT  R11 a record after the seal is rejected  test_r11_a_line_queued_after_the_final_wait_is_rejected_and_the_exit_is_normal
+CAUGHT  R12 a failed start is contained  (exit 1)
+CAUGHT  R12 nobody waits for a writer that is not running  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  A4 the writer is started eagerly by node.run  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  A4 an enqueue never starts the writer  test_a4_no_enqueue_under_a_host_lock_or_on_a_lifecycle_thread_starts_the_writer
+CAUGHT  A5 the start claim is let go however it ends  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+rows: 39
+stale or broken: []
+missed: []
+exit 0
+
+commit 1cecd77
+CAUGHT  W5 flush is bounded (re-anchored)  test_flush_is_bounded_with_a_blocked_writer
+MISSED  R11 the seal is one step with the idle decision  
+CAUGHT  R12 the final wait does not wait for a writer that cannot start  test_r12_the_final_wait_does_not_wait_for_a_writer_that_cannot_start
+CAUGHT  A5 an interrupt in the snapshot propagates  test_a5_an_interrupt_inside_the_snapshot_propagates_and_leaves_nothing_held
+rows: 4
+stale or broken: []
+missed: ['R11 the seal is one step with the idle decision']
+exit 0
+
+commit e9a145c
+CAUGHT  R11 the seal is one step with the idle decision  test_r11_the_seal_and_the_idle_decision_are_one_step
+CAUGHT  R12 a failed start is contained  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  R12 nobody waits for a writer that is not running  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  A5 the start claim is let go however it ends  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+rows: 4
+stale or broken: []
+missed: []
+exit 0
