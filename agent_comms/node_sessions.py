@@ -1808,7 +1808,16 @@ class SessionRunner:
         """Stop the loop and every session process; turns in flight are reported failed. The loop may be waiting at
         the hub: it is given JOIN_SECONDS, then the host is taken from it (it checks `stopping` before touching the
         host again). From `stopping` on the loop posts nothing (`_flush`), so what it had not reported yet and what
-        the shutdown adds go to the hub from here, in order, as one queue."""
+        the shutdown adds go to the hub from here, in order, as one queue. Its two halves, in this order: the signal
+        part (`stop_for_shutdown`) and the reporting part (`report_shutdown`); the node's shutdown runs the first
+        inside its signal sequence's one boundary (host-side logging, review round 2, R5) and the second after it."""
+        self.stop_for_shutdown()
+        self.report_shutdown()
+
+    def stop_for_shutdown(self) -> None:
+        """`shutdown`'s signal part: the loop stopped, the messages not yet written given back, and every session
+        process stopped (`stop_all`: SIGTERM, the grace, SIGKILL for what is left). Its last possible signal is in
+        here: nothing after it signals."""
         self.stopping.set()
         if self.thread is not None:
             self.thread.join(JOIN_SECONDS)
@@ -1829,6 +1838,9 @@ class SessionRunner:
                 # (Ruling M; review round 5, ruling X) what stop_all decided, whether it returned or raised, is in the
                 # host's outbox until the node takes it: delivered below, by `_emit`'s one handoff
                 log.exception("hosted sessions: the shutdown of the session processes failed part way")
+
+    def report_shutdown(self) -> None:
+        """`shutdown`'s reporting part, after its signal part: the last events handed off and reported."""
         # A flush the loop began before `stopping` may still be on its way: wait for it (a hub call is bounded by the
         # client's timeout) rather than post beside it. If it never returns, nothing is reported from here and the
         # next node process reports the lost turns.

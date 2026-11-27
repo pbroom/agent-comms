@@ -249,26 +249,41 @@ def _render_facts(name: str, status: int | None, errno: int | None, returncode: 
 
 
 def facts(exc: Any) -> _Later:
-    """(Review round 1, R3) An exception as reviewed facts, never its text: its type's name and, for a known class, an
-    integer read at the call from the instance's own storage (no property, no `str`, no code of the exception's): an
-    HTTP status error's status code, an OSError's errno, a subprocess's return code. Rendered by the writer
-    ("HTTPStatusError status=502", "OSError errno=61"); any other class: its type's name only."""
+    """(Review round 1, R3; round 2, R7) An exception as reviewed facts, never its text: its type's name and, for a
+    reviewed class, one integer read at the call with no code of the exception's own (no property, no `__dict__` or
+    `__getattribute__` of a subclass, no `str`): an OSError's errno, through OSError's own member descriptor (so for
+    any subclass too: the descriptor reads the C slot); an `httpx.HTTPStatusError`'s status code and a
+    `subprocess.CalledProcessError`'s return code, only when the type is EXACTLY that class (and the response
+    exactly `httpx.Response`), read from the instance's own dictionary; any other class, a subclass of those two
+    included: its type's name only. Rendered by the writer ("HTTPStatusError status=502", "OSError errno=61")."""
     status = errno = returncode = None
     try:
         t = type(exc)
         if issubclass(t, OSError):
             errno = _int(OSError.__dict__["errno"].__get__(exc))
         import subprocess
-        if issubclass(t, subprocess.CalledProcessError):
-            returncode = _int(vars(exc).get("returncode"))
+        if t is subprocess.CalledProcessError:
+            returncode = _int(_own_dict(exc).get("returncode"))
         import httpx
-        if issubclass(t, httpx.HTTPStatusError):
-            response = vars(exc).get("response")
+        if t is httpx.HTTPStatusError:
+            response = _own_dict(exc).get("response")
             if type(response) is httpx.Response:
-                status = _int(vars(response).get("status_code"))
+                status = _int(_own_dict(response).get("status_code"))
     except Exception:
         status = errno = returncode = None
     return _Later(_render_facts, (_type_name(exc), status, errno, returncode))
+
+
+def _own_dict(obj: Any) -> dict:
+    """The instance dictionary of an object of an EXACT reviewed class (its class's own `__dict__` descriptor)."""
+    d = type(obj).__dict__.get("__dict__")
+    if d is None:
+        for base in type(obj).__mro__[1:]:
+            d = base.__dict__.get("__dict__")
+            if d is not None:
+                break
+    out = d.__get__(obj) if d is not None else None
+    return out if type(out) is dict else {}
 
 
 def _reduce(v: Any) -> Any:

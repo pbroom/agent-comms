@@ -11,7 +11,7 @@ import pytest
 from hostlog_guard import Guard
 from test_claude_steering import (_on_watchdog, _ordinary_turn_in_flight, claude_steered, cresult, env,  # noqa: F401
                                   tick)
-from test_hosted_sessions import P2, start
+from test_hosted_sessions import P2, senv, start  # noqa: F401 (the fixture)
 from test_session_host import SID, henv, make_host, open_session  # noqa: F401
 
 
@@ -980,3 +980,286 @@ def test_a_later_value_is_rendered_by_the_writer_only(monkeypatch):
     value = hostlog.later(claude._shown, "2.1.330\n"[:64], 8)
     assert calls == []
     assert str(value) == claude.shown_version("2.1.330\n") and calls == [1, 1]
+
+
+# ---------------------------------------------------------------- review round 2: R5 (no drain inside a signal sequence)
+
+
+def _stubborn_shutdown(senv, when):
+    """A session process and an ordinary run that both ignore SIGTERM, and a warning queued by an enqueue-only thread
+    (the checkpoint sender's), on the node's own fixture: (node, session child, run child, kill times, TERM time)."""
+    from agent_comms import hostlog, node_sessions
+    from agent_comms.node import _Local
+    from test_dispatch import FakeChild
+    from test_hosted_sessions import children
+    from test_session_host import FakeSessionChild
+    node = senv.node
+    node.session_spawner.child = lambda pid: FakeSessionChild(pid, exits_on_terminate=False)
+    start(senv, "a turn")
+    tick(senv)
+    [session_child] = children(senv)
+    run_child = FakeChild(5000, exits_on_terminate=False)
+    node.running["run-1"] = _Local("run-1", run_child, senv.clock(), 1800.0, 10.0)
+    t0, kills = senv.clock(), {}
+    for name, child in (("session", session_child), ("run", run_child)):
+        real = child.kill
+        child.kill = lambda _r=real, _n=name: (kills.setdefault(_n, senv.clock() - t0), _r())[1]
+    if when == "fallback":
+        # an exception between the SIGTERMs and the SIGKILLs: the `stop_all` fallback (and the sessions' own stop)
+        real_alive, calls = node.runs_alive, []
+
+        def runs_alive():
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("a shutdown step failed")
+            return real_alive()
+        node.runs_alive = runs_alive
+
+    def queue():
+        with hostlog.enqueue_only():
+            node_sessions.log.warning("session %s: the checkpoint of message %s was not taken (%s); it is not sent "
+                                      "again", "s", 1, "ConnectError")
+    import threading
+    t = threading.Thread(target=queue)
+    t.start()
+    t.join(5)
+    return node, session_child, run_child, kills
+
+
+@pytest.mark.parametrize("mode", ["blocks", "raises"])
+@pytest.mark.parametrize("when", ["normal", "fallback"])
+def test_a_line_queued_before_shutdown_is_written_after_its_last_signal(senv, when, mode):
+    """R5 (review round 2; the amendment's A1 to A3): shutdown's signal sequence (the runs' and the sessions' SIGTERM,
+    the grace, both SIGKILLs, and the `stop_all` fallback when a step raises between them) is ONE boundary: a warning
+    the checkpoint sender queued before it is written only after the last signal, so a handler that blocks or raises
+    on it delays no SIGKILL: both go AT the grace deadline (10 s of the node's clock from the SIGTERMs, within one
+    0.2 s wait step), and the line is written after them."""
+    import threading
+    from agent_comms.node import shut_down
+    node, session_child, run_child, kills = _stubborn_shutdown(senv, when)
+    release, entered, at_entry = threading.Event(), threading.Event(), []
+
+    def act(r):
+        if "was not taken" not in r.getMessage() or entered.is_set():
+            return
+        at_entry.append((session_child.killed, run_child.killed))
+        entered.set()
+        if mode == "raises":
+            raise RuntimeError("a log handler failed")
+        release.wait(10)
+    with _Records(act=act):
+        done, err = threading.Event(), []
+
+        def run():
+            try:
+                shut_down(node)
+            except BaseException as e:      # noqa: BLE001 (the test reads it)
+                err.append(e)
+            finally:
+                done.set()
+        threading.Thread(target=run, daemon=True).start()
+        try:
+            assert _wait(lambda: session_child.killed and run_child.killed, 5), (
+                "both SIGKILLs went while the handler was blocked", kills, at_entry)
+        finally:
+            release.set()
+        assert done.wait(10), "shutdown ended"
+    assert entered.is_set() and at_entry[0] == (1, 1), ("the line, written after both SIGKILLs", at_entry)
+    assert session_child.terminated >= 1 and run_child.terminated >= 1
+    if when == "normal":
+        assert kills["session"] == pytest.approx(10, abs=0.25) and kills["run"] == pytest.approx(10, abs=0.25), kills
+        assert not err, err
+
+
+# ---------------------------------------------------------------- review round 2: R6 (the construction forms), R7
+
+
+def test_locks_are_built_only_in_the_reviewed_forms():
+    """R6 (review round 2; the amendment's A4): in the host-side modules a lock, condition, event or semaphore is built
+    only as `threading.X(...)` (or passed as `default_factory`) or wrapped as `hostlog.HostLock(...)`: `threading` is
+    imported only as itself and used only as `threading.<name>`; `from threading import` of those names, any alias of
+    the module, and a bare use of one of those names are failures. A helper that returns a lock would build it outside
+    an assignment, so the lock scan above already refuses it; the reviewed list of such factories is empty."""
+    import ast
+    factories = {}      # (module, function) -> why it may return a lock: none is reviewed
+    for rel in HOST_SIDE:
+        tree, path = _module(rel)
+        up = _parents(tree)
+        # (a bare name is one of threading's unless the module imports it from elsewhere: providers' `Event`)
+        elsewhere = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                     and n.module != "threading" for a in n.names}
+        elsewhere |= {n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
+        for node in ast.walk(tree):
+            where = f"{path.name}:{getattr(node, 'lineno', '?')}"
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    assert a.name != "threading" or a.asname is None, f"{where}: threading imported as {a.asname}"
+            if isinstance(node, ast.ImportFrom) and node.module == "threading":
+                bad = {a.name for a in node.names} & (LOCK_KINDS | {"*"})
+                assert not bad, f"{where}: from threading import {bad}"
+            if isinstance(node, ast.Name) and node.id in LOCK_KINDS - elsewhere:
+                raise AssertionError(f"{where}: a bare {node.id}")
+            if isinstance(node, ast.Name) and node.id == "threading":
+                parent = up.get(node)
+                assert isinstance(parent, ast.Attribute) and parent.value is node, f"{where}: threading used as a value"
+            if (isinstance(node, ast.Return) and node.value is not None
+                    and any(isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "threading"
+                            and n.attr in LOCK_KINDS for n in ast.walk(node.value))):
+                fn = next((a for a in _ancestors(node, up) if isinstance(a, (ast.FunctionDef, ast.Lambda))), None)
+                assert (rel, getattr(fn, "name", None)) in factories, f"{where}: an unreviewed lock factory"
+
+
+def _ancestors(node, up):
+    while node in up:
+        node = up[node]
+        yield node
+
+
+def test_a_lock_built_through_an_alias_a_bare_name_or_a_factory_is_refused(tmp_path):
+    """R6: the scans above refuse each way around them, as source text: an aliased module, `from threading import`, a
+    bare name, a helper that returns a lock."""
+    import ast
+    cases = ["import threading as t\nlock = t.Lock()\n",
+             "from threading import Lock\nlock = Lock()\n",
+             "from threading import *\n",
+             "import threading\nL = threading\nlock = L.RLock()\n",
+             "import threading\ndef make():\n    return threading.Lock()\nlock = make()\n"]
+    for src in cases:
+        tree = ast.parse(src)
+        up = _parents(tree)
+        refused = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import) and any(a.name == "threading" and a.asname for a in node.names):
+                refused = True
+            if isinstance(node, ast.ImportFrom) and node.module == "threading":
+                refused = True
+            if isinstance(node, ast.Name) and node.id in LOCK_KINDS:
+                refused = True
+            if isinstance(node, ast.Name) and node.id == "threading" and not (
+                    isinstance(up.get(node), ast.Attribute) and up[node].value is node):
+                refused = True
+            if isinstance(node, ast.Return) and node.value is not None and any(
+                    isinstance(n, ast.Attribute) and n.attr in LOCK_KINDS for n in ast.walk(node.value)):
+                refused = True
+        assert refused, src
+
+
+def test_facts_run_no_code_of_a_subclass_of_a_reviewed_class():
+    """R7 (review round 2): a hostile subclass of each reviewed class, with a `__dict__` property, a
+    `__getattribute__` and a `__str__` that record and raise: `facts` enters none of them. A subclass of
+    `HTTPStatusError` or `CalledProcessError` gives its type's name only; an OSError subclass still gives its errno,
+    read through OSError's own member descriptor."""
+    import subprocess
+    import httpx
+    from agent_comms import hostlog, session_host
+    touched = []
+
+    def hostile(base):
+        class Hostile(base):
+            @property
+            def __dict__(self):
+                touched.append("__dict__")
+                raise AssertionError("read")
+
+            def __getattribute__(self, name):
+                touched.append(name)
+                raise AssertionError("read")
+
+            def __str__(self):
+                touched.append("str")
+                return "SECRET"
+            __repr__ = __str__
+        Hostile.__name__ = "Hostile" + base.__name__
+        return Hostile
+    req = httpx.Request("GET", "http://h/x")
+    made = [hostile(httpx.HTTPStatusError)("SECRET", request=req, response=httpx.Response(502, request=req)),
+            hostile(subprocess.CalledProcessError)(3, ["SECRET"]),
+            hostile(OSError)(7, "SECRET")]
+    touched.clear()
+    with _Records() as rec:
+        for e in made:
+            session_host.log.warning("it failed: %s", hostlog.facts(e))
+    assert rec.messages() == ["it failed: HostileHTTPStatusError", "it failed: HostileCalledProcessError",
+                              "it failed: HostileOSError errno=7"]
+    assert touched == [], touched
+
+
+def _queue_a_line(text="a queued line"):
+    """A line queued by an enqueue-only thread (as the checkpoint sender's or the watchdog's)."""
+    import threading
+    from agent_comms import hostlog, node_sessions
+
+    def queue():
+        with hostlog.enqueue_only():
+            node_sessions.log.warning(text)
+    t = threading.Thread(target=queue)
+    t.start()
+    t.join(5)
+
+
+def _blocking_on(text, state):
+    """A handler action that blocks (until released) on `text`, saying `state()` when entered."""
+    import threading
+    release, entered, at_entry = threading.Event(), threading.Event(), []
+
+    def act(r):
+        if r.getMessage() == text and not entered.is_set():
+            at_entry.append(state())
+            entered.set()
+            release.wait(10)
+    return act, release, entered, at_entry
+
+
+def _in_thread(fn):
+    import threading
+    done = threading.Event()
+    threading.Thread(target=lambda: (fn(), done.set()), daemon=True).start()
+    return done
+
+
+def test_the_nodes_own_stop_all_writes_no_line_between_its_signals(senv):
+    """R5 (review round 2): `Node.stop_all` on its own (two ordinary runs that ignore SIGTERM, a queued line, a
+    blocking handler): both SIGTERMs and both SIGKILLs go, the KILLs at the grace deadline, and the line is written
+    after the last of them (the registry's release between two runs' signals writes nothing)."""
+    from agent_comms.node import _Local
+    from test_dispatch import FakeChild
+    node = senv.node
+    a, b = FakeChild(5001, exits_on_terminate=False), FakeChild(5002, exits_on_terminate=False)
+    node.running["run-a"] = _Local("run-a", a, senv.clock(), 1800.0, 10.0)
+    node.running["run-b"] = _Local("run-b", b, senv.clock(), 1800.0, 10.0)
+    _queue_a_line()
+    act, release, entered, at_entry = _blocking_on("a queued line", lambda: (a.terminated, b.terminated, a.killed,
+                                                                             b.killed))
+    with _Records(act=act):
+        done = _in_thread(node.stop_all)
+        try:
+            assert _wait(lambda: a.killed and b.killed, 5), "both SIGKILLs went while the handler was blocked"
+        finally:
+            release.set()
+        assert done.wait(10)
+    assert at_entry == [(1, 1, 1, 1)], at_entry
+
+
+def test_a_node_pass_writes_no_line_between_the_runs_it_signals(senv):
+    """R5 (review round 2): a node pass that stops two runs the hub no longer lists (a queued line, a blocking
+    handler): both get their SIGTERM in that pass; the line is not written between them (nor by the pass at all: it
+    has nothing of its own pending), and the next drain that writes everything writes it."""
+    from agent_comms.node import _Local
+    from test_dispatch import FakeChild
+    node = senv.node
+    a, b = FakeChild(5001, exits_on_terminate=False), FakeChild(5002, exits_on_terminate=False)
+    node.running["run-a"] = _Local("run-a", a, senv.clock(), 1800.0, 10.0)
+    node.running["run-b"] = _Local("run-b", b, senv.clock(), 1800.0, 10.0)
+    _queue_a_line()
+    act, release, entered, at_entry = _blocking_on("a queued line", lambda: (a.terminated, b.terminated))
+    with _Records(act=act):
+        done = _in_thread(node.tick)
+        try:
+            assert _wait(lambda: a.terminated and b.terminated, 5), "both SIGTERMs went while the handler was blocked"
+        finally:
+            release.set()
+        assert done.wait(10)
+        assert at_entry in ([], [(1, 1)]), at_entry
+        from agent_comms import hostlog
+        hostlog.drain(everything=True)
+    assert at_entry and at_entry[-1] == (1, 1), at_entry

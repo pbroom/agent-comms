@@ -955,18 +955,20 @@ def test_node_shutdown_signals_every_child_before_reporting_and_always_cleans_up
         "the ordinary runs are reported as before; the sessions come after"
     assert node.running == {} and msg(senv, sid, 1)["state"] == "failed"
 
-    # Whatever the sessions do, the runs are stopped and reported.
-    for broken in ("signal", "alive", "kill", "shutdown"):
+    # Whatever the sessions do, the runs are stopped and reported. (The sessions' shutdown in its two halves, as the
+    # node's shutdown calls them since host-side logging's review round 2: its signal part, then its reports.)
+    for broken in ("signal", "alive", "kill", "stop_for_shutdown", "report_shutdown"):
         again = FakeChild(6000)
         node.running["run-2"] = _Local("run-2", again, senv.clock(), 1800.0, 10.0)
 
         def boom():
             raise RuntimeError("session cleanup failed")
-        fake = SimpleNamespace(signal=lambda: None, alive=lambda: False, kill=lambda: None, shutdown=lambda: None)
+        fake = SimpleNamespace(signal=lambda: None, alive=lambda: False, kill=lambda: None,
+                               stop_for_shutdown=lambda: None, report_shutdown=lambda: None)
         setattr(fake, broken, boom)
         node.sessions = fake
         del posts[:]
-        if broken == "shutdown":
+        if broken in ("stop_for_shutdown", "report_shutdown"):
             with pytest.raises(RuntimeError):
                 shut_down(node)
         else:

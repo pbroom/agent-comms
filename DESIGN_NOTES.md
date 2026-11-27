@@ -16918,3 +16918,83 @@ fixes the kind. Still logging only: no stop decision, signal, signal order, save
   | `--only correlation` | PASS, 24 |
   | `--only structured` | PASS, 36 |
   | `--only tree` | PASS, 143 |
+
+## Host-side logging: review round 2
+
+Sol returned CHANGES on 654d44c: one blocker and two shoulds, plus a pre-check amendment. Still logging only: no
+signal, its order, its timing rule, a save or a transcript line changed; only where lines are WRITTEN moved.
+
+### R5. No drain inside a signal sequence
+
+- **The defect.** A checkpoint POST fails and its enqueue-only sender queues a warning. At shutdown,
+  `sessions.signal()` released the runner lock at depth 0 after the SIGTERMs and wrote that warning. A handler that
+  blocked there held up `node.kill_runs()` and `sessions.kill()`, so both kinds of SIGKILL waited, and the watchdog
+  had already exited.
+- **The rule.** A signal sequence runs on a thread that may drain. It starts at the first signal, or at the first
+  liveness check that decides one, and ends once the last signal is sent or ruled out, exception fallbacks included.
+  The whole sequence is ONE boundary, and the drain comes after its last signal.
+- **Shutdown (`node.shut_down`).** One boundary covers everything from before `node.signal_runs()` to the end of the
+  sessions' signal part. That includes `sessions.signal`, the wait, `kill_runs`, `sessions.kill`, and the ordinary
+  runs' cleanup (`report_stopped`, or the `Node.stop_all` fallback, which signals too).
+  - `SessionRunner.shutdown` is split, in its own order, into `stop_for_shutdown` (the stopping flag, the loop's
+    join, the messages given back, `stop_all`: SIGTERM, the grace, SIGKILL for what is left) and `report_shutdown`
+    (the final handoff and reports). `shutdown()` still runs both.
+  - The line between the two halves is after `stop_for_shutdown`, because nothing signals after it.
+  - The call order is unchanged: signals, the runs' cleanup, the sessions' signal part, then the sessions'
+    reports. The exception paths are unchanged too.
+  - `quietly`'s own `log.exception` only enqueues inside the sequence. The lines are written when the boundary ends,
+    before the sessions' reports, never by `atexit`.
+- **The other signal sequences on a thread that may drain:**
+
+  | Where | Signals in one call | Could a drain run between them before? | Now |
+  | --- | --- | --- | --- |
+  | `node.shut_down` | the runs' and sessions' TERM, the wait, both KILLs; the `Node.stop_all` fallback; `stop_for_shutdown` | yes: `sessions.signal()`'s runner-lock release, each run's registry release in `_stop`, `quietly`'s line | one boundary, as above |
+  | `Node.stop_all` | TERM for each run, the wait, KILL for each | yes: the registry release in each `_stop` | one boundary over the signal part; `report_stopped` after |
+  | `Node.tick` (and `_reap`, `_start`'s cleanup in it) | several runs' TERM or KILL in one pass (the hub's stops, the unlisted, the self-stop, the reap) | yes: the registry releases | one boundary over the pass |
+  | `Node.recover` (`stop_verified`) | TERM, the wait, KILL for each verified pid | no (it logs nothing and takes no host lock) | one boundary anyway |
+  | `SessionHost.stop_all`, `stop_turns`, `recover`, `tick` (timeouts, kill scan, reap), `close`, `cancel`, `park`, `kill_due` | each an entry point: one boundary for the whole call; under the node inside one runner-lock hold | no | unchanged |
+  | `SessionRunner.signal`, `alive`, `kill` | each one runner-lock hold | not inside one; between them, at shutdown, the outer boundary now | unchanged |
+  | `SessionRunner.shutdown` alone (`node.run`'s other exit) | `stop_all` in one runner-lock hold | no; the stopping flag's own exit drains BEFORE the first signal | unchanged |
+  | `SessionRunner.pass_once` | a TERM now (a timeout, the self-stop), its KILL in a LATER pass | at the lock's release between passes | no change: the watchdog sends a stalled loop's KILLs (A4's pin) |
+  | `enforce_deadlines` (the watchdog) | the self-stop's TERMs, due KILLs | never: enqueue-only | unchanged |
+
+- **What a contended wait costs.** A thread with records of its own waits up to `WAIT_SECONDS` at each depth-0 exit
+  while another thread's drain is stalled. The cap is per exit, so the waits can add up across a pass. This is noted
+  only; no change was asked for.
+- **Tests.**
+  - `test_a_line_queued_before_shutdown_is_written_after_its_last_signal[normal|fallback-blocks|raises]` has a session
+    process and an ordinary run that both ignore SIGTERM, plus the sender's queued warning. On the normal path both
+    SIGKILLs go AT the grace deadline: 10 s of the node's clock from the SIGTERMs, within a quarter second (the wait
+    steps are 0.2 s). On the fallback path, an exception between TERM and KILL, both still go. The line is written
+    after both KILLs; a raising handler changes nothing.
+  - `test_the_nodes_own_stop_all_writes_no_line_between_its_signals`.
+  - `test_a_node_pass_writes_no_line_between_the_runs_it_signals`.
+  - On 654d44c all six fail: the KILLs, or the second run's TERM, wait behind the handler.
+  - `test_node_shutdown_signals_every_child_before_reporting_and_always_cleans_up_the_runs` (test_hosted_sessions)
+    now breaks the sessions' two halves one at a time instead of `shutdown`, the call the node's shutdown no longer
+    makes. It makes the same assertions.
+
+### R6. One construction convention for locks
+
+`test_locks_are_built_only_in_the_reviewed_forms` covers the host-side modules:
+- `threading` is imported only as itself and used only as `threading.<name>`;
+- `from threading import` of a lock, condition, event or semaphore, or of `*`, is refused;
+- a bare such name is refused, unless the module defines or imports that name from elsewhere (the providers'
+  `Event`);
+- a `return` of a constructed lock (a factory) is refused unless it is on the reviewed list of factories, which is
+  empty.
+
+The lock scan also keeps refusing a construction outside an assignment, a `HostLock(...)` or a base class. That
+covers the dataclass factory `field(default_factory=lambda: hostlog.HostLock(threading.RLock()))`. A second test
+feeds each of these bypasses to the checks as source text.
+
+### R7. `facts()` runs no subclass code
+
+- An OSError's errno is read through OSError's own member descriptor, which reads the C slot, so a subclass's code
+  never runs.
+- The status code and the return code are read only when the type is EXACTLY `httpx.HTTPStatusError`, with the
+  response exactly `httpx.Response`, or EXACTLY `subprocess.CalledProcessError`. They come from the instance
+  dictionary through the exact class's own `__dict__` descriptor. Any subclass of those gives its type's name only.
+- `test_facts_run_no_code_of_a_subclass_of_a_reviewed_class` makes a hostile subclass of each class, with a
+  `__dict__` property, `__getattribute__` and `__str__` that record and raise. None is entered. On 654d44c the two
+  `__dict__` properties were entered.

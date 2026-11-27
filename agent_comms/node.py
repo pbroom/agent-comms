@@ -131,9 +131,10 @@ class Node:
         process it can verify is terminated, then killed after the grace period. Their ends are reported once the hub
         answers (tick), so an unreachable hub never leaves them running. Returns their run ids."""
         left = self._load_state()
-        stop_verified([(d.get("pid"), d.get("proc_start")) for d in left.values() if isinstance(d, dict)],
-                      probe=self.probe, signal_group=self.signal_group, sleep=self.sleep,
-                      grace=self.config.kill_grace_seconds)
+        with hostlog.BOUNDARY:      # (host-side logging, review round 2, R5: a signal sequence, TERM, wait, KILL)
+            stop_verified([(d.get("pid"), d.get("proc_start")) for d in left.values() if isinstance(d, dict)],
+                          probe=self.probe, signal_group=self.signal_group, sleep=self.sleep,
+                          grace=self.config.kill_grace_seconds)
         for rid, d in left.items():
             # The output of each run this node verified from its own state (its process group stopped above): the
             # exact directory the run recorded, else main's name for it. Nothing else in the log folder is touched:
@@ -283,7 +284,13 @@ class Node:
 
     def tick(self) -> None:
         """One pass. Local runs are reaped and held to their timeouts whatever the hub does; hub errors propagate
-        after that (the caller logs them and retries)."""
+        after that (the caller logs them and retries). (Host-side logging, review round 2, R5) One boundary: a pass may
+        signal several runs (the hub's stops, the unlisted, the self-stop, the reap), and no line is written between
+        those signals; the pass's lines are written when it returns or raises."""
+        with hostlog.BOUNDARY:
+            self._tick()
+
+    def _tick(self) -> None:
         try:
             self._flush_unreported()
             if self.clock() - self.last_hello >= HELLO_SECONDS:
@@ -476,12 +483,14 @@ class Node:
                 self._stop(local, "kill")
 
     def stop_all(self) -> None:
-        """Shutdown: terminate every run, wait the grace period, kill what remains, report each ended."""
-        self.signal_runs()
-        deadline = self.clock() + self.config.kill_grace_seconds
-        while self.runs_alive() and self.clock() < deadline:
-            self.sleep(0.2)
-        self.kill_runs()
+        """Shutdown: terminate every run, wait the grace period, kill what remains, report each ended. (Host-side
+        logging, review round 2, R5) The signals are one sequence, one boundary: no line is written between them."""
+        with hostlog.BOUNDARY:
+            self.signal_runs()
+            deadline = self.clock() + self.config.kill_grace_seconds
+            while self.runs_alive() and self.clock() < deadline:
+                self.sleep(0.2)
+            self.kill_runs()
         self.report_stopped()
 
     # stop_all's steps, so that shut_down can stop hosted sessions within the same grace period and before any report.
@@ -525,28 +534,38 @@ def shut_down(node: Node) -> None:
             log.exception("hosted sessions: a shutdown step failed")
             return default
 
-    stopped = False
+    # (Host-side logging, review round 2, R5) THE signal sequence, its fallbacks included, is ONE boundary: from
+    # before the first signal through the sessions' last possible SIGKILL (`stop_for_shutdown`), so no line (a queued
+    # checkpoint warning, `quietly`'s own) is written between two signals; the ordinary runs' cleanup inside it keeps
+    # its place in the order. The lines are written as it ends, and only the sessions' reporting comes after.
+    stopped = sessions_stopped = False
     try:
-        node.signal_runs()
-        deadline = node.clock() + node.config.kill_grace_seconds
-        if sessions is not None:
-            quietly(sessions.signal)
-        while (node.runs_alive() or (sessions is not None and quietly(sessions.alive, False))) \
-                and node.clock() < deadline:
-            node.sleep(0.2)
-        node.kill_runs()
-        if sessions is not None:
-            quietly(sessions.kill)
-        stopped = True
+        with hostlog.BOUNDARY:
+            try:
+                try:
+                    node.signal_runs()
+                    deadline = node.clock() + node.config.kill_grace_seconds
+                    if sessions is not None:
+                        quietly(sessions.signal)
+                    while (node.runs_alive() or (sessions is not None and quietly(sessions.alive, False))) \
+                            and node.clock() < deadline:
+                        node.sleep(0.2)
+                    node.kill_runs()
+                    if sessions is not None:
+                        quietly(sessions.kill)
+                    stopped = True
+                finally:
+                    if stopped:
+                        node.report_stopped()
+                    else:
+                        node.stop_all()
+            finally:
+                if sessions is not None:
+                    sessions.stop_for_shutdown()    # its processes are gone: the bookkeeping (what is left: signalled)
+                    sessions_stopped = True
     finally:
-        try:
-            if stopped:
-                node.report_stopped()
-            else:
-                node.stop_all()
-        finally:
-            if sessions is not None:
-                sessions.shutdown()     # its processes are gone: the bookkeeping, then its reports
+        if sessions_stopped:
+            sessions.report_shutdown()      # then its reports, once nothing more is signalled
 
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"

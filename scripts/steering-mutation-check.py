@@ -16,7 +16,7 @@ from pathlib import Path
 FILES = {"A": "agent_comms/providers/claude.py", "H": "agent_comms/session_host.py", "ST": "agent_comms/hosted_steer.py",
          "HS": "agent_comms/hosted.py", "NS": "agent_comms/node_sessions.py", "API": "agent_comms/api.py",
          "G": "agent_comms/node_groups.py", "D": "agent_comms/dispatch.py",
-         "L": "agent_comms/hostlog.py"}
+         "L": "agent_comms/hostlog.py", "N": "agent_comms/node.py"}
 ROWS = [('A', "F init naming S in N's bracket is a contradiction", '                if names_s:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")', '                if False:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")'),
     ('A', "F S's init: no origin", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and scalar is None'),
     ('A', "F S's init: no scalar", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and quiet'),
@@ -197,7 +197,14 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('L', 'A2 a fixed deadline behind another drainer', '            if remaining <= 0:\n                return False    # (A2', '            if False:\n                return False    # (A2'),
     ('L', 'R3 facts are rendered by the writer', '    return _Later(_render_facts, (_type_name(exc), status, errno, returncode))', '    return _render_facts(_type_name(exc), status, errno, returncode)'),
     ('L', "R3 an errno is read with no code of the exception's", '            errno = _int(OSError.__dict__["errno"].__get__(exc))', '            errno = _int(exc.errno)'),
-    ('A', 'R4 the version is rendered by the writer', 'hostlog.later(_shown, version[:VERSION_SHOWN], len(version)) if isinstance(version, str)', 'shown_version(version) if isinstance(version, str)')]
+    ('A', 'R4 the version is rendered by the writer', 'hostlog.later(_shown, version[:VERSION_SHOWN], len(version)) if isinstance(version, str)', 'shown_version(version) if isinstance(version, str)'),
+    ('N', 'R5 shutdown is one signal sequence', '        with hostlog.BOUNDARY:\n            try:\n                try:\n                    node.signal_runs()', '        with __import__("contextlib").nullcontext():\n            try:\n                try:\n                    node.signal_runs()'),
+    ('N', "R5 the sessions' signal part inside the sequence", '            finally:\n                if sessions is not None:\n                    sessions.stop_for_shutdown()    # its processes are gone: the bookkeeping (what is left: signalled)\n                    sessions_stopped = True\n    finally:\n        if sessions_stopped:\n            sessions.report_shutdown()', '            finally:\n                sessions_stopped = sessions is not None\n    finally:\n        if sessions_stopped:\n            sessions.stop_for_shutdown()\n            sessions.report_shutdown()'),
+    ('N', "R5 the node's stop_all is one signal sequence", '        with hostlog.BOUNDARY:\n            self.signal_runs()', '        with __import__("contextlib").nullcontext():\n            self.signal_runs()'),
+    ('N', 'R5 a node pass is one boundary', '        with hostlog.BOUNDARY:\n            self._tick()', '        if True:\n            self._tick()'),
+    ('L', 'R7 a CalledProcessError subclass runs no code', '        if t is subprocess.CalledProcessError:', '        if issubclass(t, subprocess.CalledProcessError):'),
+    ('L', 'R7 an HTTPStatusError subclass runs no code', '        if t is httpx.HTTPStatusError:', '        if issubclass(t, httpx.HTTPStatusError):'),
+    ('G', 'R6 no lock through an import alias', 'import os\nimport threading\n', 'import os\nimport threading\nfrom threading import Lock as _Lock\n')]
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
          "tests/test_hostlog.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",
