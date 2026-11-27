@@ -84,8 +84,6 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
 from __future__ import annotations
 
 import json
-import sys
-import logging
 import os
 import signal
 import threading
@@ -98,88 +96,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import node_groups, providers, runner_preflight, session_access
+from . import hostlog, node_groups, providers, runner_preflight, session_access
 from .dispatch import (DispatchConfig, _signal_group, _within, child_env, probe_process, process_start,
                        render_argv, spawn_piped, stop_verified, with_writable_roots)
+from .hostlog import WATCH_THREADS
 from .providers import Event, ProviderSession, validate_model, validate_session_id
 
-# (Review round 5, ruling W) The threads that run the node's deadline watchdog (node_sessions registers its own). On
-# them the host only reads clocks and memory, takes the cutoff lock, makes a claim, sends signals and appends events
-# already built: a state save is left for the loop (`_save_due`), a transcript line waits in memory (`tee_pending`),
-# and a log line of any logger of the package is kept in memory (`_diverting_log`) until the loop's next pass writes
-# it.
-WATCH_THREADS: set[int] = set()
-_WATCH_LINES: deque = deque(maxlen=2000)
-_WATCH_DROPPED = [0]        # (review round 7, ruling R7-3) lines the full queue let go, said once at the replay
+# (Review round 5, ruling W) The threads that run the node's deadline watchdog (node_sessions registers its own; the
+# set is hostlog's). On them the host only reads clocks and memory, takes the cutoff lock, makes a claim, sends
+# signals and appends events already built: a state save is left for the loop (`_save_due`) and a transcript line
+# waits in memory (`tee_pending`). Its log lines are deferred records like every host-side line (hostlog: no
+# watchdog thread ever drains; the loop's next drain writes them).
 
 
 def on_watch() -> bool:
     return threading.get_ident() in WATCH_THREADS
 
 
-_PACKAGE = "agent_comms"
-_real_log = getattr(logging.Logger._log, "_real", logging.Logger._log)     # (once, even if this module is reloaded)
-
-
-def _diverting_log(self, level, msg, args, exc_info=None, extra=None, stack_info=False, stacklevel=1):
-    """(Review round 6, ruling W2.3) Every logger of the package, provider loggers included: on a watchdog thread a
-    line is never made into a record, formatted or handed to a handler there. It is kept in memory (a bounded queue:
-    the oldest goes first if the loop is away that long, and the replay says how many went), with an exception's
-    TYPE only (round 7, ruling A3: no exception text, which gives no guarantee against steer or message text; no
-    traceback is formatted), and the loop writes it at its next pass (`flush_watch_logs`). On any other thread,
-    logging as ever."""
-    if on_watch() and (self.name == _PACKAGE or self.name.startswith(_PACKAGE + ".")):
-        try:
-            if exc_info:
-                ex = exc_info if isinstance(exc_info, BaseException) else (
-                    exc_info[1] if isinstance(exc_info, tuple) else sys.exc_info()[1])
-                if ex is not None:
-                    msg = f"{msg} ({type(ex).__name__})"
-            _keep_line(self.name, level, msg, args)
-        except Exception:       # (never raises on the watchdog's thread)
-            pass
-        return
-    _real_log(self, level, msg, args, exc_info=exc_info, extra=extra, stack_info=stack_info,
-              stacklevel=stacklevel + 1)
-
-
-_diverting_log._real = _real_log
-logging.Logger._log = _diverting_log
-
-
-def _keep_line(name: str, level: int, msg: str, args: tuple) -> None:
-    """A line put into THE deferred queue (bounded: the oldest goes first, and the replay says how many went), for the
-    loop's next flush (`flush_watch_logs`) to write: a watchdog thread's line (`_diverting_log`), and (enabling PR,
-    review round 1, A2) a claim's or a reserved stop's deferred lines, so no log handler runs inside a stop of a
-    steering session. Known limit: such a line is written with the flush's time and caller."""
-    if len(_WATCH_LINES) == _WATCH_LINES.maxlen:
-        _WATCH_DROPPED[0] += 1
-    _WATCH_LINES.append((name, level, msg, args))
-
-
-def flush_watch_logs() -> None:
-    """The loop writes what the watchdog's thread logged (called at the start of its pass and of a host tick)."""
-    if on_watch():
-        return
-    dropped, _WATCH_DROPPED[0] = _WATCH_DROPPED[0], 0
-    if dropped:
-        try:
-            logging.getLogger("agent_comms.session_host").warning(
-                "%d deferred log line(s) were dropped: the queue was full", dropped)
-        except Exception:
-            pass
-    while _WATCH_LINES:
-        try:
-            name, level, msg, args = _WATCH_LINES.popleft()
-        except IndexError:
-            return
-        try:
-            logging.getLogger(name).log(level, msg, *args)
-        except Exception:
-            pass
-
-
-log = logging.getLogger("agent_comms.session_host")
+log = hostlog.get("agent_comms.session_host")
 
 STATE_FILE = "node-sessions.json"   # session id -> {pid, proc_start, ...}: what a restarted host must clean up
 PROVIDER_FILE = "node-session-providers.json"   # session id -> the provider's own id for it (Codex's thread id)
@@ -706,6 +640,7 @@ def child_words(config: DispatchConfig, template: list[str]) -> list[str]:
     return words
 
 
+@hostlog.entries       # (host-side logging) every public method is an entry point: its lines are written as it returns
 class SessionHost:
     def __init__(self, config: DispatchConfig, log_dir: Path, *, timeout_minutes: float | None = None,
                  kill_grace_seconds: float | None = None, spawner: Callable[..., Any] = spawn_piped,
@@ -790,7 +725,9 @@ class SessionHost:
         import threading
         self.usage: dict[str, dict] = {}
         self.usage_lock = threading.Lock()
-        self._steer_stop_lock = threading.RLock()       # the steering stop latch's (above)
+        # The steering stop latch's (above): THE cutoff lock, a host lock (hostlog.HostLock: no log handler runs on a
+        # thread that holds it)
+        self._steer_stop_lock = hostlog.HostLock(threading.RLock())
         # (Review round 2, ruling I) Every event the host publishes goes here at the moment of publication; `tick`,
         # `close`, `cancel`, `stop_turns` and `stop_all` return it, emptied, when they return. An exception that
         # escapes one of them leaves it as it is, and the next of them delivers it: exactly once.
@@ -799,8 +736,10 @@ class SessionHost:
         # leaves it there; the node takes each event (put, by its identity) and only then removes it (`ack`).
         self.keep_outbox = False
         self._outbox: _Outbox = _Outbox(self)
-        self._defer_logs: list | None = None      # (ruling T) log lines held while a claim holds the cutoff lock
-        self._claimer: int | None = None            # ... and the thread making that claim
+        # (Ruling T) The thread making a claim's decision or a reserved stop's commit under the cutoff lock: a held
+        # end published there saves nothing (`_emit_hold`: the loop's next tick saves). Its only reader since the
+        # logging PR (host-side logging: every line is deferred; nothing about logging is decided here).
+        self._claimer: int | None = None
         self._gens = itertools.count(1)     # (ruling M) each opened session's incarnation, for the outbox's entries
         self._defer_save = False    # (ruling H) a stop of every turn: held publications persist after every SIGTERM
         self._save_due = False      # (round 4, ruling T) a save the watchdog's path left to the loop's next tick
@@ -1413,11 +1352,6 @@ class SessionHost:
         try:
             if not self._recovered:
                 self.recover()
-            if not self.keep_outbox:
-                # (ruling W) what the watchdog's thread (and a claim: A2) left in the deferred queue, written here by
-                # a host no node drives; a node's host's lines are written by the node's pass BEFORE it takes the
-                # runner lock (node_sessions `pass_once`), never under it (enabling PR, review round 1, A2)
-                flush_watch_logs()
             for s in list(self.sessions.values()):
                 self._flush_tee(s)
             if self._save_due:      # (ruling T) what the watchdog's path published is persisted here, by the loop
@@ -2521,8 +2455,8 @@ class SessionHost:
 
             def commit() -> None:
                 s.outbuf.clear()
-                self._say(logging.WARNING, "session %s: a steer to its process could not be written whole: the "
-                          "process is stopped", s.session_id)
+                log.warning("session %s: a steer to its process could not be written whole: the process is stopped",
+                            s.session_id)
                 if s.in_flight is not None and s.in_flight.id == slot.into:
                     self._fail(s, STEER_CUT, out)
                 s.steer = None
@@ -2606,8 +2540,8 @@ class SessionHost:
                 done()      # (Claude: the attempt is retired before any further frame is read; ruling H: atomically)
         if slot.mark is None or s.child is None:
             s.steer = None      # decided, and nothing of it is left to write
-        self._say(logging.INFO, "session %s: the steer into message %s: %s (%s)", s.session_id, msg_id,
-                  outcome["outcome"], outcome["why"])
+        log.info("session %s: the steer into message %s: %s (%s)", s.session_id, msg_id, outcome["outcome"],
+                 outcome["why"])
         return dict(outcome)
 
     def _hold(self, s: Session, end: HostEvent, now: float, out: list[HostEvent]) -> None:
@@ -2698,9 +2632,9 @@ class SessionHost:
         out.append(dataclasses.replace(held.end, steer=dict(steer)))
         out.extend(held.after)      # (ruling M: the events first; a raising log handler or save loses nothing)
         try:
-            self._say(logging.INFO, "session %s: the steer into message %s: %s (%s)", s.session_id,
-                      held.end.message_id, steer["outcome"], steer["why"])
-            if self._defer_logs is not None and self._claimer == threading.get_ident():
+            log.info("session %s: the steer into message %s: %s (%s)", s.session_id, held.end.message_id,
+                     steer["outcome"], steer["why"])
+            if self._claimer == threading.get_ident():
                 self._save_due = True       # (ruling T: nothing persisted under the cutoff lock; the loop saves)
             elif not self._defer_save:
                 self._save_state()
@@ -2782,47 +2716,34 @@ class SessionHost:
         """(Review round 4, ruling T; enabling PR, review round 1, R1, A1 and A2) THE claim of a single-session stop
         of a steering session on one of main's routes, and the order of that whole stop, in this one place:
         (a) under the cutoff lock: the latch checked and the decision made (`decide`: N failed, S decided, the fence
-            stamped), memory only, its log lines deferred (`_defer_logs`); after the latch it claims nothing, decides
-            nothing and stops nothing (False): the bulk stop owns the session;
+            stamped), memory only; after the latch it claims nothing, decides nothing and stops nothing (False): the
+            bulk stop owns the session;
         (b) the cutoff lock let go (the runner lock, when the caller holds it, stays held), the route's OWN main stop,
             passed in by the caller and run by identity (`_stop_from`, or what that route runs on main, with main's
-            registry wait) whatever `decide` raised;
-        (c) only then the deferred lines, handed to the deferred queue the loop writes (`_keep_line`): no log handler
-            is called by the claim itself or for its deferred lines. (After #119, A2) A route's own main stop logs
-            as main does: the survivor reap's stop writes main's "left members of its group" warning before its
-            SIGTERM, as main e6b421f does (inherited; for the logging PR).
-        The exception that propagates is the first: `decide`'s if it raised, else the stop's; the lines never
-        replace it. A steering-only stop never comes here: `_reserved_stop`."""
-        lines: list = []
+            registry wait) whatever `decide` raised.
+        Its lines, and the route's own stop's (the survivor reap's "left members of its group" warning before its
+        SIGTERM included), are deferred records like every host-side line (hostlog): written by the caller's drain,
+        after the signal and once no host lock is held. The exception that propagates is the first: `decide`'s if it
+        raised, else the stop's. A steering-only stop never comes here: `_reserved_stop`."""
         first: BaseException | None = None
         with self._steer_stop_lock:
             if self.steer_stopped or (s.steer is not None and s.steer.stopping):
                 return False
-            self._defer_logs, self._claimer = lines, threading.get_ident()
+            self._claimer = threading.get_ident()
             try:
                 decide()
             except BaseException as e:      # (A1: the claim is made; its stop still runs)
                 first = e
             finally:
-                self._defer_logs, self._claimer = None, None
+                self._claimer = None
         try:
             stop()
         except BaseException:
             if first is None:
                 raise
-        finally:
-            for level, msg, args in lines:
-                _keep_line(log.name, level, msg, args)
         if first is not None:
             raise first
         return True
-
-    def _say(self, level: int, msg: str, *args) -> None:
-        """A log line, deferred while a claim holds the cutoff lock (ruling T: nothing logged under it)."""
-        if self._defer_logs is not None and self._claimer == threading.get_ident():
-            self._defer_logs.append((level, msg, args))
-        else:
-            log.log(level, msg, *args)
 
     def _reserves(self, s: Session, cause: str) -> bool:
         """(Enabling PR, ruling S1; review round 10, rulings G1 and H2) THE one predicate of the stop's path, from the
@@ -2883,9 +2804,9 @@ class SessionHost:
             advanced the counter);
         (d) escalation armed FIRST, main's `_stop` body (the kill clock and the SIGTERM, dated at the signal: R8-01; a
             raising SIGTERM keeps main's clock, D1), THEN `commit`: the decision, the adapter's callbacks, the
-            buffer, publication and any diagnostic (its log lines handed to the deferred queue the loop writes: no
-            log handler runs here). Whatever `commit` raises, the kill scan escalates the group to SIGKILL after the
-            grace.
+            buffer, publication and any diagnostic (its log lines are deferred records, hostlog: written by the
+            caller's drain once no host lock is held; no log handler runs here). Whatever `commit` raises, the kill
+            scan escalates the group to SIGKILL after the grace.
         Lock order: this cutoff lock, then the registry's non-blocking attempt: nothing that holds the registry waits
         for this lock, so no deadlock. Nothing is undone: there is no rollback of a reservation."""
         child = s.child
@@ -2899,27 +2820,22 @@ class SessionHost:
         except Exception:
             alive = True        # (a probe that fails is taken as "still going", as at shutdown)
         barrier = (s.group_key, s.cwd) if alive else None
-        logs: list = []
-        try:
-            with self._steer_stop_lock:
-                if self.steer_stopped or (s.steer is not None and s.steer.stopping):
-                    return False
-                got = self.groups.try_stopping(token, barrier)
-                if got == self.groups.BUSY:
-                    return False
-                if fresh and got == self.groups.RESERVED:
-                    s.group_token = token
+        with self._steer_stop_lock:
+            if self.steer_stopped or (s.steer is not None and s.steer.stopping):
+                return False
+            got = self.groups.try_stopping(token, barrier)
+            if got == self.groups.BUSY:
+                return False
+            if fresh and got == self.groups.RESERVED:
+                s.group_token = token
+            try:
+                self._stop(s, now, at_signal=True, reserved=True)
+            finally:
+                self._claimer = threading.get_ident()
                 try:
-                    self._stop(s, now, at_signal=True, reserved=True)
+                    commit()
                 finally:
-                    self._defer_logs, self._claimer = logs, threading.get_ident()
-                    try:
-                        commit()
-                    finally:
-                        self._defer_logs, self._claimer = None, None
-        finally:
-            for level, msg, args in logs:
-                _keep_line(log.name, level, msg, args)
+                    self._claimer = None
         return True
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
@@ -3212,27 +3128,10 @@ class SessionHost:
         """Shutdown: terminate every session's process group, wait the grace period, kill what remains of each group
         (its leader may be gone while a member is not). A turn in flight is reported failed. Sessions are not ended:
         a later host may reopen them with resume. (Ruling H) Every SIGTERM goes before anything is persisted."""
-        # (Review round 7, rulings R7-2 and A2) From here through the last SIGKILL attempt, this thread's package
-        # logging is deferred by the watchdog's own mechanism (`WATCH_THREADS`): no log handler runs ahead of any
-        # signal (a held end's diagnostic, a raising SIGTERM's or SIGKILL's line, anything else). On leaving, whether
-        # the pass finished or raised, the thread's PRIOR state is restored, and only then are the lines replayed.
-        me = threading.get_ident()
-        was_diverting = me in WATCH_THREADS
-        WATCH_THREADS.add(me)
-        diverting = [True]
-
-        def undivert() -> None:
-            if diverting[0]:
-                diverting[0] = False
-                if not was_diverting:
-                    WATCH_THREADS.discard(me)
-                flush_watch_logs()
-        try:
-            return self._stop_all(undivert)
-        finally:
-            undivert()
-
-    def _stop_all(self, undivert: Callable[[], None]) -> list[HostEvent]:
+        # (Review round 7, ruling R7-2) No log handler runs ahead of any signal (a held end's diagnostic, a raising
+        # SIGTERM's or SIGKILL's line, anything else): every line is a deferred record (hostlog), and this entry
+        # point's drain writes them when it returns or raises, after the last SIGKILL attempt and the final save,
+        # with no host lock held (under the node: once the node lets go of its runner lock).
         out = self._outbox
         now = self.clock()
         live = [s for s in self.sessions.values() if s.child is not None]
@@ -3266,7 +3165,6 @@ class SessionHost:
                 except Exception:
                     failed.add(s.session_id)
                     log.exception("session %s: its SIGKILL at shutdown failed", s.session_id)
-            undivert()      # (ruling R7-2) the last SIGKILL attempt is made: the deferred lines are written now
             for s in live:
                 # (Review round 4, ruling T) every step of the traversal per session: one session's fault (its
                 # read, close or cleanup) skips no other, and the final save runs in the `finally`
@@ -3300,6 +3198,5 @@ class SessionHost:
             for s in self.sessions.values():
                 s.sealed_by = s.confirmed_by = None     # this host is done: what its processes said goes with it
         finally:
-            undivert()          # (also when the pass raised: then the final save is made with logging restored)
             self._save_state()
         return self._take_outbox()

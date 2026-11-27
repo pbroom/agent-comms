@@ -3891,25 +3891,35 @@ def test_r5_small_a_broken_pipe_through_the_write_path(henv, monkeypatch):
     assert len(ends(out)) == 1 and child.terminated == 1
 
 
-def test_r5_known_limit_a_raising_log_handler_between_a_claim_and_its_signal(henv, monkeypatch):
-    """Known limit (round 5, pinned as it is today): on the LOOP thread a log handler raises while a claim's deferred
-    line is written (after the cutoff lock, before the SIGTERM): the decision stands, made once; the raise ends that
-    session's pass (the host-error path), which sends the stop; N is reported once."""
-    from agent_comms import session_host
+def test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop(henv, monkeypatch):
+    """(Host-side logging; successor of round 5's known limit, where a handler raising while a claim's deferred line
+    was written ended that session's pass by the host-error path.) A log handler that raises on the claim's line (a
+    live attempt's N times out: `_steer_end` decides S under the claim): the handler is entered only at the tick's
+    drain, after the stop; its failure is caught there; N is decided and reported once and the stop went, by the
+    timeout's own path (no host error)."""
+    import logging
     s, child, n = steered(henv, monkeypatch)
-    real, raised = session_host.log.log, []
+    raised = []
 
-    def log(level, msg, *args, **kw):
-        if "the steer into message" in msg and not raised:
-            raised.append(1)
-            raise RuntimeError("a log handler failed")
-        return real(level, msg, *args, **kw)
-    monkeypatch.setattr(session_host.log, "log", log)
-    henv.clock.advance(61)          # N's turn times out (the pre-hold timeout: `_steer_end` decides S)
-    out = henv.host.tick() + henv.host.tick() + henv.host.tick()
-    assert raised, "the handler raised"
+    class Raises(logging.Handler):
+        def emit(self, rec):
+            if "the steer into message" in rec.getMessage():
+                raised.append(child.terminated)
+                raise RuntimeError("a log handler failed")
+    h, lg = Raises(logging.DEBUG), logging.getLogger("agent_comms")
+    level = lg.level
+    lg.addHandler(h)
+    lg.setLevel(logging.DEBUG)
+    try:
+        henv.clock.advance(61)          # N's turn times out (the pre-hold timeout: `_steer_end` decides S)
+        out = henv.host.tick() + henv.host.tick() + henv.host.tick()
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(level)
+    assert raised and raised[0] >= 1, "the handler raised, after the SIGTERM"
     assert len(ends(out)) == 1, "N decided and reported once"
-    assert child.terminated >= 1, "the stop went (by the host-error path)"
+    assert child.terminated >= 1, "the stop went"
+    assert not [e for e in out if e.kind == "ended"], "no host error"
 
 
 # ---------------------------------------------------------------- review round 6 (narrow)
@@ -4541,14 +4551,20 @@ def test_r7_2_a_stop_all_that_raises_still_saves_for_real(henv, monkeypatch):
     assert host._state_path().exists(), "the final save was made"
 
 
-def test_r7_a2_stop_all_restores_the_callers_prior_diversion(henv, monkeypatch):
-    """Ruling A2: `stop_all` run on a thread that was already diverting (a watchdog's) leaves it diverting."""
-    from agent_comms import session_host
+def test_r7_a2_stop_all_on_a_watchdog_thread_writes_no_line_there(henv, monkeypatch):
+    """Ruling A2 (host-side logging: successor of "stop_all restores the caller's prior diversion"): `stop_all` run
+    on a watchdog thread leaves it registered and enters no handler there; its lines wait for a drain elsewhere."""
+    from agent_comms import hostlog, session_host
     _held_pair(henv, monkeypatch)
     seen = []
-    t, done, ident, err = _on_watchdog(None, fn=lambda: (henv.host.stop_all(), seen.append(session_host.on_watch())))
-    assert done.wait(10) and not err, err
-    assert seen == [True]
+    with _StallingHandler(seconds=0) as h:
+        t, done, ident, err = _on_watchdog(None, fn=lambda: (henv.host.stop_all(),
+                                                             seen.append(session_host.on_watch())))
+        assert done.wait(10) and not err, err
+        assert seen == [True]
+        assert not [th for _, th, _ in h.seen if th == ident[0]], "no handler on the watchdog's thread"
+        hostlog.drain()
+        assert [m for _, th, m in h.seen if "the steer into message" in m and th != ident[0]], "written elsewhere"
 
 
 def test_r7_a2_a_held_publication_at_shutdown_does_no_io(henv, monkeypatch):
@@ -4576,10 +4592,11 @@ def test_r7_a2_a_held_publication_at_shutdown_does_no_io(henv, monkeypatch):
 
 
 def test_r7_a3_a_deferred_line_carries_the_exception_type_only(env):
-    """Ruling A3: a line logged with an exception on a diverting thread is replayed with the exception's TYPE only,
-    never its text (which gives no guarantee against steer or message text)."""
+    """Ruling A3 (host-side logging: every line, on every thread): a line logged with an exception on a watchdog
+    thread is written by a later drain with the exception's TYPE and its frames only, never its text (which gives no
+    guarantee against steer or message text)."""
     import logging
-    from agent_comms import session_host
+    from agent_comms import hostlog, node_sessions
 
     class Marked(Exception):
         pass
@@ -4588,33 +4605,39 @@ def test_r7_a3_a_deferred_line_carries_the_exception_type_only(env):
         try:
             raise Marked("PINEAPPLE-STEER-TEXT")
         except Marked:
-            logging.getLogger("agent_comms.node_sessions").exception("hosted sessions: something failed")
+            node_sessions.log.exception("hosted sessions: something failed")
     t, done, ident, err = _on_watchdog(None, fn=logs)
     assert done.wait(5) and not err, err
-    with _StallingHandler(seconds=0) as h:
-        session_host.flush_watch_logs()
-    lines = [m for _, _, m in h.seen]
-    assert any("something failed" in m and "Marked" in m for m in lines), lines
-    assert not any("PINEAPPLE" in m for m in lines), lines
+    got = []
+    h = logging.Handler(logging.DEBUG)
+    h.emit = lambda rec: got.append((rec.getMessage(), h.format(rec)))
+    lg = logging.getLogger("agent_comms")
+    lg.addHandler(h)
+    try:
+        assert hostlog.drain()
+    finally:
+        lg.removeHandler(h)
+    [(msg, text)] = [x for x in got if "something failed" in x[0]]
+    assert "Marked" in text and "in logs" in text, text
+    assert "PINEAPPLE" not in text, text
 
 
 def test_r7_3_the_deferred_queue_counts_what_it_drops(env):
-    """Ruling R7-3: more lines than the queue holds are logged on a diverting thread: the replay says, in one line,
+    """Ruling R7-3: more lines than the queue holds are logged on a watchdog thread: the next drain says, in one line,
     how many were dropped."""
-    import logging
-    from agent_comms import session_host
-    n = session_host._WATCH_LINES.maxlen + 7
+    from agent_comms import hostlog, node_sessions
+    n = hostlog.QUEUE_MAX + 7
 
     def logs():
-        lg = logging.getLogger("agent_comms.node_sessions")
         for i in range(n):
-            lg.warning("line %d", i)
+            node_sessions.log.warning("line %d", i)
     t, done, ident, err = _on_watchdog(None, fn=logs)
     assert done.wait(10) and not err, err
     with _StallingHandler(seconds=0) as h:
-        session_host.flush_watch_logs()
+        hostlog.drain()
     lines = [m for _, _, m in h.seen]
-    assert any("7" in m and "dropped" in m for m in lines), lines[-3:]
+    assert lines[0] == "7 deferred log line(s) were dropped: the queue was full", lines[:2]
+    assert lines[1] == "line 7" and lines[-1] == f"line {n - 1}" and len(lines) == hostlog.QUEUE_MAX + 1
 
 
 # ---------------------------------------------------------------- review round 8
@@ -5585,28 +5608,22 @@ def test_r4_t_a_latch_between_the_first_check_and_the_expiry_changes_no_state(he
     assert host.steer_stopped and not s.steer.expired and not child.terminated
 
 
-def test_r4_t_nothing_logs_or_saves_under_the_cutoff_lock(henv, monkeypatch):
-    """Ruling T3: the pre-hold timeout (a live attempt's N times out: `_steer_end` decides S) logs and saves nothing
-    while the cutoff lock is held."""
-    from agent_comms import session_host
+def test_r4_t_no_handler_runs_and_nothing_is_saved_under_the_cutoff_lock(henv, monkeypatch):
+    """Ruling T3 (host-side logging: a line may be queued under the cutoff lock, never written there): the pre-hold
+    timeout (a live attempt's N times out: `_steer_end` decides S) enters no log handler and saves nothing while the
+    cutoff lock is held; its lines are written by the tick's drain."""
+    from hostlog_guard import Guard
     s, child, n = steered(henv, monkeypatch)
-    lock = henv.host._steer_stop_lock
     held_while = []
-    real_log = session_host.log.log
-
-    def probe(*a, **k):
-        held_while.append(lock._is_owned())
-        return real_log(*a, **k)
-    monkeypatch.setattr(session_host.log, "log", probe)
-    for name in ("info", "warning", "error", "exception"):
-        real = getattr(session_host.log, name)
-        monkeypatch.setattr(session_host.log, name,
-                            lambda *a, _r=real, **k: (held_while.append(lock._is_owned()), _r(*a, **k))[1])
-    real_save = henv.host._save_state
-    henv.host._save_state = lambda: (held_while.append(lock._is_owned()), real_save())[1]
-    henv.clock.advance(61)
-    out = henv.host.tick() + henv.host.tick()
+    with Guard(henv.host) as g:
+        lock = henv.host._steer_stop_lock
+        real_save = henv.host._save_state
+        henv.host._save_state = lambda: (held_while.append(lock._is_owned()), real_save())[1]
+        henv.clock.advance(61)
+        out = henv.host.tick() + henv.host.tick()
     assert ends(out) and held_while and not any(held_while), held_while
+    assert [m for _, m, _ in g.seen if "the steer into message" in m], "the line, written"
+    assert not g.violations, g.violations
 
 
 def test_r4_t_stop_all_survives_a_fault_in_every_step_of_its_traversal(henv, monkeypatch):

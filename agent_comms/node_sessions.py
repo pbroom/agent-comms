@@ -91,12 +91,11 @@ from typing import Any, NamedTuple, Callable
 
 import httpx
 
-from . import session_access, session_worktrees
+from . import hostlog, session_access, session_worktrees
 from .dispatch import DispatchConfig
-from .session_host import (STEER_CONTACT_SECONDS, WATCH_THREADS, HostEvent, SessionHost, flush_watch_logs,
-                           received_under)
+from .session_host import STEER_CONTACT_SECONDS, WATCH_THREADS, HostEvent, SessionHost, received_under
 
-log = logging.getLogger("agent_comms.node_sessions")   # (ruling W2.3: diverted on a watchdog's thread, session_host)
+log = hostlog.get("agent_comms.node_sessions")     # (host-side logging: every line a deferred record, hostlog)
 
 
 def _finite(meta: dict) -> dict:
@@ -303,7 +302,10 @@ class SessionRunner:
         # nothing can start before the first listing anyway (a session is opened, and its inbox filled, only from a
         # listing the loop applied; `recover()` only stops what an earlier process left and reads its records).
         self._last_contact = clock()
-        self.lock = threading.Lock()                  # the host, between the loop, the watchdog and shutdown()
+        # The host, between the loop, the watchdog and shutdown(): THE runner lock, a host lock (hostlog.HostLock): no
+        # log handler runs on a thread that holds it; what was logged under it is written once it is let go (by the
+        # loop and shutdown; never on the watchdog's thread)
+        self.lock = hostlog.HostLock(threading.Lock())
         self.watched: list[HostEvent] = []            # what the watchdog's self-stop reported, for the loop to post
         self.watched_steer: list[HostEvent] = []      # ... of a steer attempt's session: posted before LOST detection
         # (Enabling PR, ruling S5(c)) True while a listing is being reconciled: the watchdog's own lane (`watched`) is
@@ -944,7 +946,6 @@ class SessionRunner:
             # The queue and the stop flags held here may be out of date (the human may just have closed a session):
             # turns already running go on, nothing new is handed over until a fetch has succeeded again.
             self.fresh = False
-        flush_watch_logs()      # (ruling W) what the watchdog's thread logged
         with self.lock, self.host.one_drain_budget():   # (R5-04) one drain deadline for this whole hold of the lock
             if self.stopping.is_set():
                 return ok
@@ -1726,7 +1727,7 @@ class SessionRunner:
 
     def _watch(self) -> None:
         me = threading.get_ident()
-        WATCH_THREADS.add(me)       # (ruling W) the host defers every save, transcript line and log line made here
+        WATCH_THREADS.add(me)       # (ruling W) the host defers every save and transcript line made here; no drain
         try:
             while not self.stopping.wait(self.watch_seconds):
                 try:

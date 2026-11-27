@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 import httpx
 
-from . import access
+from . import access, hostlog
 from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
                        plain_origins, probe_process, process_start, remove_browser_output, render_argv,
                        browser_output_path, make_browser_output,
@@ -35,7 +35,7 @@ from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_co
 from .node_sessions import SessionRunner
 from .session_host import STATE_FILE as SESSION_STATE_FILE, SessionHost
 
-log = logging.getLogger("agent_comms.node")
+log = hostlog.get("agent_comms.node")     # (host-side logging: every line a deferred record, hostlog)
 
 HELLO_SECONDS = 10.0
 # Without hub contact this long, the node stops its own runs: the hub counts them lost after

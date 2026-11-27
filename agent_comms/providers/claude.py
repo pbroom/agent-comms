@@ -104,12 +104,12 @@ from __future__ import annotations
 import collections
 import dataclasses
 import json
-import logging
 import os
 import re
 import uuid
 
 from . import FAILED_TURN, Event, cap_reply, number, usage_record, validate_model, validate_session_id
+from .. import hostlog
 
 # Flags a hosted session sets itself, or that would start, fork or hide a conversation other than the hub's.
 OWN_FLAGS = frozenset((
@@ -160,7 +160,7 @@ MEASURED_TERMINALS = {"success": False, "error_max_turns": True, "error_during_e
 # its uuid); UNATTRIBUTED: a turn no message of the host's is known to have started (an unmarked `init`).
 OWN, UNATTRIBUTED = "own", "unattributed"
 STEER_BRACKET = "steer"     # S's own bracket, after N's end: an `init` echoing exactly [S] (NEXT_TURN only)
-log = logging.getLogger("agent_comms.providers.claude")
+log = hostlog.get("agent_comms.providers.claude")     # (host-side logging: every line a deferred record, hostlog)
 # The facts of a `result` the host passes on as `meta`: small scalars only. The reply text travels apart from them
 # (Event.text, capped), so nothing that logs or stores `meta` ever holds it.
 RESULT_META = ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_usd", "stop_reason", "terminal_reason",

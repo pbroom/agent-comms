@@ -59,13 +59,13 @@ DESIGN_NOTES "Account pools"). `primary` and `secondary` may each be null:
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 
 from . import FAILED_TURN, Event, cap_reply, number, usage_record, validate_model, validate_session_id
+from .. import hostlog
 
-log = logging.getLogger("agent_comms.providers.codex")
+log = hostlog.get("agent_comms.providers.codex")     # (host-side logging: every line a deferred record, hostlog)
 # Codex's refusals of a `turn/steer` before it admitted it (-32600, measured on 0.171.0): the steer never reached the
 # turn, so it is not delivered.
 STEER_NO_TURN = "no active turn to steer"

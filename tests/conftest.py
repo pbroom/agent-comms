@@ -27,6 +27,15 @@ def legacy_plain(env, post_id: int, type: str | None = None) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _hostlog_fresh():
+    """Each test starts with an empty host-side log queue (agent_comms.hostlog): no record a former test's watchdog
+    thread left undrained is written into this one's handlers."""
+    from agent_comms import hostlog
+    hostlog._reset()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_real_notifications(monkeypatch):
     """Tests never spawn osascript; tests that exercise delivery inject their own deliverer."""
     monkeypatch.setattr(notify.MacOSDeliverer, "available", lambda self: False)

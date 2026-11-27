@@ -18,6 +18,8 @@ import os
 import threading
 from typing import Any, Callable, Hashable
 
+from . import hostlog
+
 
 def key(cwd: Any) -> Hashable:
     """A directory's identity: (device, inode); its real path if it cannot be stat'ed."""
@@ -32,7 +34,9 @@ class Groups:
     LIVE, STOPPING = "live", "stopping"
 
     def __init__(self) -> None:
-        self.lock = threading.RLock()
+        # THE registry lock, a host lock (hostlog.HostLock): a spawn callback runs under it (`start`), and no log
+        # handler runs on a thread that holds it (what is logged meanwhile is written once it is let go)
+        self.lock = hostlog.HostLock(threading.RLock())
         self.entries: dict[Hashable, dict[Hashable, list]] = {}     # dir key -> group token -> [state, cwd]
 
     def start(self, cwd: Any, token: Hashable, spawn: Callable[[], Any], k: Hashable | None = None) -> tuple[bool, Any]:
