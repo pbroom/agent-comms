@@ -16555,3 +16555,905 @@ tests/test_claude_steering_enable.py.
   turn was proved before the cut. At the verified reap, N settles once with S `next_turn` failed (`own_turn_cut`), and
   its detail is the cut's.
 - **No defect was found, and no product code changed.**
+
+## Ownership until verified exit (C1)
+
+This is the first of PR-C, with the order C1 → C3 → C2 (design: "kills and ownership"). The human has chosen the
+per-group supervisor (shim), which C3 builds. C1 does not depend on it.
+
+**The invariant:** no checkout or tracking record is released while the existing group may still have a live member.
+
+### The one release rule
+
+- **`Groups.release(token, proof, forget)`** is the only way a registry entry goes. The old public `gone` is now the
+  private `_gone`, and only `release` calls it.
+- **The order:**
+  1. `proof()` answers whether the group is proved gone. False, `None` or an exception means nothing is released and
+     the call returns False.
+  2. If it is proved, `forget()` drops the owner's tracking record, then the registry entry goes.
+- **The durable entry is the tracking record's projection:** `node-sessions.json` lists the sessions with a child, and
+  the node's state lists its `running` runs. So it goes at the owner's next save, and only after `forget`.
+- **The interface does not depend on how absence is proved.** C3 passes the shim's proof (its `EMPTY`, or its
+  `.empty` file) to the same rule, and no caller changes.
+
+### The proof in C1 (no anchor)
+
+- **The leader's exit, OBSERVED by its own handle:** `poll()` returned.
+- **AND a complete, successful listing of the group's members showing none:** `node_groups.group_absent`.
+  - It uses macOS libproc's `proc_listpids(PROC_PGRP_ONLY, pgid)`: one call, which the kernel answers from its
+    process lists under their lock, so the snapshot is coherent.
+  - **Complete** means the filled call returned fewer bytes than its buffer. A filled buffer may be truncated: a larger
+    one is tried, three sizes in all, and otherwise there is no proof.
+  - **An error, or no libproc,** means no proof.
+  - **Any member at all is not proof,** a zombie included.
+  - **macOS only** (review round 4, R12 and A5). Off macOS the membership half is main's own liveness answer, `not
+    group_alive(pgid)`: a stated compatibility limit. On macOS a libproc that will not load is no proof, said once.
+  - **Checked on this Mac** (scratch, on this script's own children): a zombie leader IS listed; a missing group
+    gives 0 bytes; a buffer of one slot for a group of two returns exactly the buffer's size.
+- **Why not `killpg(pgid, 0)`.** Its ESRCH also answers for a group whose only members are zombies. Its EPERM answers
+  for members this user may not signal, and briefly on macOS for a group that is exiting. So it answers about
+  permission, not membership.
+- **The existing `group_alive` (killpg) is kept** for the stop decisions, which are unchanged.
+- **Tests' fake processes** prove absence by the injected group probe (`group_absent` derived from it).
+
+### The callers (before / after)
+
+| Caller | e6ebf95 | C1 |
+| --- | --- | --- |
+| `SessionHost._reap` (session_host.py) | `poll()` and `group_alive` false, then `groups.gone` | `_release(s, child)`: kept unless proved; the pass looks again |
+| `SessionHost._stop_all` | released after its SIGKILL unless a shutdown step failed (**survivors released**) | released only if proved; else it keeps the handle, the exact token, the STOPPING entry and the durable entry |
+| `Node._reap` (node.py) | `poll()` and `group_alive` false, then `gone` and drop | `Node._release(rid, local)`, the same rule |
+| `Node.report_stopped` | **released every run and dropped it from the state file** | releases only on proof. A retained run keeps its registry entry, its handle and its state entry, and is not reported ended: the next node process reports it from its record (`recover`) |
+
+### What C1 does not do
+
+- **It adds no signal.** There is no new `killpg` site and no KILL retry (that is C2), no thread, and no restart
+  guarantee (that is C3, with the shim).
+- **It changes no stop decision**, and keeps main's latch, signal order and registry wait.
+- **A retained group is re-checked** by the existing reap in every pass (`_steps`, then `_reap`, for a session;
+  `Node._reap` in `tick` for a run).
+- **One guard keeps a retained session inert.** A session whose leader exited, and whose group is neither seen alive
+  nor proved gone, takes no further step in that pass: nothing is written to it and nothing stops it, until a pass
+  proves it gone. Main never reaches that state, because its reap let the group go in the same call.
+- **Shutdown** waits as long as before, then returns with survivors still reserved and durable.
+
+### Visibility, and a gap
+
+- A held checkout shows in the node's log: `_lingering` for a session that outlived its SIGKILL, and the run's "waits
+  for a stopping process group" line.
+- **Gap:** `SessionRunner.stopping_checkouts` (node_sessions.py) exists, but nothing reports it to the hub, so there is
+  no held checkout in the node's STATUS today. Proposed for C3, with the shim's own states. Nothing asks the human.
+
+### Tests (tests/test_ownership_c1.py)
+
+- **Reproductions.** On e6ebf95, with this tree's test file, both fail because the release happened (the handle and the
+  run were gone):
+  - `test_c1_shutdown_keeps_a_group_that_survived_its_sigkill`;
+  - `test_c1_report_stopped_keeps_a_run_whose_group_survived_its_kill`.
+
+  Each also shows that a new group is refused on that checkout.
+- **Sol's pin:** `test_c1_a_kill_that_returns_with_a_survivor_then_exit_releases_exactly_that_reservation`. Main's
+  reap already retains while the group is alive, so this one is a pin, not a reproduction.
+- `test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone`.
+- **The proof's negative cases**, through a fake libproc: a truncated listing, a failed or refused listing, no
+  libproc, a listing with a member, a proof that raises, says no or answers `None`, and the leader's exit not
+  observed.
+- `test_c1_release_is_the_only_way_out_of_the_registry`: the registry has no public `gone`.
+- **A scratch-only REAL macOS test** (`c1_real_macos.py`, in the scratchpad, never committed). It uses its own temp
+  directory and its own children: a leader that exits on SIGTERM, and a member that ignores SIGTERM, whose "SIGKILL"
+  reaches the leader only. For a session (`stop_all`) and a dispatched run (`Node._release`): kept, the checkout
+  refused while the member lives, and released by the real listing once it is gone. PASS.
+- **An older pin inverted on purpose:** `test_r6_n4_known_limit_a_kill_that_returns_with_survivors_releases_ownership`
+  (round 6, N4). It pinned main's release of a group whose KILL returned with survivors, the known limit C1 closes. Its
+  name is kept for the record, and it now asserts that the group is kept.
+
+### Mutation check
+
+12 rows: the rule (2), the proof (2), the session's proof (2), and each caller: the reap, `_stop_all`, the inert
+guard, the run's proof, the run's reap and `report_stopped`.
+- On 59cace3, 11 of 12 are caught. The miss was "a retained process is left alone": the test's turn was in flight,
+  so nothing was written anyway.
+- 16a641e's pin also lets the turn's timeout and a kill grace pass. Without the guard, main's timeout would arm a stop
+  and the kill scan would send SIGKILL; with it, the row is caught.
+- The results are in scripts/steering-mutation-results.txt.
+
+### Runs (C1, on 73309f7, rebased onto main 03268de)
+
+Claude Code 2.1.330 and codex-cli 0.172.0, run the way scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- The full suite, serial: 5356 passed, 10 skipped, in 12 min 32 s.
+- The `~/.codex/config.toml` hash was 18fcebe0d94018f8 before, after each real run and at the end.
+- The protected files are unchanged.
+
+### C1: review round 1 (on 3493ee6; Sol: CHANGES, 2 blockers, 2 shoulds; then an amendment, A1 to A4)
+
+Both blockers are about the state C1 adds: a group RETAINED where main would have released it.
+
+#### R1 and R2: one HELD state, in the registry
+
+- **What HELD is.** A third registry state, beside LIVE and STOPPING (`Groups.HELD`).
+- **Why STOPPING could not carry it.** STOPPING also means "being stopped, signals still due". A parked survivor, for
+  instance, is STOPPING and still waiting for its first TERM. A session field would not fence dispatched runs.
+- **How a group becomes HELD.** At the release rule itself: `Groups.release` refuses, and the exact token is marked
+  HELD before it returns (A2). Every caller of the rule is at main's release point:
+  - the reap, after the leader's exit and a FALSE liveness answer;
+  - `_stop_all`, after its KILL attempt, sent or raised (A1);
+  - the run's reap;
+  - `report_stopped`.
+- **A missing entry (A3).** If the token has no entry when the release is refused, the checkout is fenced under its
+  known key: the session's cached `group_key`, or the run's key, now cached at spawn (`_Local.key`).
+- **The fence (R1).** `Groups.start` refuses a HELD checkout, and `blocked` and `stopping_dirs` show it, exactly as for
+  STOPPING.
+- **Sticky.** HELD never goes back to LIVE or STOPPING: `stopping` and `try_stopping` leave it as it is. It leaves only
+  through `release` with a True proof.
+- **Proof-only (R2).** For a HELD token, no numeric signal is sent again, and no signal clock is armed. One predicate,
+  `Groups.may_signal(token)`, decides it, and every signal site a retained record can reach asks it:
+  - `SessionHost._reap`'s survivor stop: main's first stop of a dead leader with `group_alive` true is kept by
+    identity (A2). It is never sent once the token is HELD.
+  - `SessionHost._stop` (and so every route that reaches it: a close, a cancel, a timeout, `stop_turns`, parking, the
+    reserved stop): a HELD record returns at once, with no clock and no signal.
+  - `SessionHost._kill_if_due`, the kill scan of the loop and the watchdog.
+  - `SessionHost._stop_all`'s KILL pass.
+  - `SessionRunner.signal` and `SessionRunner.kill`, the node's own shutdown steps.
+  - `Node._stop`, which covers hub stops, timeouts, `signal_runs` and `kill_runs`.
+  - `Node._reap`'s survivor stop.
+
+  The inert guard in `_steps` is now this predicate: a HELD session takes no further step in a pass.
+- **No race with the transition (A4).** The check and the signal run under the owner's serialization, and so does the
+  HELD transition: the node's runner lock for hosted sessions (the loop's pass, the watchdog, shutdown), and the node's
+  one loop thread for dispatched runs (`run`'s loop, then `shut_down` on the same thread).
+- **No new wait.** `may_signal` reads a HELD index (`Groups.held`) without the registry lock. The index is written
+  under the lock at each transition and at the release, so no pass and no signal site waits on the registry. A spawn
+  holds the registry across process creation (round 8, C1). A version that read the registry under its lock failed
+  round 8's pins.
+- **What a HELD record still gets** on every pass: the proof, and release once it is True.
+- **Shutdown** returns with HELD records still reserved and durable, and does not re-arm them.
+- **The normal kill path.** A KILL that returns with members left keeps the group STOPPING, with `killed` latched. It
+  sends no further numeric signal: the kill scan is latched, `_stop` is a no-op once stopping, and the survivor branch
+  sends nothing for a stopping session. It becomes HELD at the release rule if the later proof fails.
+- **Round 5's Z, inverted on purpose (A1).** A shutdown KILL that RAISES now leaves the group HELD: no later kill by
+  number, since delivery is uncertain. Identity-safe retries are C2's and C3's.
+
+#### R3: the claim's scope, and the comments
+
+- **The scope.** `Groups.release` is the removal path of a live node's started groups.
+  - A spawn that fails removes its provisional registration in `start`.
+  - A start never made, or a claim lost, has no group to release.
+  - After a successful proof, a crash before the next save leaves a stale disk record. That is the conservative
+    direction.
+- **The C3 hole.** Unchanged startup recovery (`stop_verified`) signals only a leader it verifies, so a leaderless
+  survivor is neither signalled nor reserved, and its entry is dropped. The comments that promised otherwise are
+  corrected: `Node.recover`, the node's `report_stopped`, `_stop_all`, and node_groups' module text.
+
+#### R4: the real proof, pinned in the suite
+
+`test_r4_group_absent_against_real_children_of_this_test` is macOS-only, and uses only its own children and its own
+temporary directory. It checks:
+- a live member is listed;
+- a zombie leader is listed;
+- the member alone is listed once the leader is reaped;
+- a listing that fills its buffer is no proof (the truncation rule, made reachable by `_LISTING_ROOM`);
+- an empty group is absent.
+
+The scratch test of sessions and runs stays out of the suite.
+
+#### C1's stated limit
+
+A HELD session can stay held indefinitely if a member never exits. Its turn is then still in flight at the hub, and
+the only sign is a log line, written once at the transition (and `_lingering`'s for a group that outlived its
+SIGKILL). That remains so until C3 reports held checkouts in the node's status.
+
+#### Tests (tests/test_ownership_c1.py)
+
+- **The reproductions,** all failing on 3493ee6:
+  - `test_r1_a_retained_session_fences_its_checkout_until_the_proof` and `..._run_...`;
+  - `test_r2_a_held_session_is_never_signalled_by_number_again[reap|kill_scan|cancel|close|shutdown|stop_turns]`;
+  - `test_r2_a_held_run_is_never_signalled_by_number_again[reap|signal_runs|timeout]`;
+  - `test_r2_held_is_sticky_until_the_proof_is_true[false|raises|none]`.
+- **The amendment's pins:**
+  - `test_a3_a_refused_release_with_its_entry_missing_still_fences_the_checkout`;
+  - `test_a3_the_rules_fence_on_a_miss`;
+  - `test_a4_the_held_transition_cannot_come_between_the_signal_check_and_the_signal`: a transition attempted between
+    the check and the TERM waits for the runner lock, so the order is check, TERM, HELD;
+  - `test_r2_the_runners_shutdown_steps_never_signal_a_held_session`.
+- **R4's** real-process pin.
+- `test_r5_z_...` inverted (A1). `test_agent_accounts`' `groups.start` wrapper passes the key through.
+
+#### Mutation check (review round 1)
+
+23 rows: HELD's states (4), its transition and fence (3), the predicate and its index (2), every signal site (7), the
+two fences (2), the runner's two shutdown steps (2), and four C1 rows re-anchored on lines this round rewrote.
+- On 5d692a2, 22 are caught.
+- **Missed: "the reap's survivor stop only while it may be signalled".** For signals it is equivalent, because `_stop`
+  also checks HELD; but it let the reap decide the turn of a HELD session.
+- **Two run rows** were caught only by the slow stand-in e2e test, not by a targeted test.
+- 83d9632 pins all three directly (a HELD session's turn stays unsettled; a HELD run logs no survivor stop; a run's
+  refused release with its entry missing still fences), and all three are caught.
+
+#### Runs (C1 review round 1, on 83d9632)
+
+Claude Code 2.1.330 and codex-cli 0.172.0, run the way scripts/session-host-e2e.py runs them. The machine was heavily
+loaded by other agents' suites, with load averages of 6.5 to 9.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- **The full suite, serial:** 5377 passed, 10 skipped and 1 failed, in 27 min 13 s (about 12 min on an idle machine).
+- **The failure** is `test_hosted_sessions.py::test_the_end_to_end_script_passes_with_the_stand_in`, the in-suite
+  stand-in e2e test with its 300-second limit.
+  - Rerun alone: it failed again after 313 s, its limit plus the stop.
+  - The same script with the test's exact arguments (`--max-latency 10 --max-wake 10`), run directly: PASS, 395
+    checks, in 6 min 12 s at a load average of about 8.
+  - So this is the timeout under load, not a defect.
+- **The parallel suite earlier in the round:** 5373 passed and 2 failed. Those two were a test whose `groups.start`
+  wrapper predated the new key argument, and they are fixed.
+- **The `~/.codex/config.toml` hash** was 18fcebe0d94018f8 before, after each real run and at the end.
+- The protected files are unchanged.
+
+### C1: review round 2 (on 3b62bc6; Sol: CHANGES, 2 blockers, 1 should; then an amendment, A1 to A4)
+
+Both blockers are edges of the HELD transition. After a KILL it came too late; before a proof it came too late.
+
+#### R5, A1 and A2: the first KILL attempt makes the token proof-only, on every path
+
+- **Owner:** `Groups.veto(token)`, the one place that makes a token proof-only after a KILL.
+- **When it is called:** by every site that sends a SIGKILL to a tracked group, at the attempt and BEFORE the signal,
+  so a KILL that raises is covered too. It runs under the same owner serialization as the signal: the node's runner
+  lock for hosted sessions, and the node's one loop thread for dispatched runs.
+- **What it writes (A2):** only the lock-free HELD index (`Groups.held`), so the due-KILL path never waits on the
+  registry.
+  - The entry is already STOPPING, which fences admission.
+  - It becomes HELD in the registry at the release rule, where the registry is taken anyway.
+  - From the veto on, `may_signal` is False for that token everywhere, shutdown's TERM included.
+- **What it keeps (A1).** The veto revokes signal eligibility only. A stopping HELD session takes main's steps in each
+  pass: its stop clock (`stopping_since`, never reset), the bounded publication of a decided and fenced Claude end
+  (`_hold_fence`), main's survivor branch (which signals nothing for a stopping session), `_lingering`'s line, and the
+  reap.
+  - The `_steps` guard returns early only for a HELD session that is NOT being stopped.
+  - At the proof-true release, the reap makes main's last reads, and a run is reported ended there as main reports it
+    at its reap.
+  - No turn's outcome changes. No report is lost: a report main sends at the reap comes at the release, which is later
+    only when a member survives the KILL.
+- **Do not rely on `s.killed`, or on a handle's call being harmless.** `PopenChild.terminate()` and `kill()` are a
+  numeric `killpg`, even after `poll()` has reaped the leader. Every such call for a tracked group goes through the
+  predicate.
+- **The signal sites and handle calls for a tracked group, each with the predicate and (for a KILL) the veto:**
+
+| Site | Call | Gate |
+| --- | --- | --- |
+| `SessionHost._stop` (every TERM route: close, cancel, timeout, `stop_turns`, park, the reserved stop, binding restarts, the cut, `_stop_all`'s TERM) | `child.terminate()` | `may_signal` first: a HELD record returns, with no clock and no signal |
+| `SessionHost._kill_if_due` (the kill scan of the loop and the watchdog) | `child.kill()` | `may_signal`; `veto` at the attempt |
+| `SessionHost._stop_all`'s KILL pass | `child.kill()` | `may_signal`; `veto` at the attempt |
+| `SessionHost._reap`'s survivor stop of a dead leader | via `_stop_from`, `_stop` | main's first stop, kept by identity, only while `may_signal`; for a stopping session main's branch, which signals nothing |
+| `SessionRunner.signal` (shutdown) | `child.terminate()` | `may_signal` |
+| `SessionRunner.kill` (shutdown) | `child.kill()` | `may_signal`; `veto` at the attempt |
+| `Node._stop` (hub stop, timeout, the reap's escalation, `signal_runs`, `kill_runs`) | `child.terminate()` / `child.kill()` | `may_signal` first; `veto` at the KILL attempt |
+| `Node._reap`'s survivor stop | via `Node._stop` | only while `may_signal` |
+
+- **Not in scope:**
+  - startup recovery (`stop_verified`, `recover`), which signals verified leaders of a previous process, not tracked
+    groups: that is C3;
+  - the in-process dispatcher, which has its own admission.
+
+#### R6, A3 and A4: the checkout is fenced before the last reads and the proof
+
+- **The order in `Groups.release` now:**
+  1. Under the registry lock, the exact token is fenced (HELD, or a HELD entry under its known key, as in A3).
+  2. Outside the lock, the caller's `prepare()` runs: the session reap's last reads (read, drain, start-mode check),
+     which now come AFTER the fence (A3).
+  3. The proof.
+  4. A True proof removes the entry and the fence in one step (`_gone`). Anything else leaves the token HELD.
+- **The boundary (stated exactly in review round 3, S4):** admission is fenced when the release path installs the
+  fence under the registry lock, before the final reads and the membership proof. Work admitted while the token was
+  LIVE can coexist with a survivor discovered afterwards. A LIVE entry never fenced admission on main, and C1 does not
+  change that: excluding it would need a LIVE entry to fence, which would stop runs sharing an idle session's checkout.
+- **A fence that lifts in the same call is silent.** The "could not be proved gone" line is written only when the
+  release is refused and the token was not HELD in the registry before.
+- **A4 and R6.3: a refusal at that fence defers, as a STOPPING refusal does today.** Neither fails the work:
+  - a session's spawn returns with its message still in its inbox, and is retried on the next pass;
+  - a dispatched run logs its "waits" line and is retried on the next tick.
+
+#### R7: the real-process pin, hardened
+
+`test_r4_group_absent_against_real_children_of_this_test`:
+- Both processes are this test's own direct children: the leader in a group of its own in this session, and the member
+  put into that group.
+- The leader's exit is OBSERVED with kqueue `NOTE_EXIT`, bounded to ten seconds and without reaping it, in place of a
+  fixed sleep.
+- Every signal goes through a handle, and a handle that has been waited for is never signalled.
+
+The first try put the leader in a new session, so the member could not join its group (EPERM). That left the
+leader's `sleep 60` running until it ended by itself; nothing signalled it.
+
+#### Tests (tests/test_ownership_c1.py)
+
+- **The reproductions, failing on 3b62bc6:**
+  - `test_r5_after_the_first_kill_no_numeric_signal_reaches_the_group_again[pass|cancel|close|stop_all|stop_turns ×
+    sent|raised]`;
+  - `test_r5_the_runners_shutdown_steps_send_nothing_after_the_first_kill`;
+  - `test_r5_a1_a_killed_held_group_keeps_its_stop_and_its_bounded_publication`;
+  - `test_r6_the_checkout_is_fenced_while_the_proof_runs[True|False|None|raises]`: a deterministic gate inside the
+    proof; a session's and a run's admission are refused while it runs;
+  - `test_r6_a3_the_fence_is_in_before_the_reaps_drain`.
+- **Pins that already passed there:**
+  - `test_r5_after_a_runs_first_kill_nothing_more_is_sent[...]`: `Node._stop`'s own latches already stopped repeats
+    there;
+  - `test_r5_a1_a_killed_held_run_is_reported_ended_at_its_release`;
+  - `test_r6_a4_a_run_refused_by_a_clean_exits_fence_waits_and_is_admitted_next`;
+  - `test_r6_a4_a_session_refused_by_a_clean_exits_fence_waits_and_starts_next`.
+- **An older pin adjusted:** `test_r5_w_kills_and_fences_with_a_drain_pending_and_a_raising_or_stalling_save`. It
+  resets `s2.killed` to send a second due KILL to the same group with its second save. Its reset now also clears the
+  veto that R5 sets.
+- **Pins added after the first mutation run:**
+  - `test_r5_shutdowns_kill_pass_vetoes_at_its_attempt`;
+  - `test_r5_the_runners_kill_step_vetoes_what_follows_it`;
+  - `may_signal` False in the run's test, from its first KILL attempt;
+  - `test_r5_a1_a_killed_group_that_outlives_its_kill_is_still_said_in_the_log` (its `_lingering` line, and its
+    entry STOPPING while seen alive).
+
+#### Mutation check (review round 2)
+
+15 rows: a veto per KILL site (4), the veto itself, fence-before-proof, fence-before-reads, the two A1 rows, and six
+round-1 rows re-anchored on lines this round rewrote.
+- **On 4256afc, 13 are caught.**
+  - Three KILL-site rows were caught only by the slow stand-in e2e test:
+    - shutdown's pass: the same `stop_all`'s release later makes the token HELD anyway;
+    - the runner's step;
+    - the run's: `Node._stop`'s own latches already stop repeats.
+  - The two A1 rows were missed. `_hold_deadline` publishes the bounded end first in every tick, so the early return
+    could not be seen there, and main's survivor branch differs only in the registry state.
+- **8d9ea81** pins each of those five directly, and all five are caught by those pins.
+- The script now has 197 rows. The results are in scripts/steering-mutation-results.txt.
+
+#### Runs (C1 review round 2, on 9959df9; its code is 8d9ea81's)
+
+Run 12:56 to 13:25, with load averages of 5.6 to 8. Claude Code 2.1.330 and codex-cli 0.172.0, run the way
+scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- **The full suite, serial:** 5405 passed, 10 skipped, in 12 min 21 s, the in-suite e2e test included.
+- **The parallel suite earlier in the round** (load averages of 14 to 22): 3 failed.
+  - `test_r5_w_...` needed its own reset to clear the veto; that is fixed.
+  - `test_the_worst_case_verdict_is_fast` passed when rerun alone.
+  - The in-suite e2e test timed out, then passed in the serial run.
+- **The `~/.codex/config.toml` hash.** The file changed at 12:36:32, while no run of this branch was active (the
+  coordinator's note: the Codex desktop app's own write). The new baseline is be07f3845d522521, which held before,
+  after each real run and at the end.
+- The protected files are unchanged.
+
+### C1: review round 3 (on 2ef2615; Sol: CHANGES, 1 blocker later withdrawn, 2 shoulds; then S3 and S4)
+
+**The blocker was withdrawn.** It said that a run admitted to a still-LIVE checkout before the reap's fence races the
+release decision. Sol confirmed that a LIVE token permits sharing, on main and on C1, and that no locking in the reap is
+warranted. No code changed for it.
+
+#### S4: the boundary, stated exactly
+
+- **Admission is fenced when the release path installs the fence under the registry lock, before the final reads and
+  the membership proof.**
+- **Work admitted while the token was LIVE can coexist with a survivor discovered afterwards.** A LIVE entry never
+  fenced admission on main, and C1 does not change that. Excluding it would need a LIVE entry to fence, which would
+  stop runs sharing an idle session's checkout: not this PR.
+- This is said in `Groups.release`'s docstring and in round 2's notes, where the sentence that claimed more (that the
+  entry is never LIVE while the reads or the proof run) is replaced.
+
+#### S1: the shutdown precondition, said and pinned (the smaller choice)
+
+- **The issue.** `SessionRunner.kill` can veto a token that is still LIVE in the registry, because `signal()` sends
+  its TERM without marking STOPPING.
+- **Why this leaves no admission bypass:** from `stopping` (set by `signal()`) on, nothing starts a group.
+  - The loop's pass and the watchdog return on `stopping` before touching the host.
+  - Dispatched runs are admitted only by `Node.tick`, on the thread that runs `shut_down`.
+- **Why document rather than fence.** Fencing the shutdown TERM path would add a registry wait there and change no
+  outcome. Stating the precondition where the veto is set (`SessionRunner.kill`'s docstring) and pinning it is the
+  smaller change.
+- **Pins:**
+  - `test_s1_after_stopping_no_session_group_is_started`: after `signal()`, the loop's pass and the watchdog's start
+    no group;
+  - `test_s1_shutdown_starts_no_dispatched_run`: a run assigned at shutdown is never started.
+
+  Both held on 2ef2615 too: they pin a precondition, they do not fix one.
+
+#### S2: a failed final read still says the hold
+
+- **The defect.** An exception in `prepare()` (the reap's final reads) after the fence skipped the one-time retention
+  line, and the next pass saw an already-HELD token and stayed silent.
+- **The fix.** The session's release now writes that line in a `finally`, so it is written on this path too. The fence
+  stays.
+- **Pin:** `test_s2_a_failed_final_read_still_says_the_hold_once`: one line across two passes; HELD and fenced.
+
+#### S3: the W pin uses a fresh group
+
+`test_r5_w_kills_and_fences_with_a_drain_pending_and_a_raising_or_stalling_save` now stops a second, fresh group for
+its second due KILL, instead of clearing the first group's veto in the test.
+
+#### Mutation check (review round 3)
+
+One row, for the only changed product line (S2's retention line on a failed final read). On f3128ff it is caught by
+`test_s2_...`. S1 and S4 change text only, and S3 changes a test. The script now has 198 rows.
+
+#### Runs (C1 review round 3, on 4fa300a; its code is f3128ff's)
+
+Run 13:36 to 14:06, with load averages of 5.2 to 8.5. Claude Code 2.1.330 and codex-cli 0.172.0, run the way
+scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- **The parallel inner-loop suite:** 5408 passed, 10 skipped, in 4 min 13 s.
+- **The full suite, serial:** 5408 passed, 10 skipped, in 12 min 30 s, the in-suite e2e test included.
+- **The `~/.codex/config.toml` hash** was be07f3845d522521 (the baseline since 12:37) before, after each real run and
+  at the end. There was no further change.
+- The protected files are unchanged.
+
+### C1: review round 4 (the PR's reviews)
+
+Two reviews of e500549: the automated PR review (R8) and the independent pre-merge review (R9 to R12, and two nits).
+The coordinator's rulings, then an amendment after Sol's pre-check (A1 to A6), were built as one round. Sol had
+approved 2cdc14f, and neither Sol nor the tests caught these, each time because a fake hid the real behaviour: a fake
+child that exits at once on `kill()`, and a failure modelled as -1. So every reproduction uses the real behaviour (a
+real child of the test where it can), and each fails on e500549.
+
+#### R8 [blocker], with A1: a failed listing is no empty group
+
+**The defect.** `group_members` took a FAILED listing for an EMPTY group.
+- Apple's libproc `proc_listpids` wrapper returns 0, not -1, when its underlying `__proc_info` syscall fails, and
+  leaves the cause in errno.
+- So the `need < 0` and `got < 0` checks never fired, and a failed call gave `()`.
+- `group_absent` then said True, and `Groups.release` let go of a group that may still have had members: the one
+  thing this PR exists to prevent.
+
+**The measurement** (the coordinator's, on this machine, with ctypes `use_errno=True` and errno cleared before each
+call):
+
+| Call | Result | errno |
+| --- | --- | --- |
+| This process's own group | 8 bytes | 0 |
+| A group that does not exist | 0 | 0 |
+| A forced failure (an invalid buffer address) | 0 | 14 (EFAULT) |
+
+**The fix (784f695).**
+- `_listpids` makes each `proc_listpids` call, the size estimate and the listing alike. errno is cleared before it
+  (`ctypes.set_errno(0)`) and read right after it (`ctypes.get_errno()`, ctypes' copy: the library is loaded with
+  `use_errno`).
+- A result of 0 or less with errno set is a failure: None, not proof. So is any negative result.
+- **What it relies on, as its docstring says:** a failed syscall always sets errno, through the syscall stub, and the
+  wrapper returns 0 for it (also 0 with EINVAL for a type it does not take). No signal is used to probe anything.
+
+**A1 (this round): "no member" is exactly one answer.** It is a successful BUFFERED call that answered 0 bytes with
+errno 0. The size estimate never answers membership. Anything malformed is no proof (None):
+- a byte count that is not a whole number of pids;
+- a count larger than the buffer;
+- a slot inside the count that holds no pid (e500549 dropped zero slots, so 8 bytes of zeros read as empty).
+
+A short listing with a member is that member, and the group is retained. Sol confirmed from XNU that a successful
+buffered listing is complete: the kernel walks the live and zombie lists under the process-list lock.
+
+**The nit on the fill check, verified.** The reviewer said the kernel caps the listing, so `got < sizeof(buf)` could
+never see a truncation. Measured on this Mac:
+- A buffer of one slot for a group of two answers 4 bytes, and two slots answer 8: a buffer the group fills answers
+  exactly its size. So the check does see a cut listing.
+- With a buffer far larger than the group (1314, 1378 and 21024 slots), it answers the group's 8 bytes.
+- Listing every process into a buffer four times the estimate answered 1295 slots: the actual count, not the buffer.
+
+So the docstring now says exactly this. With the buffer sized from the kernel's own estimate (every process, plus 20,
+at the time of the estimate) plus `_LISTING_ROOM`, only a group about the size of the whole process table, or one that
+grew past it between the two calls, can fill it. The larger retries cover that, and a group that still fills the
+largest is no proof.
+
+**The rest of the PR.** `proc_listpids` is the only foreign call. `_libproc` handles a failure to load, and every
+other system call goes through Python's `os` module, which raises on error. No other error convention is assumed.
+
+#### R9 [blocker], with A2 and A6: a run killed at shutdown is reported when nothing survives
+
+**The sequence** (node.py `shut_down` and `report_stopped`).
+1. The node shuts down while a run's leader ignores SIGTERM past the grace.
+2. `kill_runs()` sends the SIGKILL, and `report_stopped()` ran straight after it, with no wait.
+3. `poll()` is still None that soon after a SIGKILL (40 of 40 in the reviewer's probe), so the release was refused.
+4. The run went HELD, stayed in the state file, and no "ended" report was sent. Main reports "ended" ("node shut
+   down") here. On e500549 the hub showed the run as running until the next node process reported it, or forever.
+
+**The fix.** `node_groups.POST_KILL_SECONDS = 1.0` and `POST_KILL_STEP = 0.05`.
+- **After both initial KILL passes are SENT** (the runs' `kill_runs()` and the sessions' `kill()`), and before the
+  runs' releases, `shut_down` makes ONE shared, bounded watch, `Node.await_kills`. In this round it looked, with no
+  signal, at the following (round 5, R13, replaced this selection with every group not yet proved gone):
+  - each run whose KILL was attempted and whose leader's exit is not seen yet (`kill_runs` returned them);
+  - each session the sessions' `kill()` attempted (it returned them; `SessionRunner.unproved`).
+
+  It ends as soon as each is proved gone (`_proved_gone`: the leader's exit seen by its own handle AND `group_absent`),
+  or at the deadline. The watch is bounded by the clock and by a count of looks, so a clock that does not move with
+  the sleep cannot hold it.
+- **Then everything is as before:** `report_stopped()` applies the release rule. A run proved gone is released and
+  reported "ended" at shutdown exactly as on main, with the same message, in the same order. A run not proved gone
+  stays retained and HELD, as designed, and only then is its retention line written.
+- **`Node.stop_all`** (the fallback when the shutdown's own steps failed) watches its KILLs the same way.
+- **The host's own KILL pass** (`SessionHost._stop_all`) has the same window right after its pass, before its reads
+  and releases, when that pass attempted a KILL. A2: the host's grace wait comes BEFORE its KILL, and its final reads
+  (a few milliseconds) could hide the same immediate-`poll()` problem. Through the node's shutdown, the sessions'
+  KILLs are watched in the node's shared window, and the host's pass then has nothing left to kill.
+- **The sessions' fallback when their initial KILL raised** (A2): the node's watch then covers only its killed runs,
+  so it delays the host's fallback (its own grace, KILL pass and window) by at most the one window. Pinned.
+
+**Why one second.** SIGKILL is delivered at once, but the kernel finishes the exit asynchronously, and launchd reaps a
+killed group's orphaned members a moment later. One second covers that by a wide margin.
+
+**What it adds, checked against launchd** (as corrected in round 5, R13 and R14, below). The watch now selects every
+group not yet proved gone, so it waits whenever one is unproved, a KILL or not. At most 2 x POST_KILL_SECONDS in all,
+on the sessions' fallback route, plus probe and scheduling overhead.
+- scripts/install-launchagents.py installs the node's LaunchAgent with `ExitTimeOut` 60 (read, not touched).
+- A shutdown that needs a KILL takes the 10 s kill grace, then the watch, then the reports: far inside 60 s.
+- `node_sessions.shutdown_bound` (the hub's bound for a node's signals) is unchanged: the watch comes after the KILL.
+
+**No signal is added, no signal's order changes, and no stop decision changes.** The watch only observes, and the
+release rule decides as before. But a signal sent after the watch comes later by up to the window: the sessions'
+fallback KILL, when their first KILL pass raised (round 5, R14).
+
+**The fake child (tests/test_dispatch.py).** `kill()` no longer makes `poll()` answer at once. `polls_after_kill`
+polls (one, by default) answer None before the exit is seen, as with a real process. A test that wants the exit seen
+at once says so with `kill_exits_at_once`. Six tests ask for it. They pin main's grace and admission timing, where the
+exit of a kill is seen on the next pass, not the exit's asynchrony:
+- in test_session_host.py, `test_a_process_that_ignores_sigterm_is_killed_after_the_grace_period_before_anything_restarts`
+  and `test_a_session_confirmed_while_its_process_is_being_stopped_resumes`;
+- in test_dispatch.py, `test_timeout_terminates_then_kills` (the hub's own runs);
+- in test_hosted_spawn.py, `test_r6_rule1_...`, `test_r8_s32_...` and `test_r9_s33_...`.
+
+With only the fake changed, these 6 failed on 784f695 and nothing else in the suite did.
+
+#### R10 [should], with A3: the fence revokes admission only
+
+**The sequence** (session_host.py `_reap`).
+1. A Codex process writes `start_failed` and exits between the pass's `_read` and the poll in `_reap`.
+2. `release` made the token HELD before the final reads (`last_reads`). The final read fails message 1 and calls
+   `_stop`, which returned early because the token was HELD, so `stopping_since` stayed unset.
+3. `stopped` was therefore False, so `_went_by_itself` ran. Message 2 met "waits_for_ready and not was_ready", and
+   `_fail_start` failed it too.
+4. On main, message 2 stayed queued and started a new process. A turn's outcome changed.
+
+**The carrier (A3): a temporary admission fence, `Groups.FENCED`, distinct from HELD.**
+- `release` installs it under the registry lock, before the final reads and the proof, but only from LIVE or a missing
+  entry (then under the known key). A STOPPING or HELD entry is kept as it is.
+- It refuses admission as HELD does: `start`, `blocked` and `stopping_dirs` count it.
+- For everything else it is the LIVE entry it was:
+  - it is not in the HELD index, so `may_signal` is unchanged by it;
+  - `stopping()` moves it to STOPPING;
+  - `try_stopping()` reserves it as it would a LIVE entry (RESERVED, not ALREADY).
+- It never clears a veto, and makes none.
+- A refused proof, or final reads that raise, turn it into HELD. A True proof removes it with the entry.
+
+So the final reads run main's code exactly, `_stop`'s bookkeeping included. Unsafe numeric signals are suppressed
+independently: by the veto (a group a KILL was attempted on), and by main's own rule for a reaped leader (`_stop`
+signals only if `poll() is None or group_alive`).
+
+**The audit: what runs inside `last_reads`** (`_read`, then `_drain_before_stop`, both through `_take_lines` and
+`_on_event`, then `_correct_start_mode`), and what each now does.
+
+| Path | Registry question | Now |
+| --- | --- | --- |
+| `start_failed` (line 1719): `_fail_start`, then `_stop` | `may_signal`, `stopping` | main's: `stopping_since` set, entry STOPPING, no TERM to a gone group; the reap treats the exit as a stop (pinned) |
+| `fatal` (1709), Codex sandbox rejection on `ready` (1621), `sealed` false (1650), the kill switch in `_check_access` (1731): `_end`, which claims (`_claim`, the steer cutoff lock only) and then `_stop_from`, then `_stop` | `may_signal`, `stopping` | main's bookkeeping. `_end` marks the session ended, so `_went_by_itself` returns on both; with `stopping_since` set as on main, the later lines of that same read are dropped as on main (`_take_lines`) |
+| The held-end settlement (in `_reap`, after the proof: `s.held` with `fenced_at` or `stopping_since`) | none | `_end`'s `_fail` reaches `_finalize_hold`, which stamps `fenced_at` while the process is still held, so the settlement runs either way; `stopping_since` is now also set as on main |
+| `turn_ended` to `_hold`, `_steer_adjudicate`, `_steer_end` | none (the steer cutoff lock) | unchanged |
+| `_correct_start_mode` | none | unchanged |
+| `_reserved_stop` / `try_stopping` | not reachable from the reads | (a FENCED entry would be reserved as LIVE) |
+
+The node's release (`Node._release`) has no final reads. Its reap and its `_stop` are unchanged by the fence.
+
+**A second outcome-sensitive path, found in this audit: the shutdown's final reads.**
+- `SessionHost._stop_all` reads each session after its KILL pass.
+- Through the node's shutdown, the sessions' `kill()` vetoes each group first. So `_stop_all`'s own `_stop` of that
+  session returned early, where main ran it in full. `stopping_since` stayed unset, and the shutdown's reads processed
+  the process's late events, which main drops for a stopping process.
+- Reproduced: a line naming another session (Claude's `fatal`), written before the process went, ENDED the session at
+  shutdown on e500549. Main leaves it to be resumed.
+- The fix: `_stop(..., shutdown=True)`, passed only by `_stop_all`. A group vetoed but not HELD keeps main's
+  bookkeeping (the stop's clock and the STOPPING mark) with no signal. A HELD one gets nothing, as round 1's R2 pins.
+
+**Why the separate state is the smaller choice.** The other option was to have `_stop` keep main's bookkeeping for any
+token that may not be signalled. That would give HELD records a signal clock, and the HELD pins (R2) forbid that. The
+fence state touches only the registry, and the final reads need no change at all.
+
+#### R11 [should], with A4: a group that is merely still exiting logs nothing
+
+- **The defect.** With the leader reaped and only zombie members left for an instant, the first release was refused
+  and wrote a permanent-sounding WARNING ("could not be proved gone… stays held"), and the next pass released it.
+  Main logs nothing at a normal end.
+- **The fix.** Only the LINE waits; HELD and the fence stay immediate.
+  - `Groups.unproved_line(token, now, after, final)` keeps, per token, the owner's monotonic time of its first refusal.
+  - The line is written once: when the group has stayed unproved for the kill grace (the run's own, or the host's), or
+    at shutdown (`final`), when the group is retained past the R9 watch.
+- **Why the kill grace.** It is how long the node already gives a group to go after a signal before it treats it as
+  not going (it SIGKILLs then). A zombie instant lasts milliseconds, and a later pass within that bound releases it in
+  silence.
+- Round 3's S2 pin (a failed final read still says the hold once) now lets the bound pass. It still sees exactly one
+  line.
+
+#### R12 [should], with A5: off macOS, main's rule, stated
+
+- **The defect.** With no libproc, `group_absent` was always False, so off macOS no group was ever released: every
+  run would stay running, never be reported, and block its checkout.
+- **The ruling changed in A5.** Off macOS (`sys.platform` is not darwin), the membership half of the proof is main's
+  own liveness answer, `not session_host.group_alive(pgid)` (`killpg(pgid, 0)`, the probe main's reap asked at this
+  release point).
+- **This is an explicit compatibility limit, with main's weakness.** A zombie-only group, or one this user may not
+  signal, counts as gone. The verified-exit proof is macOS-only, and the PR says so. Where main released with no probe
+  at all (`report_stopped`, and `_stop_all` when no step failed), the fallback is this probe, after the R9 watch.
+- **On macOS** a libproc that will not load is NOT proof: the group is retained, and it is said once in the log. A
+  listing that failed is never downgraded to the weaker probe.
+- No `/proc` scan is built in this PR.
+
+#### The nits
+
+- **node_groups.py, the truncation docstring:** verified and corrected (R8's section above).
+- **node.py `_stop`'s early return for a HELD run:** a comment now says why returning before `groups.stopping` is
+  harmless. A HELD entry already fences its checkout, and a vetoed one was marked STOPPING by the stop that sent its
+  KILL.
+
+#### Tests (tests/test_ownership_c1.py)
+
+Each test below fails on e500549, with this round's test files laid over its export, except the pins listed last. That
+run selected 34 tests: 24 failed, and the 10 that passed are those six pins and four earlier rounds' tests the
+selection also matched.
+- **R8:** `test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof[estimate|listing|both]`, and
+  `test_r4_a_real_failed_listing_is_no_proof` (a REAL EFAULT failure: the real libproc is given an invalid buffer
+  address, inside this process only).
+- **A1:** `test_a1_a_malformed_byte_count_is_no_proof[not-whole-pids|zero-slots|a-zero-slot]`,
+  `test_a1_only_the_buffered_call_answers_no_member`, and
+  `test_a1_a_stale_errno_is_not_the_listings_own_against_the_real_libproc`. That last one uses the REAL libproc: a
+  stale errno does not fail a clean answer, while the listing's own EFAULT does.
+- **R9, with REAL children of the test** (a leader that ignores SIGTERM, in a process group of its own in the test's
+  session):
+  - `test_r9_a_run_killed_at_shutdown_is_reported_ended_when_nothing_survives`: reported "ended" ("node shut down"),
+    gone from the state file, no line;
+  - `test_r9_a_run_whose_group_keeps_a_member_is_retained_past_the_bounded_wait`: the member is the test's own child,
+    ended through its own handle and not reaped, so a zombie. The watch is one window long (asserted), the run is
+    HELD, it is in the SAVED state file, the HUB still shows it running, and one line is written (A6);
+  - `test_r9_a_hosted_session_killed_at_shutdown_is_released_when_nothing_survives`: a real process as a hosted
+    session's, killed by the host's own KILL pass (A2).
+- **R9, with fakes:**
+  - `test_r9_one_shared_post_kill_deadline_for_every_killed_run`: three unproved runs cost the window once;
+  - `test_r9_the_stop_all_fallback_waits_for_its_kill_too`;
+  - `test_r9_the_sessions_fallback_after_their_kill_raised_still_releases_them` (A2).
+- **R10:**
+  - `test_r10_a_start_failed_read_at_the_reap_fails_only_its_own_message` (the review's two-message sequence);
+  - `test_r10_the_release_fence_refuses_admission_and_nothing_else`;
+  - `test_r10_the_fence_keeps_a_stopping_entry_and_fences_a_miss`;
+  - `test_r10_a_session_killed_by_the_nodes_shutdown_reads_its_last_lines_as_main_does` (the shutdown's final reads).
+- **R11:** `test_r11_a_runs_zombie_instant_logs_nothing`, `test_r11_a_run_held_past_the_bound_logs_once`, and
+  `test_r11_a_sessions_zombie_instant_logs_nothing_and_past_the_bound_once`.
+- **R12:** `test_r12_off_macos_the_membership_half_is_mains_liveness_probe` (with the platform patched, a REAL
+  child), and `test_r12_on_macos_a_libproc_load_failure_retains_and_says_so_once`.
+- **Pins that hold on e500549 too:** `test_a1_a_malformed_byte_count_is_no_proof[beyond-the-buffer]`,
+  `test_a1_a_short_listing_with_a_member_retains`, `test_r9_a_shutdown_that_needed_no_kill_does_not_wait`,
+  `test_r10_final_reads_that_raise_leave_the_token_held`, `test_r4_zero_with_errno_clear_is_an_empty_group`, and
+  `test_r4_an_errno_left_by_an_earlier_call_does_not_fail_a_clean_answer`.
+- **Two older pins changed by the rulings:**
+  - `test_c1_shutdown_keeps_a_group_that_survived_its_sigkill`: its bound is now the kill grace plus the one window;
+  - `test_s2_a_failed_final_read_still_says_the_hold_once`: the line now waits for the bound (R11), and the final
+    read raises on every pass, so the line can only come from the raising path.
+- **Pins the mutation check asked for** (23b34a5, below): `test_a1_a_part_pid_after_a_real_one_is_no_proof`,
+  `test_a1_a_malformed_answer_is_not_retried_into_proof`, `test_a1_a_negative_count_is_no_proof_whatever_errno_says`,
+  and `test_r9_the_nodes_watch_covers_the_sessions_it_killed`. The shared-deadline pin now also asserts that the
+  deadline, not the count of looks, ends the watch.
+
+#### Mutation check (review round 4)
+
+- **R8's 5 rows on 784f695:** all caught.
+- **This round's rows,** in `c1r5`'s set: A1 (4), R9 and A2 (6), R10 and A3 (8), R11 and A4 (4), R12 and A5 (3), and
+  16 re-anchored rows for earlier rounds' lines this round rewrote. The script now has 228 rows.
+- **On 40175cd,** with R8's rows again (A1 rewrote the code around them): 38 of 45 caught. The 7 misses were weak pins,
+  not dead code:
+  - a negative count, a part pid and an over-long count were each caught by A1's other checks, or retried into a later
+    answer, so each needed a pin of its own (one of them, an over-long count retried until some later call answered 0,
+    shows why the check is there);
+  - the watch's deadline was masked by its count of looks;
+  - S2's line came from a later pass that did not raise;
+  - the node's watch of killed sessions was masked by the host's own grace wait, which also polls.
+- **On 23b34a5,** which adds those pins, the 7 rows again: all caught.
+- The results are in scripts/steering-mutation-results.txt.
+
+#### Runs (C1 review round 4, on 23b34a5)
+
+Run 16:07 to 16:37, with load averages of 3.8 to 4.4. Claude Code 2.1.330 and codex-cli 0.172.0, run the way
+scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 54 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- **The parallel inner-loop suite** (on 40175cd's tree, before the four mutation pins): 5438 passed, 10 skipped, in
+  4 min 9 s.
+- **The full suite, serial, on 23b34a5:** 5442 passed, 10 skipped, in 12 min 45 s, the in-suite e2e test included.
+- **The `~/.codex/config.toml` hash** was be07f3845d522521 (the baseline since 12:37) before, after each real run and
+  at the end. There was no further change.
+- The protected files are unchanged.
+
+### C1: review round 5
+
+Sol's delta review of 5f90d53: CHANGES, 1 blocker and 2 shoulds. Then an amendment after Sol's pre-check of the
+rulings (A1 to A3). Everything else in round 4 was accepted as built, the `shutdown=True` branch included. Each
+reproduction below fails on 5f90d53, with REAL children of the test where a process is involved.
+
+#### R13 [blocker], with A1: the watch selects by "not yet proved gone"
+
+**The sequence** (Sol). A run's timeout pass KILLs it just before the node shuts down. By `kill_runs()` its leader
+is already reaped, so it was not in the list `kill_runs` returned, while a killed member is still listed as a zombie
+for an instant. The watch did not watch it, `report_stopped()` refused the release, and the shutdown "ended" report
+was skipped, though the group cleared well inside the second. Main reports it. A hosted session vetoed by an earlier
+KILL missed both watches the same way, and so did a run whose leader went on its SIGTERM (no KILL at all).
+
+**The fix: one question decides what is watched**, asked of every group the owner still tracks at that point: is it
+not yet proved gone (`_proved_gone`: the leader's exit seen by its own handle AND `group_absent`)?
+- **Runs:** every entry of `Node.running` (`await_kills`), on the node's main thread as before. The same in
+  `Node.stop_all`'s path.
+- **Hosted sessions, in the node's watch:** every session with a process handle (`SessionRunner.unproved`), read
+  under the runner's lock, the owner's serialization.
+- **Hosted sessions, in the host's own watch** (`SessionHost._stop_all`): every session of the shutdown that still
+  has its process, not only the ones its KILL pass killed now.
+- **Separate from signal eligibility.** `may_signal`, `local.killed`, the veto and `poll() is None` keep deciding
+  signals exactly as before, and decide nothing about the watch. `kill_runs()` and `sessions.kill()` are back to
+  main's form (they return nothing), since nothing else needed what they killed.
+- **Nothing unproved: no wait.** A shutdown where everything is already proved gone waits for nothing.
+- **The consequence.** A shutdown with a group that truly cannot be proved gone (a survivor, or a group HELD long
+  before) now spends the full shared window once. That covers a long-HELD group too (A1). The TERM-only case is
+  covered: a leader that exited on its SIGTERM, with a member still being reaped.
+- **"Once" for sessions too.** The host's own watch, which runs after the runs' reports, shares the node's deadline
+  (`sessions.shutdown(watched_until=...)`, then `stop_all(watched_until=...)`), so a session group that never clears
+  costs the window once, not twice. The host takes a fresh window only when its own KILL pass sends a KILL now (the
+  fallback route), or when it is not run by the node (`watched_until` None).
+
+**R13.5: other places where a decision about waiting or releasing reuses a signal-eligibility test.**
+
+| Place | Its test | What it decides | Verdict |
+| --- | --- | --- | --- |
+| `Node._reap` (node.py): `code is not None and group_alive and may_signal` | liveness and `may_signal` | main's survivor stop, or the release attempt | Keep. A run that may be signalled and whose group is alive takes main's survivor stop and makes no release attempt that pass; that attempt would be refused anyway (a member is there). A HELD run goes to the release attempt every pass. |
+| `SessionHost._reap`: `group_alive and (stopping_since or may_signal)` | the same | the same, for a session | Keep, for the same reason. |
+| `SessionHost._steps`, the HELD guard | `may_signal` with no stop's clock | no further step for a HELD session | Keep. It decides steps, not release: the reap ran just before it in that pass. |
+| The shutdown's grace waits: `runs_alive()`, `sessions.alive()` (`_going`), `_stop_all`'s `going(s)` | `poll() is None`, `group_alive` | when the TERM has worked, and so when to KILL | Main's: a signal decision. The post-KILL watch now covers what these do not (members still being reaped). |
+| `kill_runs()`, `sessions.kill()`, `_stop_all`'s KILL pass | `poll() is None`, `_going`, `may_signal` | who gets a KILL | Signals only. No longer feeds the watch. |
+| `_stop_all`'s exception path: `released = s.child is None` | none | a release step that raised | Not a signal test. |
+| `_reserved_stop`'s barrier on a registry miss | `poll() is None or group_alive` | whether to insert a barrier | Admission (the enabling PR's S3), not release. |
+| `_lingering` | `s.killed` | a log line | Logging only. |
+
+None decides a release by a signal test. The two reap branches can only postpone an attempt the proof would refuse.
+
+#### R14 [should], with A2: the bound and the claim, exact
+
+- **The lock is bounded.** `SessionRunner.unproved(budget)` takes the runner's lock with the watch's actual remaining
+  budget as its timeout, and makes one non-blocking attempt when none is left. Not taken, the look counts as "still
+  unproved" and decides nothing else. A raising look counts the same.
+- **Who can hold that lock then.** Only a pass that took it before `stopping` was set and is finishing its local
+  work: the host's tick, bounded by its drain deadline, or a child's git worktree command, bounded by its own timeout.
+  Never a hub call: the loop makes those outside the lock (`pass_once`: `_flush` and `_sync` come before and after
+  its locked section). The watchdog takes it only with LOCK_SLACK_SECONDS.
+- **The order is kept, and pinned** (A2: no reordering). When the sessions' first KILL pass raised, the node's watch
+  (which now also watches those sessions, still alive, so it spends the whole window) runs before
+  `sessions.shutdown()`, whose fallback KILL then comes after the runs' reports, as on main.
+  `test_r9_the_sessions_fallback_after_their_kill_raised_still_releases_them` pins the order: the runs' reports, then
+  the session's KILL.
+- **What is true now, stated exactly.** The watch adds no signal and reorders none. But it can delay a later
+  session fallback signal by up to POST_KILL_SECONDS of polling, and two serial watches (on that fallback route: the
+  node's, then the host's own after its fallback KILL) can add up to twice that, plus probe and scheduling overhead.
+  The sentences that said "no signal is delayed" are corrected: node.py `await_kills` and `shut_down`, the
+  POST_KILL_SECONDS comment in node_groups.py, and round 4's notes above.
+- **The total worst case added to a shutdown: 2 seconds** (2 x POST_KILL_SECONDS), plus probe and scheduling
+  overhead. The route that reaches it: the sessions' first KILL pass raises, so the node's watch spends its whole
+  window on those still-alive sessions; then, after the runs' reports and the host's own grace (main's), the host's
+  fallback KILL pass sends a KILL and takes a fresh window for a group that still cannot be proved gone. The second
+  route (Sol's review of this round): stopping the runs itself fails in `shut_down`, so `Node.stop_all()` spends one
+  window on its runs and `sessions.shutdown()`, handed no deadline on that route, can spend another on a session
+  group that cannot be proved gone. So: two polling windows on either fallback route; every other route adds at most
+  1 second. The runner-lock timeout bounds the acquisition only; probes and scheduling add their own overhead.
+
+#### R15 [should], with A3: an interrupt cannot leave a token FENCED
+
+- **The defect.** `release`'s `try`/`finally` began after `_admit_fence()`. An interrupt between the installation and
+  the `try` (the node's SIGTERM handler raises KeyboardInterrupt on the main thread) left the token FENCED, with
+  nothing to move it.
+- **The fix.** The installation is now inside the protected region. From its first instruction on, the token ends in
+  one of three states, never FENCED:
+
+| Where the interrupt lands | The token ends |
+| --- | --- |
+| Before the fence is installed | Exactly as it was. No HELD for a fence never set: the cleanup converts only a FENCED entry (`_held_if_fenced`). This is what the code before round 4 did too: it fenced first, outside the `try`. |
+| After the installation (inside `_admit_fence`, or right after its lock is released), during the final reads, or during the proof | HELD: admission fenced and numeric signals vetoed. |
+| After the proof held, `forget()` returned, before `_gone()` finished | The registry's removal completes in the `finally`, so no proved-gone group's entry is left with no record to retry it. Round 4 made that token HELD, with its owner's record already gone. |
+| A second interrupt inside that cleanup | Fail closed. The entry may stay, and its checkout admits nothing, for the rest of this node process. |
+
+- **Why failing closed there is right.** The only interrupt source on a releasing thread is the node's own SIGTERM or
+  Ctrl-C handler (`node.run`'s `on_term`). Python delivers signals to the main thread only, so the hosted sessions'
+  loop thread, where a session's reap releases, gets none. The process is then on its way out, and the entry goes
+  with it. No other interrupt source was found: the other handlers (cli.py, waiter.py) belong to other processes.
+  `release`'s docstring says this.
+- **One more consequence.** A `forget()` that raises after a True proof now still removes the registry entry (the
+  group IS proved gone). Neither owner's `forget()` can raise: one pops a dict entry, the other sets attributes.
+
+#### Tests (tests/test_ownership_c1.py)
+
+Each test below fails on 5f90d53, except the pins listed last.
+- **R13, with REAL children:**
+  - `test_r13_a_run_killed_by_an_earlier_pass_is_watched_at_shutdown[clears-in-the-window]`: the run's timeout pass
+    and grace pass stop and KILL it just before the shutdown, and its leader is reaped. The member, this test's own
+    child, is a zombie until the test reaps it inside the window. The run is reported "ended" ("node shut down"), gone
+    from the state file, and no line is written. This is (a).
+  - `...[never-clears]`: the same, but the member is not reaped in time. The shutdown spends the one window, then the
+    run is retained: HELD, on record, still "running" at the hub, said once. This is (d).
+  - `test_r13_a_run_that_ended_on_its_sigterm_is_watched_at_shutdown`: no KILL at all. This is (b).
+  - `test_r13_a_hosted_session_vetoed_by_an_earlier_kill_is_watched_at_shutdown`: the host's own watch. This is (c).
+- **R13 and R14, with fakes:**
+  - `test_r13_the_runners_watch_selects_every_session_not_yet_proved_gone` (a leader that exited by itself);
+  - `test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock`;
+  - `test_r14_the_watch_hands_the_sessions_its_remaining_budget`.
+- **R15:**
+  - `test_r15_an_interrupt_after_the_fence_is_installed_never_leaves_it_fenced[inside-the-installation|as-the-lock-is-released]`;
+  - `test_r15_an_interrupt_after_forget_still_completes_the_registry_cleanup`.
+- **Pins that hold on 5f90d53 too:**
+  - `test_r15_an_interrupt_before_the_fence_is_installed_leaves_the_token_as_it_was`;
+  - `test_r15_...[in-prepare|in-the-proof]`;
+  - `test_r14_a_session_group_that_never_clears_costs_the_shared_window_once`;
+  - the fallback-order assertion added to `test_r9_the_sessions_fallback_after_their_kill_raised_still_releases_them`.
+- **A fake changed:** `test_node_shutdown_signals_every_child_before_reporting_and_always_cleans_up_the_runs`
+  (test_hosted_sessions.py). Its stand-in for the sessions now takes `shutdown(watched_until=...)` and answers
+  `unproved`.
+
+#### Mutation check (review round 5)
+
+24 rows, on 52184bb: all caught.
+- **R13 (9):** the selection, reverted both to the killed runs and to a live leader; the sessions' and the host's
+  selections; each of the three watch sites (`shut_down`, `Node.stop_all`, the host); the shared deadline, on both
+  of its sides.
+- **R14 (4):** the lock taken with the budget; one non-blocking attempt when none is left; contention as still
+  unproved; the remaining budget handed on.
+- **R15 (4):** the installation inside the protected region; a cut installation; an interrupt before the
+  installation; the cleanup after `forget()`.
+- **7 re-anchored round-4 rows** whose lines this round rewrote.
+
+The script now has 239 rows. The results are in scripts/steering-mutation-results.txt.
+
+#### Runs (C1 review round 5, on 52184bb)
+
+Run 17:16 to 17:46, with load averages of 4.0 to 7.2. Claude Code 2.1.330 and codex-cli 0.172.0, run the way
+scripts/session-host-e2e.py runs them.
+
+| Run | Real CLIs | Stand-ins |
+| --- | --- | --- |
+| `--only steer` | PASS, 28 | PASS, 27 |
+| `--only steering` | PASS, 55 | PASS, 115 |
+| `--only correlation` | PASS, 23 | PASS, 24 |
+| `--only tree` | PASS, 101 | PASS, 143 |
+| Full e2e | not run | PASS, 395 |
+
+- **The parallel inner-loop suite:** 5456 passed, 10 skipped, in 4 min 14 s.
+- **The full suite, serial:** 5456 passed, 10 skipped, in 12 min 54 s, the in-suite e2e test included.
+- **The `~/.codex/config.toml` hash** was be07f3845d522521 (the baseline since 12:37) before, after each real run and
+  at the end. There was no further change.
+- The protected files are unchanged.
+
