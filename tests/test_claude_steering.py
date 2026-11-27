@@ -3520,18 +3520,20 @@ def test_r5_w_kills_and_fences_with_a_drain_pending_and_a_raising_or_stalling_sa
     from test_hosted_sessions import P2
     runner = env.node.sessions
     host = runner.host
+    from test_hosted_sessions import P3
     sid, child, n, s = _claude_partial_with_n_buffered(env)
-    sid2, c2, m2 = _ordinary_turn_in_flight(env, project=P2)
-    s2 = host.sessions[sid2]
-    c2.exits_on_terminate = False
-    with runner.lock:
-        host._stop(s2, env.clock())
-    env.clock.advance(host.kill_grace + 1)
+    due = []
+    for project in (P2, P3):        # (one group per save: a group's first KILL makes it proof-only, C1 R5)
+        sid2, c2, m2 = _ordinary_turn_in_flight(env, project=project)
+        s2 = host.sessions[sid2]
+        c2.exits_on_terminate = False
+        due.append(s2)
     stall = threading.Event()
-    for save in (lambda: (_ for _ in ()).throw(OSError("the disk is full")), lambda: stall.wait(10)):
+    for s2, save in zip(due, (lambda: (_ for _ in ()).throw(OSError("the disk is full")), lambda: stall.wait(10))):
+        with runner.lock:
+            host._stop(s2, env.clock())
+        env.clock.advance(host.kill_grace + 1)
         host._save_state = save
-        c2.killed = getattr(c2, "killed", False)
-        s2.killed = False
         t, done, ident, err = _on_watchdog(runner)
         assert done.wait(3), "the watchdog's pass returned"
         assert s2.killed, "the due SIGKILL was sent"
@@ -3744,8 +3746,10 @@ def test_r5_x_a_failed_handoff_keeps_its_lane(env):
 
 
 def test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded(henv, monkeypatch):
-    """Sol's blocker 3 (ruling Z): at shutdown a TERM-ignoring child whose KILL raises keeps its handle and its
-    group entry; its sibling is stopped; the final save records it; a later kill can stop it."""
+    """Sol's blocker 3 (ruling Z), with "Ownership until verified exit (C1)", review round 1, A1 (the name kept for
+    the record): at shutdown a TERM-ignoring child whose KILL raises keeps its handle and its group entry (HELD); its
+    sibling is stopped; the final save records it; and, delivery being uncertain, no later kill is sent by number
+    (identity-safe retries are C2 and C3)."""
     import json as _json
     (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
     host = henv.host
@@ -3765,7 +3769,7 @@ def test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded(henv, monkey
     c1.kill = real_kill
     henv.clock.advance(host.kill_grace + 1)
     host.kill_due()
-    assert c1.killed or getattr(c1, "kills", 0), "a later kill stops it"
+    assert not c1.killed and host.groups.state(token) == host.groups.HELD, "HELD: no later kill by number (A1)"
 
 
 def test_r5_z_a_failed_final_save_keeps_the_earlier_record(henv, monkeypatch):
@@ -4241,9 +4245,10 @@ def test_r6_n4_known_limit_a_registry_wait_ahead_of_the_kill_step(env):
 
 
 def test_r6_n4_known_limit_a_kill_that_returns_with_survivors_releases_ownership(henv, monkeypatch):
-    """Known limit (round 6, N4; main e6b421f's behaviour): at shutdown a KILL that returns while members of the
-    group survive (a no-op signal, or one not yet delivered): the session lets go of its handle, its group entry
-    and its record, as main does; its sibling is stopped. (A KILL that RAISES keeps the group: round 5.)"""
+    """Known limit (round 6, N4), CLOSED by "Ownership until verified exit (C1)" (the name kept for the record): at
+    shutdown a KILL that returns while members of the group survive (a no-op signal, or one not yet delivered): the
+    session now KEEPS its handle, its group entry and its record until its group is proved gone; its sibling is
+    stopped. (A KILL that RAISES keeps the group too: round 5.)"""
     import json as _json
     (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
     host = henv.host
@@ -4253,8 +4258,8 @@ def test_r6_n4_known_limit_a_kill_that_returns_with_survivors_releases_ownership
     token = s1.group_token
     host.stop_all()
     assert s2.child is None, "the sibling is stopped"
-    assert s1.child is None and not any(token in g for g in host.groups.entries.values()), "pinned: released"
-    assert s1.session_id not in _json.loads(host._state_path().read_text()), "pinned: no record kept"
+    assert s1.child is c1 and any(token in g for g in host.groups.entries.values()), "kept (C1)"
+    assert s1.session_id in _json.loads(host._state_path().read_text()), "its record kept (C1)"
 
 
 # ---------------------------------------------------------------- review round 7
@@ -4878,7 +4883,7 @@ def test_r9_e2_a_registry_miss_is_not_a_verified_exit(henv, monkeypatch, process
     child.emit(owned(n, text="N"))
     henv.host.tick()
     henv.clock.advance(21)
-    henv.host.groups.gone(s.group_token)        # (the registry lost its entry)
+    henv.host.groups._gone(s.group_token)        # (the registry lost its entry)
     if process == "gone":
         child.code = 0
     henv.host._hold_cut(s, henv.clock(), henv.host._outbox, drain=False)

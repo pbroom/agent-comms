@@ -254,6 +254,7 @@ def test_a_turn_past_the_timeout_is_terminated_and_failed_and_the_next_message_r
 def test_a_process_that_ignores_sigterm_is_killed_after_the_grace_period_before_anything_restarts(henv):
     s = open_session(henv)
     stubborn = FakeSessionChild(2000, exits_on_terminate=False)
+    stubborn.kill_exits_at_once = True      # (main's grace timing, with the kill's exit seen in that same pass)
     henv.host.spawner = lambda argv, **kw: stubborn
     first = henv.host.send(SID, "first")
     queued = henv.host.send(SID, "queued")
@@ -335,6 +336,7 @@ def test_a_session_confirmed_while_its_process_is_being_stopped_resumes(henv):
     """Claude refuses --session-id for a session that exists ("already in use"), so a late init must still count."""
     s = open_session(henv)
     stubborn = FakeSessionChild(2000, exits_on_terminate=False)
+    stubborn.kill_exits_at_once = True      # (the kill's exit seen in the pass that sends it)
     henv.host.spawner = lambda argv, **kw: stubborn
     first = henv.host.send(SID, "first")
     henv.host.tick()

@@ -1,28 +1,232 @@
-# The output of scripts/steering-mutation-check.py for the follow-ups after #119 (DESIGN_NOTES "After #119: follow-ups"):
-# only the rows for the product code this PR changed (A1, A3), then A1's two edge rows (Sol's should). The whole set (162
-# rows) last ran in round 6. The enabling PR's runs: 21 rows on d704cbf and 14 on 1a37582, all caught. Run on ae147aa: all
-# 4 caught. Run on fdad401 (the edge pins): all 3 caught. The existing row "A1 only that session incarnation's" is caught
-# first by test_s5c_...; it is also caught by the new other-generation pin alone.
+# The output of scripts/steering-mutation-check.py for "Ownership until verified exit (C1)" (DESIGN_NOTES): C1's rows, then
+# review round 1's rows (HELD, its fence, every signal site that asks it, and four re-anchored C1 rows). The whole set
+# (188 rows) last ran in round 6.
+# - On 5d692a2: 22 of 23 caught. The reap's survivor-stop row was missed: for signals it is equivalent, since _stop also
+#   checks HELD, but it let the reap decide the turn. Two of the run's rows were caught only by the slow stand-in e2e
+#   test, not by a targeted test.
+# - 83d9632 adds targeted pins for all three, and they are caught.
 
-commit ae147aa
-CAUGHT  A1 a close's session's earlier watched events go first  test_a1_a_close_of_the_self_stopped_session_follows_its_watched_turn_end[codex]
-CAUGHT  A1 only that session incarnation's  test_s5c_a_handoff_inside_reconciliation_keeps_lost_ahead_of_a_watched_terminal[True]
-CAUGHT  A3 the reap settles an armed hold whose decision never ran  test_a3_after_a_raising_commit_the_verified_reap_settles_the_held_end
-CAUGHT  A3 an undecided hold is finalized at the reap  test_a3_after_a_raising_commit_the_verified_reap_settles_the_held_end
-rows: 4
+commit 59cace3
+CAUGHT  C1 the rule releases only on proof  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1 a proof that raises retains  test_c1_the_rule_releases_nothing_without_proof[raises]
+CAUGHT  C1 only a complete empty listing is absence  test_c1_a_truncated_listing_is_not_proof
+CAUGHT  C1 a filled buffer is not a complete listing  test_c1_a_truncated_listing_is_not_proof
+CAUGHT  C1 the session's proof needs the leader's exit observed  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1 the session's proof needs the group's absence  test_c1_shutdown_keeps_a_group_that_survived_its_sigkill
+CAUGHT  C1 the reap keeps what is not proved gone  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+CAUGHT  C1 shutdown keeps what is not proved gone  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+MISSED  C1 a retained process is left alone
+CAUGHT  C1 the run's proof needs the group's absence  test_c1_report_stopped_keeps_a_run_whose_group_survived_its_kill
+CAUGHT  C1 the run's reap keeps what is not proved gone  test_a_fake_childs_pid_that_names_a_live_process_group_on_the_machine_does_not_fool_the_node
+CAUGHT  C1 report_stopped keeps what is not proved gone  test_c1_report_stopped_keeps_a_run_whose_group_survived_its_kill
+rows: 12
+stale or broken: []
+missed: ['C1 a retained process is left alone']
+exit 0
+
+commit 16a641e
+CAUGHT  C1 a retained process is left alone  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+rows: 1
 stale or broken: []
 missed: []
 exit 0
 
-commit fdad401
-CAUGHT  A1 only that session incarnation's  test_s5c_a_handoff_inside_reconciliation_keeps_lost_ahead_of_a_watched_terminal[True]
-CAUGHT  A1 only earlier watched events  test_a1_a_watched_event_published_after_the_ended_is_not_promoted
-CAUGHT  A1 the generation counts  test_a1_a_watched_event_of_another_generation_is_not_promoted
+commit 5d692a2
+CAUGHT  R1 start refuses a HELD checkout  test_c1_shutdown_keeps_a_group_that_survived_its_sigkill
+CAUGHT  R1 blocked sees a HELD checkout  test_c1_shutdown_keeps_a_group_that_survived_its_sigkill
+CAUGHT  R2 HELD never goes back to STOPPING  test_r2_held_is_sticky_until_the_proof_is_true[false]
+CAUGHT  R2 try_stopping leaves a HELD entry as it is  test_r2_held_is_sticky_until_the_proof_is_true[false]
+CAUGHT  A2 a refused release makes the token HELD  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  A3 a refused release fences a missing entry  test_a3_a_refused_release_with_its_entry_missing_still_fences_the_checkout
+CAUGHT  R2 the one predicate reads HELD  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  R2 the HELD index is kept  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+MISSED  R2 the reap's survivor stop only while it may be signalled  
+CAUGHT  R2 _stop sends nothing to a HELD record  test_r2_a_held_session_is_never_signalled_by_number_again[cancel]
+CAUGHT  R2 the kill scan skips a HELD record  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  R2 shutdown's KILL pass skips a HELD record  test_r2_a_held_session_is_never_signalled_by_number_again[shutdown]
+CAUGHT  R2 a HELD session takes no further step  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+CAUGHT  A3 the session's fence  test_a3_a_refused_release_with_its_entry_missing_still_fences_the_checkout
+CAUGHT  R2 the runner's TERM step skips a HELD session  test_r2_the_runners_shutdown_steps_never_signal_a_held_session
+CAUGHT  R2 the runner's KILL step skips a HELD session  test_r2_the_runners_shutdown_steps_never_signal_a_held_session
+CAUGHT  R2 the run's _stop sends nothing to a HELD run  test_r2_a_held_run_is_never_signalled_by_number_again[signal_runs]
+CAUGHT  R2 the run's reap survivor stop only while it may be signalled  test_the_end_to_end_script_passes_with_the_stand_in
+CAUGHT  A3 the run's fence  test_the_end_to_end_script_passes_with_the_stand_in
+CAUGHT  C1 the rule releases only on proof (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1 a proof that raises retains (re-anchored)  test_c1_the_rule_releases_nothing_without_proof[raises]
+CAUGHT  C1 the session's proof needs the leader's exit observed (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1 the session's proof needs the group's absence (re-anchored)  test_c1_shutdown_keeps_a_group_that_survived_its_sigkill
+rows: 23
+stale or broken: []
+missed: ["R2 the reap's survivor stop only while it may be signalled"]
+exit 0
+
+commit 83d9632
+CAUGHT  R2 the reap's survivor stop only while it may be signalled  test_r2_a_held_session_is_never_signalled_by_number_again[reap]
+CAUGHT  R2 the run's reap survivor stop only while it may be signalled  test_r2_a_held_runs_reap_takes_no_survivor_stop
+CAUGHT  A3 the run's fence  test_a3_a_runs_refused_release_with_its_entry_missing_still_fences_the_checkout
 rows: 3
 stale or broken: []
 missed: []
 exit 0
-existing row 'A1 only that session incarnation's' against pin 2 alone: FAILS (caught)
+
+# Round 2 of C1's review (appended below the round-1 results):
+# - 15 rows on 4256afc: 13 caught. Three KILL-site rows (shutdown's pass, the runner's step, the run's) were caught
+#   only by the slow stand-in e2e test. Two A1 rows were missed: the bounded publication runs first in every tick,
+#   so the early return could not be seen there, and the survivor branch differs only in the registry state.
+# - 8d9ea81 adds targeted pins, and all five are caught by them.
+
+commit 4256afc
+CAUGHT  R5 the kill scan vetoes at its attempt  test_r5_after_the_first_kill_no_numeric_signal_reaches_the_group_again[pass-False]
+CAUGHT  R5 shutdown's KILL pass vetoes at its attempt  test_the_end_to_end_script_passes_with_the_stand_in
+CAUGHT  R5 the runner's KILL step vetoes at its attempt  test_the_end_to_end_script_passes_with_the_stand_in
+CAUGHT  R5 the run's KILL vetoes at its attempt  test_the_end_to_end_script_passes_with_the_stand_in
+CAUGHT  R5 the veto writes the HELD index  test_r5_after_the_first_kill_no_numeric_signal_reaches_the_group_again[pass-False]
+CAUGHT  R6 the rule fences before the proof  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+CAUGHT  A3 the reap's last reads come after the fence  test_r6_a3_the_fence_is_in_before_the_reaps_drain
+MISSED  A1 a stopping HELD session keeps main's steps  
+MISSED  A1 the reap keeps main's survivor branch for a stopping session  
+CAUGHT  C1 the reap keeps what is not proved gone (re-anchored)  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+CAUGHT  A2 a refused release makes the token HELD (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  A3 a refused release fences a missing entry (re-anchored)  test_a3_a_refused_release_with_its_entry_missing_still_fences_the_checkout
+CAUGHT  R2 the HELD index is kept (re-anchored)  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+CAUGHT  R2 the reap's survivor stop only while it may be signalled (re-anchored)  test_r2_a_held_session_is_never_signalled_by_number_again[reap]
+CAUGHT  R2 a HELD session takes no further step (re-anchored)  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+rows: 15
+stale or broken: []
+missed: ["A1 a stopping HELD session keeps main's steps", "A1 the reap keeps main's survivor branch for a stopping session"]
+exit 0
+
+commit 8d9ea81
+CAUGHT  R5 shutdown's KILL pass vetoes at its attempt  test_r5_shutdowns_kill_pass_vetoes_at_its_attempt
+CAUGHT  R5 the runner's KILL step vetoes at its attempt  test_r5_the_runners_kill_step_vetoes_what_follows_it
+CAUGHT  R5 the run's KILL vetoes at its attempt  test_r5_after_a_runs_first_kill_nothing_more_is_sent[reap]
+CAUGHT  A1 a stopping HELD session keeps main's steps  test_r5_a1_a_killed_group_that_outlives_its_kill_is_still_said_in_the_log
+CAUGHT  A1 the reap keeps main's survivor branch for a stopping session  test_r5_a1_a_killed_group_that_outlives_its_kill_is_still_said_in_the_log
+rows: 5
+stale or broken: []
+missed: []
+exit 0
+
+# Round 3 of C1's review: the one changed product line (S2), on f3128ff: caught.
+
+commit f3128ff
+CAUGHT  S2 a failed final read still says the hold once  test_s2_a_failed_final_read_still_says_the_hold_once
+rows: 1
+stale or broken: []
+missed: []
+exit 0
+
+# Review round 4 of C1 (the PR's reviews). R8's rows on 784f695; then R8's and this round's rows on 40175cd (38 of 45
+# caught: seven pins were too weak against A1's layered checks, the watch's count bound, the S2 raising path and the
+# node's watch of killed sessions); then those seven again on 23b34a5, which adds the pins: all caught.
+
+commit 784f695
+CAUGHT  R4 errno is cleared before each call  test_r4_zero_with_errno_clear_is_an_empty_group
+CAUGHT  R4 a zero with errno set is a failure  test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof[estimate]
+CAUGHT  R4 a negative result is a failure  test_c1_a_failed_or_refused_listing_is_not_proof
+CAUGHT  R4 the estimate's failure is no proof  test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof[estimate]
+CAUGHT  R4 the listing's failure is no proof  test_c1_a_failed_or_refused_listing_is_not_proof
+rows: 5
+stale or broken: []
+missed: []
+exit 0
+
+commit 40175cd
+CAUGHT  R4 errno is cleared before each call  test_r4_zero_with_errno_clear_is_an_empty_group
+CAUGHT  R4 a zero with errno set is a failure  test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof[estimate]
+MISSED  R4 a negative result is a failure  
+CAUGHT  R4 the estimate's failure is no proof  test_r4_a_listing_that_fails_with_zero_and_errno_is_no_proof[estimate]
+MISSED  C1R5A1 a count that is no whole number of pids is no proof  
+MISSED  C1R5A1 a count beyond the buffer is no proof  
+CAUGHT  C1R5A1 a slot with no pid is no proof  test_a1_a_malformed_byte_count_is_no_proof[zero-slots]
+CAUGHT  C1R5 the listing's failure is no proof (A1's form)  test_c1_a_failed_or_refused_listing_is_not_proof
+MISSED  C1R5 S2 a failed final read still says the hold (past the bound)  
+CAUGHT  C1R5 a filled buffer is not a complete listing (re-anchored)  test_r4_group_absent_against_real_children_of_this_test
+CAUGHT  C1R5 the session's proof needs the leader's exit observed (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1R5 the session's proof needs the group's absence (re-anchored)  test_c1_shutdown_keeps_a_group_that_survived_its_sigkill
+CAUGHT  C1R5 the run's proof needs the leader's exit observed  test_c1_report_stopped_keeps_a_run_whose_group_survived_its_kill
+CAUGHT  C1R5 the run's proof needs the group's absence (re-anchored)  test_r1_a_retained_run_fences_its_checkout_until_the_proof
+CAUGHT  C1R5 a proof that raises retains (re-anchored)  test_c1_the_rule_releases_nothing_without_proof[raises]
+CAUGHT  C1R5 the rule fences admission before the final reads (re-anchored)  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+CAUGHT  C1R5 the rule releases only on proof (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1R5 the veto writes the HELD index (re-anchored)  test_r5_after_the_first_kill_no_numeric_signal_reaches_the_group_again[pass-False]
+CAUGHT  C1R5 N stop_all per session (re-anchored)  test_r3_n_a_bulk_stop_survives_one_sessions_fault[stop_all]
+CAUGHT  C1R5 R7-2 the replay after the last SIGKILL, not before (re-anchored)  test_r7_2_what_a_process_wrote_last_reaches_its_transcript_at_shutdown
+CAUGHT  C1R5 R2 try_stopping leaves a HELD entry as it is (re-anchored)  test_r2_held_is_sticky_until_the_proof_is_true[false]
+CAUGHT  C1R5 R2 _stop sends nothing to a HELD record (re-anchored)  test_r2_a_held_session_is_never_signalled_by_number_again[cancel]
+CAUGHT  C1R5 R2 the run's _stop sends nothing to a HELD run (re-anchored)  test_r2_a_held_run_is_never_signalled_by_number_again[signal_runs]
+CAUGHT  C1R5 report_stopped keeps what is not proved gone (re-anchored)  test_r9_a_run_whose_group_keeps_a_member_is_retained_past_the_bounded_wait
+CAUGHT  C1R5R9 the node watches its killed runs  test_r9_a_run_killed_at_shutdown_is_reported_ended_when_nothing_survives
+CAUGHT  C1R5R9 the kill pass names what it killed  test_r9_a_run_killed_at_shutdown_is_reported_ended_when_nothing_survives
+MISSED  C1R5R9 the deadline ends the watch  
+MISSED  C1R5A2 the node's watch covers the killed sessions  
+MISSED  C1R5A2 the sessions' kill names what it killed  
+CAUGHT  C1R5A2 the host watches its own kill pass  test_r9_a_hosted_session_killed_at_shutdown_is_released_when_nothing_survives
+CAUGHT  C1R5R10 the release fence is not HELD  test_r10_a_start_failed_read_at_the_reap_fails_only_its_own_message
+CAUGHT  C1R5R10 a LIVE entry is fenced  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+CAUGHT  C1R5R10 a missing entry is fenced  test_r10_the_fence_keeps_a_stopping_entry_and_fences_a_miss
+CAUGHT  C1R5R10 a FENCED entry refuses admission  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+CAUGHT  C1R5R10 a refused proof makes it HELD  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1R5R10 a FENCED entry is reserved as the LIVE one it was  test_r10_the_fence_keeps_a_stopping_entry_and_fences_a_miss
+CAUGHT  C1R5R10 the shutdown's stop of a vetoed group keeps main's bookkeeping  test_r10_a_session_killed_by_the_nodes_shutdown_reads_its_last_lines_as_main_does
+CAUGHT  C1R5R10 a HELD group gets no shutdown clock  test_r2_a_held_session_is_never_signalled_by_number_again[shutdown]
+CAUGHT  C1R5R11 the line waits for the bound  test_r11_a_runs_zombie_instant_logs_nothing
+CAUGHT  C1R5R11 the line is written once  test_s2_a_failed_final_read_still_says_the_hold_once
+CAUGHT  C1R5R11 the shutdown says what it keeps  test_r9_a_run_whose_group_keeps_a_member_is_retained_past_the_bounded_wait
+CAUGHT  C1R5R11 report_stopped is final  test_r9_a_run_whose_group_keeps_a_member_is_retained_past_the_bounded_wait
+CAUGHT  C1R5R12 off macOS, main's liveness probe  test_r12_off_macos_the_membership_half_is_mains_liveness_probe
+CAUGHT  C1R5A5 a libproc load failure is no proof  test_c1_no_libproc_is_not_proof
+CAUGHT  C1R5A5 a load failure is said once  test_r12_on_macos_a_libproc_load_failure_retains_and_says_so_once
+rows: 45
+stale or broken: []
+missed: ['R4 a negative result is a failure', 'C1R5A1 a count that is no whole number of pids is no proof', 'C1R5A1 a count beyond the buffer is no proof', 'C1R5 S2 a failed final read still says the hold (past the bound)', 'C1R5R9 the deadline ends the watch', "C1R5A2 the node's watch covers the killed sessions", "C1R5A2 the sessions' kill names what it killed"]
+exit 0
+
+commit 23b34a5
+CAUGHT  R4 a negative result is a failure  test_a1_a_negative_count_is_no_proof_whatever_errno_says
+CAUGHT  C1R5A1 a count that is no whole number of pids is no proof  test_a1_a_part_pid_after_a_real_one_is_no_proof
+CAUGHT  C1R5A1 a count beyond the buffer is no proof  test_a1_a_malformed_answer_is_not_retried_into_proof
+CAUGHT  C1R5 S2 a failed final read still says the hold (past the bound)  test_s2_a_failed_final_read_still_says_the_hold_once
+CAUGHT  C1R5R9 the deadline ends the watch  test_r9_one_shared_post_kill_deadline_for_every_killed_run
+CAUGHT  C1R5A2 the node's watch covers the killed sessions  test_r9_the_nodes_watch_covers_the_sessions_it_killed
+CAUGHT  C1R5A2 the sessions' kill names what it killed  test_r9_the_nodes_watch_covers_the_sessions_it_killed
+rows: 7
+stale or broken: []
+missed: []
+exit 0
+
+# Review round 5 of C1: R13 (the watch's selection and its three sites, the shared deadline), R14 (the lock's bound,
+# the budget), R15 (the protected release), and 7 re-anchored round-4 rows, on 52184bb: all 24 caught.
+
+commit 52184bb
+CAUGHT  C1R6 R13 the node watches every run not yet proved gone (not only the killed ones)  test_r13_a_run_that_ended_on_its_sigterm_is_watched_at_shutdown
+CAUGHT  C1R6 R13 the node watches a run whose leader is already reaped  test_r9_a_run_whose_group_keeps_a_member_is_retained_past_the_bounded_wait
+CAUGHT  C1R6 R13 the sessions' watch selects every session with a handle  test_r13_the_runners_watch_selects_every_session_not_yet_proved_gone
+CAUGHT  C1R6 R13 the host's watch selects every live session, not only this pass's kills  test_r13_a_hosted_session_vetoed_by_an_earlier_kill_is_watched_at_shutdown
+CAUGHT  C1R6 R13 shut_down watches  test_r9_a_run_killed_at_shutdown_is_reported_ended_when_nothing_survives
+CAUGHT  C1R6 R13 Node.stop_all watches  test_r9_the_stop_all_fallback_waits_for_its_kill_too
+CAUGHT  C1R6 R13 the host watches  test_r9_a_hosted_session_killed_at_shutdown_is_released_when_nothing_survives
+CAUGHT  C1R6 R13 the host shares the node's deadline  test_r14_a_session_group_that_never_clears_costs_the_shared_window_once
+CAUGHT  C1R6 R13 the node hands its deadline to the host  test_r14_a_session_group_that_never_clears_costs_the_shared_window_once
+CAUGHT  C1R6 R14 the runner lock is taken with the watch's budget  test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock
+CAUGHT  C1R6 R14 no budget left: one non-blocking attempt  test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock
+CAUGHT  C1R6 R14 contention counts as still unproved  test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock
+CAUGHT  C1R6 R14 the sessions are given what is left of the window  test_r14_the_watch_hands_the_sessions_its_remaining_budget
+CAUGHT  C1R6 R15 the installation is inside the protected region  test_r15_an_interrupt_after_the_fence_is_installed_never_leaves_it_fenced[inside-the-installation]
+CAUGHT  C1R6 R15 a cut installation leaves no FENCED entry  test_r15_an_interrupt_after_the_fence_is_installed_never_leaves_it_fenced[inside-the-installation]
+CAUGHT  C1R6 R15 an interrupt before the installation leaves the token as it was  test_r15_an_interrupt_before_the_fence_is_installed_leaves_the_token_as_it_was
+CAUGHT  C1R6 R15 a proved release completes its cleanup  test_r15_an_interrupt_after_forget_still_completes_the_registry_cleanup
+CAUGHT  C1R6 the release fence is not HELD (re-anchored)  test_r10_a_start_failed_read_at_the_reap_fails_only_its_own_message
+CAUGHT  C1R6 the rule fences admission before the final reads (re-anchored)  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+CAUGHT  C1R6 a refused proof makes it HELD (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1R6 the rule releases only on proof (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  C1R6 the deadline ends the watch (re-anchored)  test_r9_one_shared_post_kill_deadline_for_every_killed_run
+CAUGHT  C1R6 the node's watch covers the sessions (re-anchored)  test_r9_the_nodes_watch_covers_the_sessions_it_killed
+CAUGHT  C1R6 R7-2 the replay after the last SIGKILL, not before (re-anchored)  test_r7_2_what_a_process_wrote_last_reaches_its_transcript_at_shutdown
+rows: 24
+stale or broken: []
+missed: []
+exit 0
 
 # Host-side logging (PR-B; DESIGN_NOTES "Host-side logging"): the rows re-anchored on the code it changed, the
 # successors of the rows on code it deleted (3 rows of the deleted logging code had none and are gone: their

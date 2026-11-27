@@ -1061,6 +1061,31 @@ def test_r18_every_host_lock_and_hostlogs_own_lock_is_entered_by_c_code():
         assert not problems, [f"{path.name}:{ln}: {what}" for ln, what in problems]
 
 
+def test_nothing_in_the_host_side_modules_waits_for_the_writer_but_the_final_wait():
+    """The merge of C1 (#122): its shutdown watches (`Node.await_kills`, the host's own watch in `SessionHost.stop_all`,
+    `SessionRunner.unproved`) run on the node's main thread, which is enqueue-only for the whole run: they never wait
+    for the log writer or enter a handler. Statically, over every host-side module: the only calls of hostlog's
+    waiting or starting functions are `node.run`'s eager start and `_exit_if_stalled`'s final wait; and the three
+    watches exist (so this pin covers them) and call none of them. (A handler is entered only by the writer: the
+    loggers are hostlog's, pinned by `test_the_host_side_modules_take_their_loggers_from_hostlog`.)"""
+    import ast
+    waits = {"flush", "final_flush", "start_writer", "_acknowledge", "_wait_for", "_lazy_start", "_reset"}
+    found, defined = set(), set()
+    for rel in HOST_SIDE:
+        if rel == "hostlog.py":
+            continue
+        tree, _ = _module(rel)
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef):
+                defined.add((rel, fn.name))
+                for n in ast.walk(fn):
+                    if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in waits
+                            and ast.unparse(n.func.value) == "hostlog"):
+                        found.add((rel, fn.name, n.func.attr))
+    assert found == {("node.py", "run", "start_writer"), ("node.py", "_exit_if_stalled", "final_flush")}, found
+    assert {("node.py", "await_kills"), ("session_host.py", "stop_all"), ("node_sessions.py", "unproved")} <= defined
+
+
 @pytest.mark.parametrize("src", [
     "from . import hostlog\nclass A:\n    def f(self):\n        with self.lock:\n            pass\n",
     "from . import hostlog\nclass A:\n    def f(self):\n        with self.lock, hostlog.BOUNDARY:\n            pass\n",

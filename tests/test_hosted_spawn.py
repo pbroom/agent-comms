@@ -2185,6 +2185,7 @@ def test_r6_rule1_a_sessions_process_is_not_started_where_a_run_of_this_node_is_
     senv.node.tick()
     [run] = senv.node.spawner.children
     run.exits_on_terminate = False
+    run.kill_exits_at_once = True           # (its kill's exit is seen on the next pass)
     senv.node._stop(senv.node.running["node-run-1"], "terminate")
     sid = start(senv)["session_id"]
     tick(senv, times=2)
@@ -2608,6 +2609,7 @@ def test_r8_s32_a_kill_without_a_terminate_still_holds_the_runs_checkout(senv):
     _assign(senv)
     senv.node.tick()
     [run] = senv.node.spawner.children
+    run.kill_exits_at_once = True           # (its kill's exit is seen on the next pass)
     senv.groups.add(run.pid)
     senv.node._stop(senv.node.running["node-run-1"], "kill")    # the hub's kill, its terminate never seen
     assert run.killed and os.path.realpath(str(senv.work)) in senv.node.sessions.stopping_checkouts()
@@ -2757,6 +2759,7 @@ def test_r9_s33_a_session_waiting_for_its_checkout_stops_no_idle_process_for_a_s
     _assign(env)
     env.node.tick()
     [run] = env.node.spawner.children
+    run.kill_exits_at_once = True           # (its kill's exit is seen on the next pass)
     env.groups.add(run.pid)
     env.node._stop(env.node.running["node-run-1"], "kill")     # the run's group outlives its kill, in env.work
     waiting = start(env)["session_id"]

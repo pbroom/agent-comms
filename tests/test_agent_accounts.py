@@ -1358,11 +1358,11 @@ def test_a_retry_of_the_same_assignment_after_a_failed_start_succeeds(tmp_path, 
     nenv.d.tick()
     real_start, held = nenv.node.groups.start, [True]
 
-    def start_once_held(cwd, token, spawn):
+    def start_once_held(cwd, token, spawn, **kw):
         if held:
             held.clear()
             return False, None          # a process group is still being stopped in that checkout: try again later
-        return real_start(cwd, token, spawn)
+        return real_start(cwd, token, spawn, **kw)
     monkeypatch.setattr(nenv.node.groups, "start", start_once_held)
     nenv.node.tick()
     assert nenv.node_spawner.calls == []

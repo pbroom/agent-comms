@@ -1784,7 +1784,7 @@ class SessionRunner:
         self.stopping.set()     # (R4-01: every held steer record is marked first: no steer byte after this)
         with hostlog.BOUNDARY, self.lock:
             for s in self.host.sessions.values():
-                if s.child is not None:
+                if s.child is not None and self.host.groups.may_signal(s.group_token):     # (C1: never a HELD one)
                     try:
                         s.child.terminate()
                     except Exception:
@@ -1800,17 +1800,45 @@ class SessionRunner:
 
     def kill(self) -> None:
         """After `signal()` and the grace period: SIGKILL for every session process group that is still there. No
-        reporting; `shutdown()` then finds them gone."""
+        reporting; `shutdown()` then finds them gone. (C1, review round 3, S1) The veto set here may fall on a token
+        still LIVE in the registry (`signal()` sends its TERM without marking it STOPPING). That leaves no admission
+        bypass, by this precondition: from `stopping` (set by `signal()`) on, nothing starts a group. The loop's pass
+        and the watchdog return on `stopping` before touching the host, and dispatched runs are admitted only by
+        `Node.tick`, on the thread that is running this shutdown (node.py `run`, then `shut_down`)."""
         with hostlog.BOUNDARY, self.lock:
             for s in self.host.sessions.values():
-                if self._going(s):
+                if self._going(s) and self.host.groups.may_signal(s.group_token):     # (C1: never a HELD one)
+                    self.host.groups.veto(s.group_token)     # (C1, R5: from this attempt on, proof-only)
                     s.child.kill()
 
-    def shutdown(self) -> None:
+    def unproved(self, budget: float) -> bool:
+        """(C1, review rounds 4 and 5, R9, A2, R13 and R14) For the node's one post-KILL watch (node.py `shut_down`):
+        is any session that still has a process handle not yet proved gone (its leader's exit seen by its own handle
+        and no member listed, `SessionHost._proved_gone`)? Every such session, whoever sent its KILL and whether or
+        not one was sent: a session vetoed by an earlier pass, or one whose leader went on its SIGTERM, counts as much
+        as one killed just now. The handles are read under the runner's lock (the owner's serialization), taken with
+        the watch's remaining `budget` as its timeout (one non-blocking attempt when none is left): not taken, the
+        look says "still unproved" and decides nothing else. Who can hold it then: a pass that took it before
+        `stopping` was set and is finishing its local work (the host's tick, bounded by its drain deadline; a child's
+        git worktree command, bounded by its own timeout); never a hub call, which the loop makes outside it. An
+        observation only: nothing is signalled or released here."""
+        with hostlog.BOUNDARY:      # (R18.2: the native timed acquire and release, in main's shape, in a boundary)
+            got = self.lock.acquire(timeout=budget) if budget > 0 else self.lock.acquire(blocking=False)
+            if not got:
+                return True
+            try:
+                return any(s.child is not None and not self.host._proved_gone(s.child)
+                           for s in self.host.sessions.values())
+            finally:
+                self.lock.release()
+
+    def shutdown(self, watched_until: float | None = None) -> None:
         """Stop the loop and every session process; turns in flight are reported failed. The loop may be waiting at
         the hub: it is given JOIN_SECONDS, then the host is taken from it (it checks `stopping` before touching the
         host again). From `stopping` on the loop posts nothing (`_flush`), so what it had not reported yet and what
-        the shutdown adds go to the hub from here, in order, as one queue."""
+        the shutdown adds go to the hub from here, in order, as one queue. `watched_until` (review round 5, R13): the
+        deadline of the node's post-KILL watch, which already watched these sessions; the host's own watch shares it
+        unless its own KILL pass sends a KILL now (`SessionHost.stop_all`)."""
         self.stopping.set()
         if self.thread is not None:
             self.thread.join(JOIN_SECONDS)
@@ -1826,7 +1854,7 @@ class SessionRunner:
             if back:
                 self._save_handed()
             try:
-                self.host.stop_all()
+                self.host.stop_all(watched_until=watched_until)
             except Exception:
                 # (Ruling M; review round 5, ruling X) what stop_all decided, whether it returned or raised, is in the
                 # host's outbox until the node takes it: delivered below, by `_emit`'s one handoff

@@ -362,7 +362,7 @@ def test_s2_a_raising_commit_after_the_reservation_still_escalates(henv, monkeyp
 def _cut_with_the_entry_missing(henv, monkeypatch, token):
     s, child = _held(henv, monkeypatch)
     child.exits_on_terminate = False
-    henv.host.groups.gone(s.group_token)        # (the registry has no entry for this live group)
+    henv.host.groups._gone(s.group_token)        # (the registry has no entry for this live group)
     if token == "none":
         s.group_token = None
     s.steer.cover_until = henv.clock() - 1
@@ -388,7 +388,7 @@ def test_s3_a_live_group_missing_from_the_registry_gets_a_barrier(henv, monkeypa
 def test_s3_a_lost_claim_leaves_no_entry(henv, monkeypatch):
     """Ruling S3: the claim is lost (the latch came) with the entry missing: no entry is made."""
     s, child = _held(henv, monkeypatch)
-    henv.host.groups.gone(s.group_token)
+    henv.host.groups._gone(s.group_token)
     s.steer.cover_until = henv.clock() - 1
     henv.host.steer_drain_hook = lambda sess: henv.host.steer_stopping()
     henv.host._hold_cut(s, henv.clock(), henv.host._outbox)
@@ -398,7 +398,7 @@ def test_s3_a_lost_claim_leaves_no_entry(henv, monkeypatch):
 def test_s3_a_verified_exit_needs_no_entry(henv, monkeypatch):
     """Ruling S3: the entry is missing and the probe says the group is gone: no barrier, no SIGTERM."""
     s, child = _held(henv, monkeypatch)
-    henv.host.groups.gone(s.group_token)
+    henv.host.groups._gone(s.group_token)
     child.code = 0
     s.steer.cover_until = henv.clock() - 1
     henv.host._hold_cut(s, henv.clock(), henv.host._outbox, drain=False)
@@ -412,7 +412,7 @@ def test_s3_try_stopping_inserts_the_barrier_only_on_a_miss():
     k = node_groups.key("/w")
     assert g.try_stopping("t1", (k, "/w")) == g.RESERVED
     assert g.entries == {k: {"t1": [g.STOPPING, "/w"]}} and g.blocked("/w")
-    g.gone("t1")
+    g._gone("t1")
     assert g.try_stopping("t1") == g.MISSING and not g.entries
 
 
@@ -643,7 +643,7 @@ def test_r2_a_reserved_watchdog_cut_makes_no_filesystem_call(henv, monkeypatch, 
     registered = node_groups.key(s.cwd)
     assert registered in henv.host.groups.entries
     if branch != "token":
-        henv.host.groups.gone(s.group_token)
+        henv.host.groups._gone(s.group_token)
     if branch == "no_token":
         s.group_token = None
     s.steer.cover_until = henv.clock() - 1
