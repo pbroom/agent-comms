@@ -2093,7 +2093,11 @@ def test_a3_a_registered_writer_that_dies_releases_every_waiter(monkeypatch):
     from agent_comms import hostlog, session_host
     monkeypatch.setattr(hostlog, "ACK_SECONDS", 5.0)
     assert hostlog.flush(5)
+    _no_writer()        # (a FRESH writer, started and registered here: its registration is the one under test)
+    assert hostlog.start_writer()
+    assert _wait(lambda: hostlog._writer[0] is not None)
     writer = hostlog._writer[0]
+    assert hostlog._state["token"] is None, "its registration consumed its token"
 
     class Dies(collections.deque):
         def popleft(self):
