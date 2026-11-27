@@ -1,6 +1,6 @@
 """The mutation check of Claude steering (step 3): one change per row, applied alone to an EXPORT of the branch
 (never a working tree), the steering tests run first and, only if they did not catch it, the wider tests; the file
-restored after each. The rows are review rounds 2 to 9's (DESIGN_NOTES "Mid-turn steering, step 3", each round's
+restored after each. The rows are review rounds 2 to 10's (DESIGN_NOTES "Mid-turn steering, step 3", each round's
 "Mutation check"): each is (file, name, the exact text, what replaces it); a row whose text is no longer there once
 is reported STALE.
 
@@ -139,10 +139,8 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('H', 'R7-3 the dropped lines counted', '            if len(_WATCH_LINES) == _WATCH_LINES.maxlen:\n                _WATCH_DROPPED[0] += 1', '            if False:\n                _WATCH_DROPPED[0] += 1'),
     ('H', "T stop_all's final save in a finally (re-anchored)", '        finally:\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)\n            self._save_state()\n        return self._take_outbox()', '        finally:\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)\n        self._save_state()\n        return self._take_outbox()'),
     ('H', 'R7-2 the final save made with logging restored', '        finally:\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)\n            self._save_state()', '        finally:\n            self._save_state()\n            undivert()          # (also when the pass raised: then the final save is made with logging restored)'),
-    ('H', "C1 the same code in the loop's tick", '            self._cutoff_stop(s, why, now, out, reserve=True)', '            self._cutoff_stop(s, why, now, out, reserve=not drain)'),
     ('H', 'T the claim checks the latch (re-anchored)', '            if self.steer_stopped or (s.steer is not None and s.steer.stopping):\n                return False\n            if reserve:', '            if reserve:'),
     ('H', "D1 a raising SIGTERM keeps main's clock", '                s.child.terminate()\n\n    def _release_steer', '                try:\n                    s.child.terminate()\n                except BaseException:\n                    s.stopping_since = None\n                    raise\n\n    def _release_steer'),
-    ('H', "D2 the held turn's own timeout reserves without waiting", '            self._cutoff_stop(s, detail, now, out, reserve=True)\n            return', '            self._cutoff_stop(s, detail, now, out, reserve=False)\n            return'),
     ('H', 'E2 a registry miss is not a refusal', '                if got == self.groups.BUSY:\n', '                if got in (self.groups.BUSY, self.groups.MISSING):\n'),
     ('H', "E1 only the attempt's own reservation undone", '                if got == self.groups.RESERVED:\n', '                if got in (self.groups.RESERVED, self.groups.ALREADY):\n'),
     ('H', "E1 the attempt's reservation undone", '                    self.groups.unreserve(s.group_token)\n', '                    pass\n'),
@@ -153,10 +151,12 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('D', 'F off by default', '    claude_steer: bool = False', '    claude_steer: bool = True'),
     ('H', 'C1 the checkout reserved before the claim (re-anchored)', '                got = self.groups.try_stopping(s.group_token)\n                if got == self.groups.BUSY:\n                    return False', '                got = None'),
     ('H', 'C1 registry busy: no stop committed (re-anchored)', '                if got == self.groups.BUSY:\n                    return False', '                if got == self.groups.BUSY:\n                    pass'),
-    ('H', "T the interrupted timeout's cutoff (re-anchored)", '                if self._steering(s):\n                    # (ruling T; round 9, ruling D2', '                if False:\n                    # (ruling T; round 9, ruling D2'),
-    ('H', "T the broken pipe's cutoff (re-anchored)", '            elif self._steering(s):\n                # (ruling T: nothing after the latch. Round 9', '            elif False:\n                # (ruling T: nothing after the latch. Round 9')]
+    ('H', "G1 the predicate-false path is main's", '        if not self._reserves(s):\n            self._fail(s, why, out)\n            self._stop_from(s, now, live)\n            return True', '        if False:\n            self._fail(s, why, out)\n            self._stop_from(s, now, live)\n            return True'),
+    ('H', 'G1 the predicate asks the switch', '        return (self.claude_steer() and getattr(s.provider, "steering_on", False) is True', '        return (getattr(s.provider, "steering_on", False) is True'),
+    ('H', 'G1 the predicate asks for a Claude attempt or a hold', '                and (s.held is not None or (s.steer is not None and s.steer.holds)))', '                and (s.held is not None or s.steer is not None))'),
+    ('H', 'H2 the predicate reads the attempt, not the advertised holds', '        return (self.claude_steer() and getattr(s.provider, "steering_on", False) is True', '        return (self.claude_steer() and getattr(s.provider, "holds", False) is True')]
 FIRST = ["tests/test_claude_steering.py"]
-REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_session_restart.py",
+REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",
         "tests/test_session_restart_hub.py", "tests/test_structured_results.py", "tests/test_hosted_sessions.py",
         "tests/test_session_host.py"]
 

@@ -1873,8 +1873,8 @@ class SessionHost:
                     if s.in_flight is None and s.writing is None:
                         return
                 if self._steering(s):
-                    # (ruling T; round 9, ruling D2: the reservation without waiting, as the expired hold's cut)
-                    self._cutoff_stop(s, self._timeout_detail(), now, out, reserve=True)
+                    # (ruling T; rounds 9 and 10, rulings D2 and G1: `_cutoff_stop` decides the path)
+                    self._cutoff_stop(s, self._timeout_detail(), now, out, live=live)
                     return
                 self._fail(s, self._timeout_detail(), out)
                 self._stop_from(s, now, live)
@@ -1914,9 +1914,9 @@ class SessionHost:
         else:
             detail = self._timeout_detail()
         if live or s.held is not None:
-            # (ruling N: the held timeout too; nothing after the latch. Review round 9, ruling D2: the reservation
-            # without waiting, as the expired hold's cut: registry busy, no stop is committed, tried next tick)
-            self._cutoff_stop(s, detail, now, out, reserve=True)
+            # (ruling N: the held timeout too. Rounds 9 and 10, rulings D2 and G1: a Claude attempt's or held end's,
+            # with steering on, reserves without waiting; every other, a Codex attempt's included, is main's)
+            self._cutoff_stop(s, detail, now, out, live=live)
             return
         self._fail(s, detail, out)
         self._stop_from(s, now, live)
@@ -2699,7 +2699,7 @@ class SessionHost:
         if drain:       # (ruling W: never on the watchdog's thread; S is then decided from what was read so far)
             now = self._drain_before_stop(s, now, out)
         if s.held is held:
-            self._cutoff_stop(s, why, now, out, reserve=True)   # (round 8, ruling C1: reserve first, commit second)
+            self._cutoff_stop(s, why, now, out, live=True)   # (round 8, ruling C1: reserve first, commit second)
 
     def _steering(self, s: Session) -> bool:
         """The session holds a Claude steer whose outcome is open, or a held end: from the latch on the bulk stop
@@ -2755,16 +2755,35 @@ class SessionHost:
         else:
             log.log(level, msg, *args)
 
-    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent], *, reserve: bool) -> bool:
+    def _reserves(self, s: Session) -> bool:
+        """(Review round 10, ruling G1) THE one predicate of the reserved stop: Claude steering is switched on for
+        this node, the session's adapter is a Claude one it was copied onto (`steering_on`: no Codex adapter has it),
+        and the stop is for a Claude attempt (`slot.holds`) or a held end. With the switch off it is false for every
+        session; for a Codex slot it is false with the switch on too."""
+        return (self.claude_steer() and getattr(s.provider, "steering_on", False) is True
+                and (s.held is not None or (s.steer is not None and s.steer.holds)))
+
+    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent], live: bool) -> bool:
         """THE single-session stop of a session holding a live steer attempt or a held end (review round 3, ruling N;
-        callers: `_hold_cut`, and the turn timeout `_hold_to_timeout`, the held one included). The decision and the
-        fence are made under the cutoff lock; after the global latch it does nothing (the stop of every turn is the
-        one that acts, Shutdown simplified). The group registry and the SIGTERM come after the lock is let go (a
-        stop decided before the latch whose signal lands after it is the same signal shutdown sends). False: it did
+        callers: `_hold_cut`, the turn timeout `_hold_to_timeout` (both its branches), and a broken pipe). Review round
+        10, ruling G1: the callers do not choose: `_reserves` does. False: main e6b421f's path, unchanged: the turn is
+        failed and stopped (`_fail`, `_stop_from`). True: the reserved stop (`_reserved_cutoff`). False return: it did
         nothing."""
-        if not self._claim(s, lambda: self._fail(s, why, out), reserve=reserve):
+        if not self._reserves(s):
+            self._fail(s, why, out)
+            self._stop_from(s, now, live)
+            return True
+        return self._reserved_cutoff(s, why, now, out)
+
+    def _reserved_cutoff(self, s: Session, why: str, now: float, out: list[HostEvent]) -> bool:
+        """(Rounds 8 to 10) A Claude attempt's or held end's stop with Claude steering on: the decision and the fence
+        under the cutoff lock, after the checkout was reserved there without waiting (`_claim(reserve=True)`);
+        registry busy, or after the global latch, nothing (the next pass or tick tries again; the stop of every turn
+        is the one that acts). The SIGTERM after the lock is let go, dated at the signal (R8-01), main's `_stop` but
+        for the registry call (D1)."""
+        if not self._claim(s, lambda: self._fail(s, why, out), reserve=True):
             return False
-        self._stop(s, now, at_signal=True, reserved=reserve)      # (dated at its SIGTERM: R8-01)
+        self._stop(s, now, at_signal=True, reserved=True)
         return True
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
@@ -2938,9 +2957,8 @@ class SessionHost:
             if (s.provider.waits_for_ready and not s.ready) or s.checking:
                 self._fail_start(s, detail, out)
             elif self._steering(s):
-                # (ruling T: nothing after the latch. Round 9, ruling E4: listed in the notes, not changed here: this
-                # cut keeps the registry's blocking wait, as main's own write-failure stop does)
-                self._cutoff_stop(s, detail, now, out, reserve=False)
+                # (ruling T; round 10, ruling G1: `_cutoff_stop` decides the path, as for every other caller)
+                self._cutoff_stop(s, detail, now, out, live=live)
                 return
             else:
                 self._fail(s, detail, out)

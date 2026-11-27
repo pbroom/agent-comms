@@ -5041,6 +5041,129 @@ def test_r8_c3_known_limit_a_registry_stall_past_two_graces(env):
     assert m["state"] == "done" and show(env, a)["reply"] == "N's reply", m
 
 
+# ---------------------------------------------------------------- review round 10
+
+
+def test_r10_h2_a_claude_attempt_keeps_its_path_after_the_adapter_stops_advertising(henv, monkeypatch):
+    """Ruling H2: the path is chosen by the attempt's recorded Claude identity (`slot.holds`) or the actual hold, not
+    the adapter's advertised `holds`: a Claude attempt whose adapter lost verification (no longer advertising) still
+    gets the Claude path for its cleanup (switch on): its turn timeout with the registry busy commits nothing."""
+    import threading
+    s, child, n = steered(henv, monkeypatch)
+    s.provider._verified = False        # (verification lost: the adapter no longer says `holds`)
+    assert not s.provider.holds and s.steer is not None and s.steer.holds
+    assert henv.host._reserves(s), "the attempt's own identity decides"
+    release, held = threading.Event(), threading.Event()
+
+    def spawn_holding_the_registry():
+        with henv.host.groups.lock:
+            held.set()
+            release.wait(10)
+    threading.Thread(target=spawn_holding_the_registry, daemon=True).start()
+    assert held.wait(3)
+    try:
+        henv.clock.advance(61)
+        out = henv.host.tick()
+        assert not ends(out) and not child.terminated, "the Claude path: no stop committed while the registry is busy"
+    finally:
+        release.set()
+
+
+def test_r10_h2_a_codex_slot_never_takes_the_claude_path(henv, monkeypatch):
+    """Ruling H2: a Codex slot never makes the predicate true, with the switch on."""
+    from test_codex_steering import host_n
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", "steer", authorized=True)
+    host.tick()
+    assert s.steer is not None and not s.steer.holds and not host._reserves(s)
+
+
+def test_r10_g3_a_restart_with_the_switch_off_restores_no_steering(henv, monkeypatch):
+    """Ruling G3: a host restarted with the switch off, from a state saved while it was on with a held end: no slot,
+    no hold and no queued steer bytes come back; the session's modes name no steering."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    assert s.held is not None
+    henv.host._save_state()
+    _claude_steering_default(monkeypatch)
+    host = make_host(henv, timeout_minutes=1)
+    host.recover()
+    s2 = host.open(SID, agent="claude", runtime="claude-code", project=PROJECT_OF(henv))
+    assert s2.steer is None and s2.held is None and not s2.outbuf and not s2.provider.steering_on
+    assert "steer" not in providers_modes(s2.provider) and "held" not in providers_modes(s2.provider)
+
+
+def PROJECT_OF(henv):
+    from test_session_host import PROJECT
+    return PROJECT
+
+
+def providers_modes(provider):
+    from agent_comms import providers
+    return providers.modes(provider)
+
+
+def test_r10_g3_a_stale_hub_mode_meets_an_off_node(env, monkeypatch):
+    """Ruling G3: the hub still lists a Claude steer mode for a session of an off node (stale): its offer is refused
+    at slot creation (no slot, nothing written), and the node's next status drops the mode."""
+    _claude_steering_default(monkeypatch)
+    sid = start(env, "a long turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    n = written(child)[-1]["uuid"]
+    child.emit(cinit(sid, n))
+    tick(env, times=2)
+    with hosted.db.write_tx(env.board.conn) as c:
+        r = hosted._session(c, sid)
+        hosted._put(c, hosted.SESSION_PREFIX + sid, r | {"modes": ["steer", "restart", "held"]}, "test", env.clock())
+    r = env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": TEXT, "mode": "steer"})
+    tick(env, times=2)
+    s = env.node.sessions.host.sessions[sid]
+    assert s.steer is None, "no slot"
+    assert not [x for x in written(child) if x.get("message", {}).get("content") == TEXT], "nothing written"
+    child.emit(cresult(sid, n, text="N's reply"))
+    tick(env, times=2)
+    assert hosted._session(env.board.conn, sid)["modes"] == ["restart"], "the next status dropped the mode"
+
+
+@pytest.mark.parametrize("direction", ["node_to_old_hub", "old_node_to_hub"])
+def test_r10_g3_mixed_versions_write_no_claude_steer(env, monkeypatch, direction):
+    """Ruling G3 (mixed versions): this head's node with the switch off against a hub that behaves as d11ff99 (its
+    listing names no `held`), and a d11ff99-style node report (a Claude session's modes `restart` only) against this
+    head's hub: no Claude steer is written either way."""
+    _claude_steering_default(monkeypatch)
+    sid = start(env, "a long turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    n = written(child)[-1]["uuid"]
+    child.emit(cinit(sid, n))
+    runner = env.node.sessions
+    if direction == "node_to_old_hub":
+        real = runner.client
+
+        class D11ff99Listing:
+            def request(self, method, path, **kw):
+                r = real.request(method, path, **kw)
+                if method == "GET" and path.startswith("/api/nodes/sessions"):
+                    data = r.json()
+                    if isinstance(data.get("features"), list):
+                        data["features"] = [f for f in data["features"] if f != "held"]
+                    return httpx.Response(r.status_code, json=data, request=r.request)
+                return r
+        runner.client = D11ff99Listing()
+    else:
+        r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [], "state": "running", "modes": ["restart"],
+                                                              "seq": 10 ** 18})
+        assert r.status_code == 200, r.text
+    tick(env, times=2)
+    env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": TEXT, "mode": "steer"})
+    tick(env, times=2)
+    assert not [x for x in written(child) if x.get("message", {}).get("content") == TEXT]
+    assert env.node.sessions.host.sessions[sid].steer is None
+
+
 RESULT_FIELDS = ["subtype", "is_error", "num_turns", "origin", "user_message_uuid", "user_message_uuids", "result",
                  "permission_denials", "terminal_reason", "stop_reason", "duration_ms", "total_cost_usd"]
 INIT_FIELDS = ["claude_code_version", "capabilities", "permissionMode", "tools", "user_message_uuids", "origin",
