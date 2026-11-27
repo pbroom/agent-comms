@@ -15937,3 +15937,144 @@ round asked:
 - The stand-in e2e in full (F touches the configuration): PASS (395 checks).
 - `--only steering` with stand-ins: PASS (115 checks).
 - No real CLI was run.
+
+### Review round 10 (on 5a629c9, judged with Claude steering off as shipped: CHANGES, one blocker) and what changed
+
+Backup branch `backup/claude-steering-5a629c9`. Sol judged the shipped configuration. F is as claimed for Claude.
+The one blocker is a Codex path: a Codex turn reaching its timeout with a live steer and bytes still in the output
+buffer called `_cutoff_stop(reserve=True)`. With the registry busy it committed no failure and sent no SIGTERM;
+main fails the turn and stops it. The D1–D4 findings go to the enabling PR. Sol's pre-check added H1 to H3.
+
+Commits: 790a25a (code and tests), c6b40d3 (the predicate's term pins), 0d7006b (mutation results), then these notes.
+The new tests:
+- tests/test_steering_off_tripwire.py: G1 and G2;
+- seven in tests/test_claude_steering.py: H2, G1's term pins and G3.
+
+On an export of 5a629c9 with 790a25a's test files, 10 tests run: pytest reports 2 failed, 8 passed and 2 errors.
+c6b40d3's term-pin test asks `_reserves` too, so it would also fail there.
+- **Error:** the G1 Codex timeout, `[off]` and `[on]`, at teardown. The tripwire recorded `Groups.try_stopping`
+  being called for a Codex stop. Its raise was swallowed by the host-error path, which then failed the session, so
+  the bodies pass and are among the 8.
+- **Fail:** the two H2 tests. They ask the predicate `_reserves`, which 5a629c9 does not have. Behaviourally,
+  5a629c9 reserved for every live attempt, so a Claude attempt kept the reserved path there too.
+- **Pass, as pins:** the G2 and G3 tests.
+
+#### G1, H1 and H2. The path is chosen before the claim, in one place, by one predicate (the host)
+
+- **The class.** Any stop whose path depends on its call site rather than on what the stop is for. Round 9 had the
+  call sites choose `reserve`, and the turn timeout chose it for every live attempt, Codex included.
+- **Owner.** `SessionHost._reserves(s)`, THE predicate. It is true when all three hold:
+  - Claude steering is switched on for this node;
+  - the session's adapter is one the switch was copied onto (`steering_on`, which only a Claude adapter has);
+  - the stop is for a Claude attempt (`slot.holds`, recorded at the offer) or an actual hold (`s.held`).
+- **The caller.** `SessionHost._cutoff_stop(s, why, now, out, live)`: the `reserve` keyword is gone, and the callers
+  (the expired hold's cut, both turn-timeout branches, a broken pipe) do not choose.
+  - **Predicate false (H1):** the whole of main e6b421f's fallback runs, before any claim: `_fail`, then
+    `_stop_from(s, now, live)`. For the Codex timeout these are main's calls in main's order, so `_stop` registers
+    with the registry and waits for it as main's does. This branch is main's code, not a reservation path in a
+    waiting mode.
+  - **Predicate true:** `_reserved_cutoff`: rounds 8 and 9's reserved stop.
+- **H2: the predicate reads the attempt's recorded Claude identity or the actual hold, not the adapter's advertised
+  `holds`.** `holds` turns false when the incarnation loses its verification, or at RETIRED_MAX, while a Claude
+  attempt still needs its cleanup.
+- **The identity, with the switch off.** `claude_steer()` is false, so `_reserves` is false for every session. That
+  makes all of these unreachable, and `_cutoff_stop` and `_stop` main's for every caller:
+  - `Groups.try_stopping`, `Groups.unreserve`;
+  - the claim with a reservation (`_reserved_cutoff`);
+  - the "registry busy, commit nothing" return.
+- **A Codex slot, with the switch on.** A Codex adapter has no `steering_on`, its slot's `holds` is false (it has no
+  `steer_named`), and a Codex session never holds an end. So the predicate is false for it with the switch on too.
+- **Tests.**
+  - `test_r10_g1_a_codex_timeout_with_a_live_steer_is_mains[off|on]`: Sol's sequence, with the output buffer
+    non-empty at the timeout, so it exercises the stop path, not the interrupt. With the registry busy, the calls
+    are `_fail` then `_stop_from` and the turn fails once. Its process gets main's SIGTERM once the registry lets go,
+    with the switch off and on.
+  - `test_r10_h2_a_claude_attempt_keeps_its_path_after_the_adapter_stops_advertising` (switch on).
+  - `test_r10_h2_a_codex_slot_never_takes_the_claude_path`.
+  - `test_r10_g1_each_term_of_the_predicate_alone_makes_it_false`. Two of the three terms are redundant in every
+    reachable state: the adapter's `steering_on` is copied from the switch at open, and every Claude slot records
+    `holds`. They are kept on purpose:
+    - the switch term makes "switch off: the predicate is false" hold without relying on the copy;
+    - the attempt term makes "a Codex slot: false" hold without relying on the adapter.
+
+    No scenario can tell either term apart, so this test pins each one directly on a live Claude attempt. The
+    mutation check found the gap: see below.
+
+#### G2 and H3. A tripwire for the shipped configuration (tests)
+
+- tests/test_steering_off_tripwire.py makes every steering-only entry point a tripwire. Each raises if called and is
+  recorded, so a host-error path that swallows the raise cannot hide it:
+  - `Groups.try_stopping` and `Groups.unreserve`;
+  - the reservation branch of the stop (`_reserved_cutoff`);
+  - a hold's creation (`_hold`) and the fence's publication (`_publish_hold`);
+  - the hold deadline enforcers' cut (`_hold_cut`);
+  - H3: Claude frame construction (`ClaudeSession.steer_named`), and checkpoint enqueue (`_checkpoint`) and send
+    (`_post_checkpoints`).
+- Run under them, none fires:
+  - every scenario of tests/test_codex_steering.py, imported into that file (not edited) and run a second time there;
+  - the Codex timeout above;
+  - a Claude turn with a steer request (main's `REFUSED["cli"]`, nothing written);
+  - shutdown with a Codex steer live and a Claude turn running.
+- This is the pin that "off" means main's code for stops.
+
+#### G3. The switch is read at start (the node)
+
+- The config comment and these notes say it: `claude_steer` is read when the node starts and copied onto each
+  Claude adapter when its session opens. Editing the file changes no running node or adapter; a change needs a node
+  restart.
+- **Pins.**
+  - `test_r10_g3_a_restart_with_the_switch_off_restores_no_steering`: a host restarted with the switch off, from a
+    state saved while it was on with a held end, restores no slot, no hold and no queued steer bytes. The saved
+    state never carried them: it records pid, start time, directory, resume and the turn.
+  - `test_r10_g3_a_stale_hub_mode_meets_an_off_node`: a hub that still lists a Claude steer mode for an off node's
+    session has its offer refused at slot creation (no slot, nothing written), and the node's next status drops the
+    mode (`restart` only).
+  - `test_r10_g3_mixed_versions_write_no_claude_steer[node_to_old_hub|old_node_to_hub]`: this head's node, off,
+    against a hub that behaves as d11ff99 (no `held` in its listing), and a d11ff99-style report (a Claude session's
+    modes `restart` only) against this head's hub. No Claude steer is written either way.
+
+#### The enabling PR's starting list (Sol's three items; not built here)
+
+1. **Finish the steering-added stop audit.** The E4 table (round 9) covers the known call sites, but its listed
+   routes still wait: the held-session close, cancel, fatal and host-error paths; the Claude partial-write and
+   broken-pipe cuts (the broken pipe now goes through `_cutoff_stop`'s predicate); and reap and parking with
+   survivors. Any stop newly reached because of steering must not add a registry wait under the runner lock. Pin
+   each.
+2. **Make the reservation's failure cleanup safe.** An early `decide()` failure undoes only RESERVED (an earlier
+   ALREADY barrier stays), but `unreserve` takes the registry with a blocking wait under the cutoff and runner locks,
+   and a spawn can take the registry between the reservation and the rollback. Also, a post-claim loop diagnostic
+   must not strand a committed fence before `_stop` arms the escalation.
+3. **Keep checkout ownership on a live registry miss.** MISSING correctly does not stand for a verified exit, but
+   going on with `reserved=True` can stop a live group with no registry barrier, then publish while a survivor
+   remains. The admission barrier has to be retained or repaired before N's hold is released. A live child with
+   `group_token is None` returns before the probe today; cover it separately.
+
+#### Mutation check (G1 and H2 only; G2 is tests only, so it has no code row)
+
+Four rows, in scripts/steering-mutation-check.py. The results are in scripts/steering-mutation-results.txt. The
+whole set (139 rows, all still anchored and compiling) last ran in round 6.
+
+- **On 790a25a, 2 of 4 caught.** Missed:
+  - "G1 the predicate asks the switch";
+  - "G1 the predicate asks for a Claude attempt or a hold".
+
+  Both are equivalent mutants in every reachable state, for the reason given under G1's tests. c6b40d3 adds
+  `test_r10_g1_each_term_of_the_predicate_alone_makes_it_false`.
+- **On c6b40d3, all 4 caught.** "G1 the predicate-false path is main's" (`if not self._reserves(s):` made
+  `if False:`) shows only `(exit 1)`, because the G1 Codex timeout tests error at teardown: the tripwire recorded
+  `_reserved_cutoff` reached for a Codex stop, and the check prints no test name for a teardown error.
+
+#### Runs (on c6b40d3, the last code commit; the commits after it are this round's mutation results and these notes)
+
+Machine load averages were 5.3 to 5.5 throughout.
+
+- **The full suite:** 5277 passed, 10 skipped, in 12 min 25 s. The 300-second stand-in e2e test passed inside it.
+- **`--only steering`, stand-ins:** PASS (115 checks).
+- **`--only correlation`, stand-ins:** PASS (24 checks).
+- **`--only steering`, real CLIs:** PASS (54 checks). Claude Code 2.1.330 and codex-cli 0.172.0, run the way
+  scripts/session-host-e2e.py runs them.
+- **`--only correlation`, real CLIs:** PASS (23 checks).
+- **`~/.codex/config.toml` sha256 (first 16 characters):** 18fcebe0d94018f8 before, between the stand-in and real
+  runs, between the two real runs, and after. That is the baseline.
+- Before the commit, the steering, tripwire, Codex, host, correlation, hosted, structured-result, restart, node,
+  spawn and tree suites: 2094 passed, 10 skipped.
