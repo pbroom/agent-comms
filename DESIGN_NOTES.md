@@ -16888,3 +16888,33 @@ fixes the kind. Still logging only: no stop decision, signal, signal order, save
 - **`HostLock`.** Its docstring now says it is not a general replacement for a lock, and that no
   `threading.Condition` may be built on it. `locked()` no longer misreports an RLock that the calling thread holds:
   it asks `_is_owned()` first.
+
+### Reproduction, mutation check and runs
+
+- **On ff393a3** (an export with this round's tests/test_hostlog.py and tests/hostlog_guard.py copied in, each test
+  run alone and bounded at 40 s):
+  - R1's 12 fallback cases all fail: 8 assertion failures and 4 `reenters` deadlocks.
+  - R2's checkpoint test fails at (i): the sender thread entered the handler.
+  - The static and mechanism tests fail as expected: the report lock, the ack lock and the record lock are not
+    boundaries, `_watch` is not enqueue-only, `shown_version` is formatted at the call, and the new hostlog names do
+    not exist.
+- **Mutation rows.** The script has 181 rows.
+  - New: 9 (the report lock, the ack lock and the record lock as boundaries; the checkpoint sender and the watchdog
+    enqueue-only; the fixed deadline; facts rendered by the writer; the errno read with no code of the exception's;
+    the version rendered by the writer).
+  - Re-anchored: 3 (the one predicate, twice, and the exit with nothing of its own).
+  - On 7f9e3f2, 28 rows ran (all hostlog rows and every row this round touched): all CAUGHT. That includes the
+    nested-drain row, which hung the suite on 8a9ea35 and now fails its pin.
+- **Runs** (stand-ins; the real CLIs were not run). The machine was heavily loaded by other agents' runs, with load
+  averages from 6 to 21.
+
+  | Run | Result |
+  | --- | --- |
+  | full suite, serial, on the final code (7f9e3f2) | 5456 passed, 10 skipped, 1 failed, 28 min 28 s (load about 8; 13 min on an idle machine): `test_the_end_to_end_script_passes_with_the_stand_in`, its 300 s limit again. ff393a3's code fails that same test alone, under the same load (load 8), at 316 s, so the failure comes from the load, not this round's code. |
+  | full suite, `-n auto` (7f9e3f2's code) | 5455 passed, 10 skipped, 2 failed, 8 min 25 s, load 20: `test_the_worst_case_verdict_is_fast` (a 50 ms timing budget) and `test_the_end_to_end_script_passes_with_the_stand_in` (its 300 s limit). Rerun alone, the first passed and the second ran past 300 s again. |
+  | full stand-in e2e, run directly | PASS, 395 checks, 6 min 0 s. ff393a3's code under the same load: PASS, 395, 6 min 56 s, so this round adds no time. The pytest wrapper's 300 s limit is the load's. |
+  | `--only steer` | PASS, 27 |
+  | `--only steering` | PASS, 115 |
+  | `--only correlation` | PASS, 24 |
+  | `--only structured` | PASS, 36 |
+  | `--only tree` | PASS, 143 |

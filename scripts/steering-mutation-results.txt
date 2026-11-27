@@ -75,3 +75,44 @@ HUNG    L a nested drain leaves its records to the active drainer  test_a_handle
 commit ffb483c (before the pin; superseded above)
 MISSED  L the drain runs only at depth 0  
 rows: 32, caught: 31, hung (the predicted deadlock): 1, missed: 0
+
+# Host-side logging, review round 1 (DESIGN_NOTES "Host-side logging: review round 1"): every hostlog row (key
+# L), the rows on code this round changed or added (R1 to R4, A2's fixed deadline, N3/R2 re-anchored), and the
+# runner, registry and entry-point successors; on 7f9e3f2 (this round's code). The nested-drain row, which
+# hung the suite on 8a9ea35, now FAILS its pin (bounded below WAIT_SECONDS) and is caught. (Two rows of earlier
+# rounds matched the selection by prefix: "R1 the claim runs the route's own stop", "R2 the barrier is under
+# the cached key".)
+
+commit 7f9e3f2
+CAUGHT  N3/R2 a background thread never drains (re-anchored)  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+CAUGHT  R7-2 stop_all is an entry point (successor)  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[held]
+CAUGHT  A3 the exception's type only (successor)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  R1 the claim runs the route's own stop  test_the_queued_s_close_finalizer_n_end_then_ended
+CAUGHT  A2 the runner lock is a host lock (successor)  test_a2_under_the_node_a_claims_lines_are_written_outside_the_runner_lock
+CAUGHT  A2 the registry lock is a host lock (successor)  test_a_registry_callback_line_is_written_after_the_registry_is_let_go
+CAUGHT  A2 the host's public methods are entry points (successor)  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  R2 the barrier is under the cached key  test_r2_a_reserved_watchdog_cut_makes_no_filesystem_call[token]
+CAUGHT  L the drain runs only at depth 0 (re-anchored)  test_no_drain_inside_a_boundary_even_when_asked
+CAUGHT  L a nested drain leaves its records to the active drainer  test_a_handler_that_logs_and_calls_back_into_the_host_does_not_deadlock
+CAUGHT  L a waiting drain waits for its own records  test_a_drain_with_another_drainer_stalled_is_bounded_when_asked
+CAUGHT  L one handler's failure never stops the others  test_a_handler_that_raises_is_caught_and_the_drain_goes_on
+CAUGHT  L the level is checked at the call  test_a_line_the_logger_would_not_emit_is_not_kept
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's caller is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's time is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  L an exit with nothing of its own writes nothing (re-anchored)  test_the_watchdogs_lines_are_written_at_the_runner_locks_release_not_by_an_entry_that_logged_nothing
+CAUGHT  L a host lock's release writes everything  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+CAUGHT  R1 the report lock is a boundary  test_a_refused_reports_fallback_writes_its_line_after_the_report_lock[ordinary-400-blocks]
+CAUGHT  R1 the ack lock is a boundary  test_every_lock_of_the_host_side_modules_is_a_boundary_or_reviewed
+CAUGHT  R1 a steer attempt's record lock is a boundary  test_every_lock_of_the_host_side_modules_is_a_boundary_or_reviewed
+CAUGHT  R2 the checkpoint sender is enqueue-only  test_a_failed_checkpoint_is_written_by_the_loop_and_never_holds_it
+CAUGHT  R2 the watchdog is enqueue-only  test_every_thread_the_host_side_modules_start_is_reviewed_and_every_background_one_is_enqueue_only
+CAUGHT  A2 a fixed deadline behind another drainer  test_a_drain_with_another_drainer_stalled_is_bounded_when_asked
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R3 an errno is read with no code of the exception's  test_facts_never_call_a_hostile_exceptions_own_code
+CAUGHT  R4 the version is rendered by the writer  test_nothing_is_formatted_at_a_log_call
+rows: 28
+stale or broken: []
+missed: []
+exit 0
