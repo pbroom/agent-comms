@@ -292,8 +292,10 @@ def test_r2_a_held_session_is_never_signalled_by_number_again(henv, site):
     s, child = _retained_session(henv)
     henv.groups.add(child.pid)          # (the stranger)
     if site == "reap":
+        out = []
         for _ in range(3):
-            henv.host.tick()
+            out += henv.host.tick()
+        assert not [e for e in out if e.kind == "turn_ended"], "HELD: the reap decides nothing (no survivor stop)"
     elif site == "kill_scan":
         henv.clock.advance(henv.host.kill_grace + 1)
         henv.host.kill_due()
@@ -495,3 +497,36 @@ def test_r2_the_runners_shutdown_steps_never_signal_a_held_session(env):
     runner.signal()
     runner.kill()
     assert not child.terminated and not child.killed, "no numeric signal from the runner's shutdown steps"
+
+
+def test_r2_a_held_runs_reap_takes_no_survivor_stop(nenv, caplog):
+    """R2, the run's reap: a HELD run whose pgid answers alive again (the stranger) is not taken for a leader that
+    left members of its group: no survivor stop (its "stopping them" line), no signal, on any later pass."""
+    import logging
+    rid, child = _retained_run(nenv)
+    child.left_members = True
+    with caplog.at_level(logging.WARNING, logger="agent_comms.node"):
+        for _ in range(3):
+            nenv.node.tick()
+    assert not [r for r in caplog.records if "left members of its group" in r.getMessage()], caplog.text
+    assert not child.terminated and nenv.node.running[rid].terminated_at is None
+
+
+def test_a3_a_runs_refused_release_with_its_entry_missing_still_fences_the_checkout(nenv):
+    """Amendment A3, for a dispatched run: the registry has no entry for its token when the release is refused: its
+    checkout is fenced under the key cached at its spawn, and a new run is refused there."""
+    from test_nodes import allow, human_post
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    nenv.node.tick()
+    [rid] = list(nenv.node.running)
+    child = nenv.node_spawner.children[0]
+    nenv.node.groups._gone(("run", rid))       # (the token lookup will miss)
+    nenv.node.group_absent = lambda pgid: False
+    child.code = 0
+    nenv.node.tick()
+    assert rid in nenv.node.running and nenv.node.groups.state(("run", rid)) == nenv.node.groups.HELD
+    started, _ = nenv.node.groups.start(nenv.node_dir, ("run", "next"), lambda: object())
+    assert not started, "refused on that checkout"
