@@ -1,32 +1,14 @@
-# The output of scripts/steering-mutation-check.py (review round 7): only round 7's rows (R7-1, R7-2, A1-A3, R7-3
-# and the two re-anchored on stop_all's lines), as the round asked. The whole set (130 rows) last ran in round 6
-# (117 caught, 5 equivalent; that round's results are in git history, a0897d9).
-# Run 1: a946a1b, 11 rows: 8 caught, 3 missed. Run 2: 85e13d7, after a test for each miss: all 3 caught.
+# The output of scripts/steering-mutation-check.py (review round 8): only C1's rows, plus round 4's "the claim checks
+# the latch", re-anchored on its new line (the reservation now follows it), as the round asked. Round 7's A1 rows
+# are gone with the code they changed. The whole set (131 rows) last ran in round 6. Run on 7c059d7: all 5 caught.
 
-## Run 1
-commit a946a1b
-CAUGHT  R7-1 the steer deadlines inside the one section  test_r7_1_the_watchdogs_pass_takes_the_runner_lock_once
-CAUGHT  A1 the watchdog never waits on the registry  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
-CAUGHT  A1 a deferred stop starts no kill clock  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
-MISSED  A1 a deferred stop is retried  
-CAUGHT  R7-2 shutdown's logging deferred through the last SIGKILL  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[held]
-CAUGHT  A2 the caller's prior diversion restored  test_r7_a2_stop_all_restores_the_callers_prior_diversion
-MISSED  R7-2 the replay after the last SIGKILL, not before  
-CAUGHT  A3 the exception's type only  test_r7_a3_a_deferred_line_carries_the_exception_type_only
-CAUGHT  R7-3 the dropped lines counted  test_r7_3_the_deferred_queue_counts_what_it_drops
-CAUGHT  T stop_all's final save in a finally (re-anchored)  test_r4_t_stop_all_saves_even_when_its_traversal_raises
-MISSED  R7-2 the final save made with logging restored  
-rows: 11
-stale or broken: []
-missed: ['A1 a deferred stop is retried', 'R7-2 the replay after the last SIGKILL, not before', 'R7-2 the final save made with logging restored']
-exit 0
-
-## Run 2
-commit 85e13d7
-CAUGHT  A1 a deferred stop is retried  test_r7_a1_the_loop_sends_a_deferred_stop_by_itself
-CAUGHT  R7-2 the replay after the last SIGKILL, not before  test_r7_2_what_a_process_wrote_last_reaches_its_transcript_at_shutdown
-CAUGHT  R7-2 the final save made with logging restored  test_r7_2_a_stop_all_that_raises_still_saves_for_real
-rows: 3
+commit 7c059d7
+CAUGHT  C1 the checkout reserved before the claim  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  C1 registry busy: nothing changes  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  C1 the same code in the loop's tick  test_r8_c1_the_loops_tick_never_waits_on_the_registry
+CAUGHT  C1 a failed SIGTERM starts no kill clock  test_r8_c1_a_failed_sigterm_starts_no_kill_clock
+CAUGHT  T the claim checks the latch (re-anchored)  test_r3_n_the_held_timeout_after_the_latch_starts_no_stop
+rows: 5
 stale or broken: []
 missed: []
 exit 0
