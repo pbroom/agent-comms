@@ -2,10 +2,11 @@
 directory: hosted sessions' processes (session_host.SessionHost) and dispatched runs (node.Node) alike.
 
 The invariant (review round 7, owner decision): nothing is started in a checkout directory that holds a process group
-in the STOPPING (or HELD) state, and every stopping group stays registered (and keeps receiving its kill) until the
-whole group is gone, leader reaped and no member left, however its leader ended. (Ownership until verified exit, C1)
-A group is let go only by `release`, with a proof; one it refuses where main would have let it go becomes HELD:
-fenced, and never signalled by number again (`may_signal`). This holds for a live node; across a restart, a group
+in the STOPPING (or HELD) state, and every stopping group stays registered until the whole group is verified gone,
+leader reaped and no member left, however its leader ended. (Ownership until verified exit, C1) A group is let go
+only by `release`, with a proof; one it refuses where main would have let it go becomes HELD: fenced, and never
+signalled by number again (`may_signal`). The first SIGKILL attempt on a group, sent or raised, is its last numeric
+signal: there are no retries (`veto`). This holds for a live node; across a restart, a group
 whose leader is gone is not restored (C3). Live groups may share a directory (a parent
 session and its shared-checkout children, a session beside a dispatched run the hub allowed): the rule is about
 groups being stopped.
