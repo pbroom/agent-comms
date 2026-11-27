@@ -17272,8 +17272,11 @@ alive or re-open a wait:
 ### A5. The scope of "no raise"
 
 The containment is scoped to `Exception`. A `KeyboardInterrupt` or `SystemExit` arriving during an enqueue or a
-start propagates, as it must for SIGTERM (`on_term` raises `KeyboardInterrupt`). It leaves no lock held: every lock
-is a `with`. It leaves no claim stuck: the claim is cleared in a `finally`. Two tests check this:
+start propagates, as it must for SIGTERM (`on_term` raises `KeyboardInterrupt`). It leaves no lock held. (Corrected
+in review round 3, R18: "every lock is a `with`" was not enough, because `HostLock`'s and `Condition`'s `__exit__`
+were Python code, which an interrupt can enter before the release. Every host lock is now a native lock entered as
+`with hostlog.BOUNDARY, lock:`, and hostlog's own lock is a raw lock entered as `with _LOCK:`, so the acquire and
+the release are C code.) It leaves no claim stuck: the claim is cleared in a `finally`. Two tests check this:
 - a `KeyboardInterrupt` raised by the writer's `Thread.start()` (a standalone caller's lazy start);
 - a `SystemExit` inside the record's snapshot, on a lifecycle thread. Afterwards the depth is back to 0, nothing is
   queued, and the next line is written.

@@ -93,7 +93,7 @@ import httpx
 
 from . import hostlog, session_access, session_worktrees
 from .dispatch import DispatchConfig
-from .session_host import STEER_CONTACT_SECONDS, WATCH_THREADS, HostEvent, SessionHost, received_under
+from .session_host import STEER_CONTACT_SECONDS, WATCH_THREADS, HostEvent, SessionHost
 
 log = hostlog.get("agent_comms.node_sessions")     # (host-side logging: every line a deferred record, hostlog)
 
@@ -238,7 +238,7 @@ class SessionRunner:
         self.last_fetch: tuple | None = None
         # The evidence above, between the loop, node.py's hellos and the watchdog: its own short lock, never the
         # host's (R2-09). Order: the host's lock (where held), then this, then an attempt's.
-        self.ack_lock = hostlog.HostLock(threading.RLock())     # (a boundary: host-side logging, review round 1, R1)
+        self.ack_lock = threading.RLock()     # (a host lock: `with hostlog.BOUNDARY, self.ack_lock:`, R1, R18)
         # (R8-04, R9-01) The steer diagnostics, each bounded by construction:
         # - a held attempt's reasons (another turn, not the held attempt): session -> (its uuid, the reasons said),
         #   at most one entry per open session, of at most two reasons; gone with the slot (a new attempt is said
@@ -302,10 +302,10 @@ class SessionRunner:
         # nothing can start before the first listing anyway (a session is opened, and its inbox filled, only from a
         # listing the loop applied; `recover()` only stops what an earlier process left and reads its records).
         self._last_contact = clock()
-        # The host, between the loop, the watchdog and shutdown(): THE runner lock, a host lock (hostlog.HostLock): no
+        # The host, between the loop, the watchdog and shutdown(): THE runner lock, a host lock (native: `with hostlog.BOUNDARY, self.lock:`, R18): no
         # log handler runs on a thread that holds it; what was logged under it is written once it is let go (by the
         # loop and shutdown; never on the watchdog's thread)
-        self.lock = hostlog.HostLock(threading.Lock())
+        self.lock = threading.Lock()
         self.watched: list[HostEvent] = []            # what the watchdog's self-stop reported, for the loop to post
         self.watched_steer: list[HostEvent] = []      # ... of a steer attempt's session: posted before LOST detection
         # (Enabling PR, ruling S5(c)) True while a listing is being reconciled: the watchdog's own lane (`watched`) is
@@ -316,7 +316,7 @@ class SessionRunner:
         self.latched_at: float | None = None
         self.latch_lock = threading.Lock()            # the latch, between the loop's calls, the loop and the watchdog
         # the report queue: one flush at a time, shutdown's last (a boundary: host-side logging, review round 1, R1)
-        self.report_lock = hostlog.HostLock(threading.Lock())
+        self.report_lock = threading.Lock()
         self.seq = self._load_seq()                   # the last report's stamp (`_stamp`), an earlier process's included
         self.seq_unsaved = False                      # the last attempt to put it on disk failed (said once)
         self.hub_seq = 0                              # the highest stamp the hub says it applied, for any session
@@ -616,7 +616,7 @@ class SessionRunner:
         is dropped, so one bad event never holds the others back. Once shutdown has begun only shutdown's own flush
         (`final`) posts: the loop's would race it, and an older status sent after shutdown's would bring a dead pid
         back to life on the hub."""
-        with self.report_lock:
+        with hostlog.BOUNDARY, self.report_lock:
             if self.stopping.is_set() and not final:
                 return False
             ok = self._post_pending()
@@ -938,11 +938,12 @@ class SessionRunner:
         fetch_sent = self.clock()
         if ok and (wait or not self.fresh or self.clock() - self.last_sync >= self.sync_seconds):
             try:
-                with self.ack_lock:
+                with hostlog.BOUNDARY, self.ack_lock:
                     fetch_sent = self.clock()
                     snapshot = (self.hello_ack, dict(self.report_ack)), self.ack_seq   # as it stood when it was sent
                 data = self._sync(wait)
-                with received_under(self.ack_lock, self.clock) as received:
+                with hostlog.BOUNDARY, self.ack_lock:
+                    received = self.clock()     # (R4-02: the receipt time is read AFTER the lock is taken)
                     # Frozen when the answer came (R3-03): its receipt time (the offer's age is judged here; read
                     # under the lock that freezes the history, R4-02) and the acknowledgements received while it was
                     # out; what comes later counts only as current authority.
@@ -957,7 +958,7 @@ class SessionRunner:
             # The queue and the stop flags held here may be out of date (the human may just have closed a session):
             # turns already running go on, nothing new is handed over until a fetch has succeeded again.
             self.fresh = False
-        with self.lock, self.host.one_drain_budget():   # (R5-04) one drain deadline for this whole hold of the lock
+        with hostlog.BOUNDARY, self.lock, self.host.one_drain_budget():   # (R5-04) one drain deadline for this whole hold of the lock
             if self.stopping.is_set():
                 return ok
             now = self.clock()
@@ -1449,7 +1450,7 @@ class SessionRunner:
                 for d in (self.status, self.reported, self.acked_modes, self.last_busy, self.queue, self.sent, self.tree,
                           self.parent_of):
                     d.pop(sid, None)
-                with self.ack_lock:
+                with hostlog.BOUNDARY, self.ack_lock:
                     self.report_ack.pop(sid, None)
                 # The session is gone here, so "the hub no longer lists it: report nothing" has done its work. It
                 # must be lifted BEFORE the worktree is looked at: that its worktree was removed is the one thing
@@ -1483,7 +1484,7 @@ class SessionRunner:
         answer names in flight (never a bool or another session's answer). Kept only for a session open here
         (S2-13)."""
         if sid not in self.host.sessions:
-            with self.ack_lock:
+            with hostlog.BOUNDARY, self.ack_lock:
                 self.report_ack.pop(sid, None)
             return
         ok = isinstance(answer, dict) and answer.get("session_id") == sid
@@ -1494,7 +1495,7 @@ class SessionRunner:
         """One acknowledgement: into the evidence and its log, then into every held attempt's record, each under its
         own lock, where it counts for that attempt only if it names it (SteerSlot.ack: a break, if it came after the
         contact ran out, is latched there for good, S2-03)."""
-        with self.ack_lock:
+        with hostlog.BOUNDARY, self.ack_lock:
             received = self.clock()
             if about is None:
                 self.hello_ack = max(self.hello_ack, sent)
@@ -1588,7 +1589,7 @@ class SessionRunner:
         fetch = self.last_fetch if self.last_fetch is not None and self.last_fetch[0] == fetch_sent else None
         big = len(json.dumps(item["text"]).encode()) > STEER_MAX_BYTES
         why = err = None
-        with self.ack_lock:     # no acknowledgement slips between the walk and the record's creation
+        with hostlog.BOUNDARY, self.ack_lock:     # no acknowledgement slips between the walk and the record's creation
             fresh, cover = self._offer_contact(sid, n, fetch, self.clock())
             try:
                 why = self.host.steer_offer(sid, str(n), item["uuid"], item["text"], authorized=fresh and not big,
@@ -1701,7 +1702,7 @@ class SessionRunner:
         (Review round 5, ruling W) On this thread the host saves nothing, writes no transcript, runs no log handler
         and formats no traceback (all deferred to the loop). Each step is on its own: one that raises never keeps
         the next from running."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             if self.stopping.is_set():
                 return          # shutdown stops everything itself
             now = self.clock()
@@ -1781,7 +1782,7 @@ class SessionRunner:
         """The first step of a shutdown: SIGTERM to every session process, now. No waiting and no reporting, so the
         node can go on to stop its ordinary runs at once (node.run); `shutdown()` does the rest."""
         self.stopping.set()     # (R4-01: every held steer record is marked first: no steer byte after this)
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             for s in self.host.sessions.values():
                 if s.child is not None:
                     try:
@@ -1794,13 +1795,13 @@ class SessionRunner:
 
     def alive(self) -> bool:
         """After `signal()`: is any session process, or anything in its process group, still there?"""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             return any(self._going(s) for s in self.host.sessions.values())
 
     def kill(self) -> None:
         """After `signal()` and the grace period: SIGKILL for every session process group that is still there. No
         reporting; `shutdown()` then finds them gone."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             for s in self.host.sessions.values():
                 if self._going(s):
                     s.child.kill()
@@ -1813,7 +1814,7 @@ class SessionRunner:
         self.stopping.set()
         if self.thread is not None:
             self.thread.join(JOIN_SECONDS)
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             # stop_all reports the turn in flight and says nothing of a message still in a session's inbox. Such a
             # message never reached a process, so it is given back: the hub still lists it as queued, and with its
             # number no longer recorded as handed the next node process delivers it (once) instead of failing it.
@@ -1833,11 +1834,12 @@ class SessionRunner:
         # A flush the loop began before `stopping` may still be on its way: wait for it (a hub call is bounded by the
         # client's timeout) rather than post beside it. If it never returns, nothing is reported from here and the
         # next node process reports the lost turns.
-        if not self.report_lock.acquire(timeout=REPORT_WAIT_SECONDS):
-            log.warning("a report to the hub is still under way; the session shutdown is not reported")
-            return
-        self.report_lock.release()
-        with self.lock:             # the loop is past its last pass: `pending` and `status` are shutdown's now
+        with hostlog.BOUNDARY:      # (R18.2: the native acquire and release, in main's own shape, inside a boundary)
+            if not self.report_lock.acquire(timeout=REPORT_WAIT_SECONDS):
+                log.warning("a report to the hub is still under way; the session shutdown is not reported")
+                return
+            self.report_lock.release()
+        with hostlog.BOUNDARY, self.lock:             # the loop is past its last pass: `pending` and `status` are shutdown's now
             for attempt in (1, 2):
                 # (Review round 6, ruling X) the final handoff, tried once more if it raises; exhausted, what was not
                 # taken stays where it was published (this process reports no more of it: the next node process

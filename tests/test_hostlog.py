@@ -229,14 +229,26 @@ HOST_SIDE = ["session_host.py", "node_sessions.py", "node.py", "node_groups.py",
              "providers/claude.py", "providers/codex.py", "hostlog.py"]
 LOCK_KINDS = {"Lock", "RLock", "Condition", "Semaphore", "BoundedSemaphore", "Event", "Barrier"}
 # (Review round 1, R1) The locks of the host-side modules under which no line can be logged, each with why; every
-# other lock constructed there is a boundary (`hostlog.HostLock`). DESIGN_NOTES "Host-side logging: review round 1"
-# has the whole table.
+# other lock constructed there is a HOST lock (BOUNDARIES): a native lock, entered only as
+# `with hostlog.BOUNDARY, lock:` (review round 3, R18). DESIGN_NOTES "Host-side logging: review round 1" has the whole
+# table.
+BOUNDARIES = {
+    ("node_groups.py", "self.lock"): "the registry lock (an RLock)",
+    ("node_sessions.py", "self.ack_lock"): "the acknowledgement lock (an RLock)",
+    ("node_sessions.py", "self.lock"): "the runner lock (a Lock)",
+    ("node_sessions.py", "self.report_lock"): "the report lock (a Lock)",
+    ("session_host.py", "lock"): "a steer attempt's record lock (an RLock, a SteerSlot field)",
+    ("session_host.py", "self._steer_stop_lock"): "the cutoff lock (an RLock)",
+}
+HOST_LOCK_ATTRS = {"lock", "ack_lock", "report_lock", "_steer_stop_lock"}     # (their names where they are entered)
 NOT_BOUNDARIES = {
     ("session_host.py", "self.usage_lock"): "held only to copy or update the usage dict (clean_usage logs nothing)",
     ("node_sessions.py", "self.latch_lock"): "held only for a comparison and an assignment",
     ("node_sessions.py", "self.checkpoint_cond"): "held only to queue, pop or clear checkpoints, and to wait or notify",
     ("node_sessions.py", "class _Stopping"): "an Event: its lock is held only inside set/wait (steer_stopping first)",
-    ("hostlog.py", "_cond"): "the queue's own lock: never held across a handler, a log call or foreign code",
+    ("hostlog.py", "_LOCK"): "the queue's own lock (raw, entered only as `with _LOCK:`): never held across a handler, "
+                             "a log call or foreign code",
+    ("hostlog.py", "_cond"): "built on `_LOCK`: the writer's own idle wait and the notifies only",
 }
 
 
@@ -273,15 +285,20 @@ def _owner(node, up):
     return None
 
 
-def test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time(env):
-    """R1 (review round 1): the runner's lock, report lock and ack lock, the host's cutoff lock, the registry's lock and
-    a steer attempt's record lock are boundaries (`HostLock`) as constructed."""
+def test_the_locks_a_line_can_be_logged_under_are_native_at_run_time(env):
+    """R1 (review round 1) and R18 (review round 3): the runner's lock, report lock and ack lock, the host's cutoff lock,
+    the registry's lock and a steer attempt's record lock are NATIVE locks as constructed (their acquire and release
+    are C code), the runner's and the report lock plain Locks as on main, the others RLocks; hostlog's own lock is a
+    raw Lock."""
+    import threading
     from agent_comms import hostlog
     from agent_comms.session_host import SteerSlot
     runner = env.node.sessions
-    for lock in (runner.lock, runner.report_lock, runner.ack_lock, runner.host._steer_stop_lock,
-                 runner.host.groups.lock, SteerSlot("u", "1", "t").lock):
-        assert isinstance(lock, hostlog.HostLock)
+    lock_t, rlock_t = type(threading.Lock()), type(threading.RLock())
+    assert [type(x) for x in (runner.lock, runner.report_lock)] == [lock_t, lock_t]
+    assert [type(x) for x in (runner.ack_lock, runner.host._steer_stop_lock, runner.host.groups.lock,
+                              SteerSlot("u", "1", "t").lock)] == [rlock_t] * 4
+    assert type(hostlog._LOCK) is lock_t and hostlog._cond._lock is hostlog._LOCK
 
 
 # (Review round 1, R2) Every thread the host-side modules start: the loop drains; every other one is enqueue-only.
@@ -859,7 +876,7 @@ def test_a_thread_holding_a_host_lock_never_waits(env, monkeypatch):
             with hostlog._cond:
                 hostlog._state["stalled_at"] = None
             t0 = _time.monotonic()
-            with lock:
+            with hostlog.BOUNDARY, lock:        # (as the host enters it)
                 session_host.log.warning("under the lock")
                 inside = _time.monotonic() - t0
             assert inside < 0.1, inside
@@ -879,13 +896,14 @@ def test_a_thread_holding_a_host_lock_never_waits(env, monkeypatch):
 
 def _lock_problems(rel, tree, reviewed=None):
     """THE checker (R1, R6, R10): every problem with how a module of the host-side modules builds its locks, as
-    (line, what): a lock, condition, event or semaphore built outside an assignment, `hostlog.HostLock(...)` or a base
-    class, or built in an assignment not on the reviewed list (`reviewed`, default NOT_BOUNDARIES); `threading`
+    (line, what): a lock, condition, event or semaphore built outside an assignment, `threading.Condition(...)` or a
+    base class, or built in an assignment not on the reviewed list (`reviewed`, default BOUNDARIES and
+    NOT_BOUNDARIES); `threading`
     aliased or used as a value; `from threading import` of a lock kind or `*`; a bare lock name the module does not
     define or import from elsewhere; a `return` of a lock built in the function (directly, or through a local it was
     assigned to)."""
     import ast
-    reviewed = NOT_BOUNDARIES if reviewed is None else reviewed
+    reviewed = {**BOUNDARIES, **NOT_BOUNDARIES} if reviewed is None else reviewed
     up = _parents(tree)
     problems = []
     elsewhere = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
@@ -914,8 +932,8 @@ def _lock_problems(rel, tree, reviewed=None):
             parent = up.get(node)
             call = parent if isinstance(parent, ast.Call) and parent.func is node else None
             wrapper = up.get(call) if call is not None else None
-            if isinstance(wrapper, ast.Call) and call in wrapper.args and ast.unparse(wrapper.func) in (
-                    "hostlog.HostLock", "HostLock", "threading.Condition"):
+            if isinstance(wrapper, ast.Call) and call in wrapper.args and ast.unparse(wrapper.func) == (
+                    "threading.Condition"):
                 continue
             owner = _owner(node, up)
             if (rel, owner) not in reviewed:
@@ -931,9 +949,9 @@ def _lock_problems(rel, tree, reviewed=None):
 
 
 def test_every_lock_of_the_host_side_modules_is_built_as_reviewed():
-    """R1, R6 (and R10's checker): in every host-side module, every lock is a boundary (`hostlog.HostLock`) or on the
-    reviewed list of those under which no line can be logged, built in the allowed forms only; the list has no stale
-    entry."""
+    """R1, R6 (and R10's checker): in every host-side module, every lock is a host lock (BOUNDARIES) or on the
+    reviewed list of those under which no line can be logged, built in the allowed forms only; neither list has a
+    stale entry."""
     import ast
     found = set()
     for rel in HOST_SIDE:
@@ -943,9 +961,9 @@ def test_every_lock_of_the_host_side_modules_is_built_as_reviewed():
         up = _parents(tree)
         for node in ast.walk(tree):
             if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "threading"
-                    and node.attr in LOCK_KINDS and (rel, _owner(node, up)) in NOT_BOUNDARIES):
+                    and node.attr in LOCK_KINDS and (rel, _owner(node, up)) in {**BOUNDARIES, **NOT_BOUNDARIES}):
                 found.add((rel, _owner(node, up)))
-    assert found == set(NOT_BOUNDARIES), set(NOT_BOUNDARIES) - found
+    assert found == set(BOUNDARIES) | set(NOT_BOUNDARIES), (set(BOUNDARIES) | set(NOT_BOUNDARIES)) - found
 
 
 @pytest.mark.parametrize("src", [
@@ -967,13 +985,95 @@ def test_the_checker_refuses_each_way_around_it(src):
 
 
 def test_the_checker_accepts_the_reviewed_forms():
-    """R10: what the modules do passes: a boundary, a dataclass factory of one, a reviewed native lock."""
+    """R10: what the modules do passes: a host lock, a dataclass factory of one, a reviewed native lock."""
     import ast
     src = ("import threading\nfrom . import hostlog\nfrom dataclasses import field\n"
-           "lock = hostlog.HostLock(threading.RLock())\n"
-           "class A:\n    slot: object = field(default_factory=lambda: hostlog.HostLock(threading.RLock()))\n"
+           "lock = threading.RLock()\n"
+           "class A:\n    slot: object = field(default_factory=lambda: threading.RLock())\n"
            "    def __init__(self):\n        self.latch = threading.Lock()\n")
-    assert _lock_problems("fixture.py", ast.parse(src), reviewed={("fixture.py", "self.latch")}) == []
+    assert _lock_problems("fixture.py", ast.parse(src), reviewed={
+        ("fixture.py", "self.latch"): "", ("fixture.py", "lock"): "", ("fixture.py", "slot"): ""}) == []
+
+
+def _r18_problems(rel, tree):
+    """R18 (A1, A2), THE pin of how a host lock and hostlog's own lock are ENTERED (what `_lock_problems` is to how
+    they are built): (line, what) for
+    - a `with` that enters a host lock (`HOST_LOCK_ATTRS`) without `hostlog.BOUNDARY` as its FIRST item;
+    - an explicit `acquire(` of a host lock outside a `with hostlog.BOUNDARY:`;
+    - a host lock built as anything but the native call itself (no wrapper, `BOUNDARIES` owners only);
+    - in hostlog.py: a `with _cond` (the queue's lock is entered only as `with _LOCK:`), and `_LOCK` built as anything
+      but `threading.Lock()`;
+    - a generator (a `yield` in the function) that enters a host lock or `_LOCK`: no generator or `@contextmanager`
+      helper holds one across a `yield`;
+    - any `HostLock` (the Python wrapper whose `__exit__` an interrupt could enter before the release)."""
+    import ast
+    up, problems = _parents(tree), []
+
+    def host(expr):
+        return isinstance(expr, ast.Attribute) and expr.attr in HOST_LOCK_ATTRS
+
+    def in_boundary(node):
+        at = node
+        while at in up:
+            at = up[at]
+            if isinstance(at, ast.With) and ast.unparse(at.items[0].context_expr) == "hostlog.BOUNDARY":
+                return True
+        return False
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Name) and node.id == "HostLock" or isinstance(node, ast.Attribute) and \
+                node.attr == "HostLock":
+            problems.append((line, "HostLock"))
+        if isinstance(node, ast.With):
+            exprs = [i.context_expr for i in node.items]
+            if any(host(e) for e in exprs) and ast.unparse(exprs[0]) != "hostlog.BOUNDARY":
+                problems.append((line, f"`{ast.unparse(node).splitlines()[0]}` does not enter the boundary first"))
+            if rel == "hostlog.py" and any(ast.unparse(e) == "_cond" for e in exprs):
+                problems.append((line, "`with _cond` (the queue's lock is entered as `with _LOCK:`)"))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "acquire" \
+                and host(node.func.value) and not in_boundary(node):
+            problems.append((line, f"`{ast.unparse(node)}` outside a `with hostlog.BOUNDARY:`"))
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            target = ast.unparse(node.targets[0] if isinstance(node, ast.Assign) else node.target)
+            value = ast.unparse(node.value) if node.value is not None else ""
+            if (rel, target) in BOUNDARIES and value not in (
+                    "threading.RLock()", "threading.Lock()",
+                    "field(default_factory=lambda: threading.RLock(), repr=False, compare=False)"):
+                problems.append((line, f"{target} is not built as a native lock: {value}"))
+            if rel == "hostlog.py" and target == "_LOCK" and value != "threading.Lock()":
+                problems.append((line, f"_LOCK is built as {value}"))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(node)):
+            for w in ast.walk(node):
+                if isinstance(w, ast.With) and any(host(i.context_expr) or ast.unparse(i.context_expr) == "_LOCK"
+                                                   for i in w.items):
+                    problems.append((getattr(w, "lineno", 0), f"the generator {node.name} holds a lock"))
+    return problems
+
+
+def test_r18_every_host_lock_and_hostlogs_own_lock_is_entered_by_c_code():
+    """R18 (A1, A2), statically, over every host-side module: each host lock is a native lock entered only as
+    `with hostlog.BOUNDARY, lock:` (or acquired explicitly inside a boundary, in main's own shape), hostlog's lock only
+    as `with _LOCK:`, no generator holds either, and `HostLock` is gone."""
+    for rel in HOST_SIDE:
+        tree, path = _module(rel)
+        problems = _r18_problems(rel, tree)
+        assert not problems, [f"{path.name}:{ln}: {what}" for ln, what in problems]
+
+
+@pytest.mark.parametrize("src", [
+    "from . import hostlog\nclass A:\n    def f(self):\n        with self.lock:\n            pass\n",
+    "from . import hostlog\nclass A:\n    def f(self):\n        with self.lock, hostlog.BOUNDARY:\n            pass\n",
+    "class A:\n    def f(self):\n        self.ack_lock.acquire()\n",
+    "import threading\nfrom . import hostlog\nclass A:\n    def __init__(self):\n"
+    "        self.lock = hostlog.HostLock(threading.RLock())\n",
+    "from contextlib import contextmanager\nfrom . import hostlog\n@contextmanager\ndef held(slot):\n"
+    "    with hostlog.BOUNDARY, slot.lock:\n        yield\n",
+], ids=["no-boundary", "boundary-second", "bare-acquire", "wrapper", "generator"])
+def test_the_r18_pin_refuses_each_unsafe_form(src):
+    """R18: the SAME pin refuses each form an interrupt could leave a lock held through, as source text."""
+    import ast
+    assert _r18_problems("node_sessions.py", ast.parse(src)), src
 
 
 THREADS = {"hosted-sessions": ("run_forever", "the session loop"),
@@ -1635,57 +1735,32 @@ def test_r11_an_enqueue_after_the_seal_raises_nothing_starts_nothing_and_blocks_
     assert not hostlog._state["sealed"] and hostlog._writer[0] is not None
 
 
-def test_r11_the_seal_and_the_idle_decision_are_one_step(monkeypatch):
-    """R11 (the atomicity): a producer that tries to enqueue exactly when the final wait has decided "idle" cannot get
-    in before the seal: its record is rejected and no handler is entered.
-
-    Deterministic: `_cond` is wrapped so that, once "idle" has been decided, any LATER entry of the queue's lock by the
-    deciding thread first lets the producer in (and waits until it has enqueued or been rejected). A seal made in a
-    second critical section is therefore always preceded by the producer's record; the seal made in the deciding
-    critical section never re-enters, and the producer runs only after it."""
+def test_r11_the_seal_comes_before_the_final_waits_first_look(monkeypatch):
+    """R11 (the atomicity) with the final wait sealing FIRST: a producer let in exactly when the final wait starts to
+    look (its first check, the seal already made) is rejected: the sequence never advances (R16) and no handler is
+    entered. With the seal made after the wait, the producer's record would be accepted."""
     import threading
     from agent_comms import hostlog, session_host
-    real_idle_by, real_cond = hostlog._idle_by, hostlog._cond
-    go, done, decided, main = threading.Event(), threading.Event(), [False], threading.get_ident()
+    real_wait_for, done, ran = hostlog._wait_for, threading.Event(), []
 
-    class Gate:
-        def __getattr__(self, name):
-            return getattr(real_cond, name)
-
-        def __enter__(self):
-            if decided[0] and threading.get_ident() == main:
-                decided[0] = False
-                go.set()                    # (the producer runs now, with the queue's lock free)
-                assert done.wait(5)
-            return real_cond.__enter__()
-
-        def __exit__(self, *a):
-            return real_cond.__exit__(*a)
-
-    def idle_by(deadline, **k):
-        ok = real_idle_by(deadline, **k)
-        decided[0] = ok
-        return ok
+    def wait_for(check, deadline):
+        if not ran:
+            ran.append(True)
+            threading.Thread(target=lambda: _on_watch_thread(producer), daemon=True).start()
+            assert done.wait(5)
+        return real_wait_for(check, deadline)
 
     def producer():
-        go.wait(10)
-        session_host.log.warning("between the idle decision and the seal")
+        session_host.log.warning("at the final wait's first look")
         done.set()
     with _Records() as rec:
-        monkeypatch.setattr(hostlog, "_idle_by", idle_by)
-        monkeypatch.setattr(hostlog, "_cond", Gate())
-        threading.Thread(target=lambda: _on_watch_thread(producer), daemon=True).start()
         seq = hostlog._state["seq"]
-        try:
-            assert hostlog.final_flush(2.0) is True
-        finally:
-            decided[0] = False
-            go.set()                        # (the seal is made: the producer runs now, and is rejected)
-            assert done.wait(5)
-            monkeypatch.setattr(hostlog, "_cond", real_cond)
-        assert hostlog._state["sealed"]
+        monkeypatch.setattr(hostlog, "_wait_for", wait_for)
+        assert hostlog.final_flush(2.0) is True
+        monkeypatch.setattr(hostlog, "_wait_for", real_wait_for)
+        assert ran and hostlog._state["sealed"]
         assert hostlog._state["seq"] == seq, "the late enqueue never advances the sequence (R16)"
-    assert "between the idle decision and the seal" not in rec.messages()
+    assert "at the final wait's first look" not in rec.messages()
 
 
 def test_r11_a_line_logged_during_the_final_wait_is_rejected(monkeypatch):
@@ -1846,7 +1921,7 @@ def test_a4_no_enqueue_under_a_host_lock_or_on_a_lifecycle_thread_starts_the_wri
     monkeypatch.setattr(hostlog, "ACK_SECONDS", 0.2)
     for lock in (runner.lock, runner.host._steer_stop_lock, runner.host.groups.lock):
         _no_writer()
-        with lock:
+        with hostlog.BOUNDARY, lock:        # (as the host enters it)
             session_host.log.warning("under a host lock")
             assert calls == [], lock    # (no start while the lock is held ...)
         assert calls == ["start"], lock     # (... the lazy start is the standalone caller's, at depth 0)
@@ -2319,6 +2394,355 @@ def test_pr_a_record_that_cannot_be_made_is_counted_not_lost_silently():
     notice = "1 deferred log line(s) were dropped (the queue was full, or a line could not be made a record)"
     assert probe.written[-3:] == [notice, notice, "the next line"], (probe.written, probe.errors)  # (a notice owed
     # is written before the next queued line: one per loss here)
+
+
+# ---------------------------------------------------------------- review round 3 (the PR's reviews): R18 to R22
+
+
+_LOCK_SCRIPT = r"""
+import os, signal, sys, threading
+from pathlib import Path
+from agent_comms import hostlog
+
+def on_term(signum, frame):
+    raise KeyboardInterrupt         # as node._run's on_term does
+signal.signal(signal.SIGTERM, on_term)
+kind = sys.argv[1]
+if kind == "rlock":                 # the registry's lock, as production builds it
+    from agent_comms.node_groups import Groups
+    lock, boundary = Groups().lock, True
+elif kind == "lock":                # the runner's lock (a plain Lock), as production builds it
+    import httpx
+    from agent_comms.dispatch import DispatchConfig
+    from agent_comms.node_sessions import SessionRunner
+    runner = SessionRunner(httpx.Client(), DispatchConfig.from_dict({"sessions": {"enabled": True}}),
+                           Path(sys.argv[2]) / "logs")
+    lock, boundary = runner.lock, True
+else:                               # hostlog's own lock, as hostlog enters it
+    lock, boundary = getattr(hostlog, "_LOCK", None) or hostlog._cond, False
+native = getattr(lock, "_lock", lock)       # (the lock itself, or the one a Python wrapper holds)
+
+def c_body():
+    # A long C call that holds the GIL. The SIGTERM is sent by this process's own timer thread, which can run only
+    # when the main thread next lets the GIL go, at its first check after the call: so the signal is handled at the
+    # same point, which is inside the lock's exit when that exit is Python code (the reviewer's probe).
+    threading.Timer(0.2, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+    sum(range(3 * 10**8))
+try:
+    if boundary:
+        with hostlog.BOUNDARY, lock:        # (the production form)
+            print("in", flush=True)
+            c_body()
+    else:
+        with lock:
+            print("in", flush=True)
+            c_body()
+    print("no interrupt", flush=True)
+except KeyboardInterrupt:
+    print("interrupted", flush=True)
+got = []
+
+def take():
+    if native.acquire(timeout=2):
+        got.append(True)
+        native.release()
+other = threading.Thread(target=take)
+other.start()
+other.join(5)
+print("free" if got == [True] else "held", flush=True)
+"""
+
+
+def _signalled_child(tmp_path, script, *args, ready="in", wait=30, send=True):
+    """Run `script` as the test's OWN child; once it printed `ready`, send it a real SIGTERM (unless `send` is False:
+    the child signals itself). Bounded handshake and cleanup (R13/R16): (status or None if it never ended, its stdout
+    lines, the tail of its stderr)."""
+    import os
+    import queue as _queue
+    import signal
+    import subprocess
+    import sys
+    import threading
+    import time as _time
+    from pathlib import Path
+    path = tmp_path / "child.py"
+    path.write_text(script)
+    child = subprocess.Popen([sys.executable, str(path), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, cwd=str(tmp_path),
+                             env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1]),
+                                  "AGENT_COMMS_HOME": str(tmp_path / "home")})
+    lines: _queue.Queue = _queue.Queue()
+
+    def read():
+        for line in child.stdout:
+            lines.put(line.rstrip("\n"))
+        lines.put(None)
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    out, status = [], None
+    try:
+        deadline = _time.monotonic() + 30
+        while ready not in out:
+            line = lines.get(timeout=max(0.0, deadline - _time.monotonic()))
+            if line is None:
+                break
+            out.append(line)
+        if ready in out and send:
+            child.send_signal(signal.SIGTERM)       # (the test's own child, and only it)
+        try:
+            status = child.wait(wait)
+        except subprocess.TimeoutExpired:
+            status = None
+    except _queue.Empty:
+        pass
+    finally:
+        if child.poll() is None:
+            child.kill()                            # (through its own handle)
+            child.wait(5)
+        reader.join(5)
+        err = child.stderr.read()[-2000:]
+        child.stdout.close()
+        child.stderr.close()
+    while not lines.empty():
+        x = lines.get_nowait()
+        if x is not None:
+            out.append(x)
+    return status, out, err
+
+
+@pytest.mark.parametrize("kind", ["rlock", "lock", "hostlog"])
+def test_r18_a_real_sigterm_at_the_end_of_a_locked_body_leaves_the_lock_free(tmp_path, kind):
+    """R18 (A1, A7a): a real SIGTERM lands while the main thread is in a long C call at the end of a `with` body
+    holding a host lock over an RLock (the registry's), one over a plain Lock (the runner's), or hostlog's own lock,
+    each entered in its production form. The handler raises (as `node._run`'s does): the KeyboardInterrupt
+    propagates, the native lock is FREE afterwards (another thread takes it at once), and the process exits. (The
+    child sends the signal to itself from a timer thread: see the script.)"""
+    status, out, err = _signalled_child(tmp_path, _LOCK_SCRIPT, kind, str(tmp_path), send=False)
+    assert out[:2] == ["in", "interrupted"], (out, err)
+    assert out[2:3] == ["free"], (out, err)
+    assert status == 0, (status, out, err)
+
+
+_FINAL_WAIT_SCRIPT = r"""
+import logging, signal, threading
+from agent_comms import hostlog, node
+
+def on_term(signum, frame):
+    raise KeyboardInterrupt
+signal.signal(signal.SIGTERM, on_term)
+
+class Stuck(logging.Handler):
+    def emit(self, record):
+        threading.Event().wait()            # blocks for good, holding the handler's own lock
+
+logging.getLogger("agent_comms").addHandler(Stuck())
+logging.getLogger("agent_comms").setLevel(logging.INFO)
+with hostlog.enqueue_only():
+    hostlog.start_writer()
+    node.log.warning("a line")
+    print("waiting", flush=True)
+    node._exit_if_stalled(3)
+print("returned", flush=True)
+"""
+
+
+def test_r21_an_interrupt_during_the_final_wait_takes_the_stalled_exit(tmp_path):
+    """R21 (A3, A7b): a real SIGTERM lands during the node's final wait (the writer is stuck in a handler holding its
+    lock): the interrupt is treated as stalled, so the process ends at once with the status already selected (3)
+    instead of escaping into the interpreter's `logging.shutdown()`, which would block on the stuck handler."""
+    status, out, err = _signalled_child(tmp_path, _FINAL_WAIT_SCRIPT, ready="waiting", wait=20)
+    assert status == 3, (status, out, err)
+    assert out == ["waiting"], (out, err)
+
+
+def test_r21_the_main_threads_final_wait_holds_the_queues_lock_only_briefly(monkeypatch):
+    """A3: on the main thread the final wait polls OUTSIDE the queue's lock (a short `with` per look, then a sleep),
+    never `Condition.wait`: an interrupt there can neither leave the lock held nor be masked."""
+    import threading
+    from agent_comms import hostlog
+    assert threading.current_thread() is threading.main_thread()
+    release = threading.Event()
+
+    def act(r):
+        if r.getMessage() == "blocks":
+            release.wait(10)
+    waits, real_wait = [], hostlog._cond.wait
+
+    def wait(*a, **k):
+        if threading.current_thread() is threading.main_thread():
+            waits.append(a)
+        return real_wait(*a, **k)
+    monkeypatch.setattr(hostlog._cond, "wait", wait)
+    with _Records(act=act):
+        with hostlog.enqueue_only():
+            __import__("agent_comms.session_host").session_host.log.warning("blocks")
+        assert _wait(lambda: hostlog._state["busy"] is not None)
+        assert hostlog.final_flush(0.3) is False
+        lock = getattr(hostlog, "_LOCK", None)
+        assert lock is not None and not lock.locked(), "the queue's lock is free during and after the final wait"
+        release.set()
+    assert waits == [], "no Condition.wait on the main thread"
+
+
+def test_r20_a_chained_exception_keeps_every_type_and_frame_and_no_text():
+    """R20 (A6): an error wrapped and re-raised (`raise ... from`) and one raised while handling another: the line
+    shows the root's type and its location, in stock logging's order and with its separators, and no message text."""
+    from agent_comms import session_host
+    lines = []
+    h = logging.Handler(logging.DEBUG)
+    h.emit = lambda r: lines.append(h.format(r))
+    lg = logging.getLogger("agent_comms")
+    lg.addHandler(h)
+
+    def root():
+        raise KeyError("ROOT-SECRET")
+
+    def wrap():
+        try:
+            root()
+        except KeyError as e:
+            raise RuntimeError("WRAP-SECRET") from e
+
+    def during():
+        try:
+            wrap()
+        except RuntimeError:
+            raise ValueError("DURING-SECRET")
+    try:
+        try:
+            during()
+        except ValueError:
+            session_host.log.exception("chained")
+        from agent_comms import hostlog
+        assert hostlog.flush(5)
+    finally:
+        lg.removeHandler(h)
+    [text] = [x for x in lines if x.startswith("chained")]
+    assert "SECRET" not in text, text
+    order = [text.index(k) for k in ("in root", "KeyError", "direct cause", "RuntimeError", "During handling",
+                                     "ValueError")]
+    assert order == sorted(order), text     # (the root first, with its location; then each link, as stock prints it)
+
+
+def test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so():
+    """R20 (A6): a cycle of contexts and a chain longer than CHAIN_MAX are cut, with a line that says so; the
+    walk reads only BaseException's own descriptors (a subclass's `__cause__` property is never run)."""
+    from agent_comms import hostlog
+
+    class Hostile(Exception):
+        @property
+        def __cause__(self):
+            raise AssertionError("the exception's own code ran")
+
+    a, b = ValueError("A"), KeyError("B")
+    a.__context__, b.__context__ = b, a
+    kept = hostlog._exception(a)
+    assert kept is not None and "cycle" in hostlog._exc_text(kept)
+    e = ValueError("0")
+    for i in range(hostlog.CHAIN_MAX + 5):
+        n = KeyError(str(i))
+        n.__cause__ = e
+        e = n
+    text = hostlog._exc_text(hostlog._exception(e))
+    assert "cut" in text and text.count("direct cause") == hostlog.CHAIN_MAX - 1, text
+    h = Hostile("x")
+    BaseException.__dict__["__cause__"].__set__(h, KeyError("k"))
+    assert "KeyError" in hostlog._exc_text(hostlog._exception(h))
+    assert hostlog.FRAMES_MAX > 0
+
+
+def test_r20_the_frames_of_a_chain_are_capped_and_the_cut_is_said(monkeypatch):
+    """R20 (A6): FRAMES_MAX bounds the frames kept from a whole chain; past it, the line says the chain was cut."""
+    from agent_comms import hostlog
+    monkeypatch.setattr(hostlog, "FRAMES_MAX", 2)
+
+    def deep(n):
+        if n == 0:
+            raise KeyError("k")
+        deep(n - 1)
+    try:
+        deep(5)
+    except KeyError as e:
+        kept = hostlog._exception(e)
+    assert len(kept[1]) == 2 and "more than 2 frames" in hostlog._exc_text(kept), kept
+
+
+def test_a4_stale_bookkeeping_fails_closed_and_only_the_reset_clears_it():
+    """A4: a depth left one too high, or an `enqueue_only()` registration left behind (as an interrupt in their Python
+    exits can leave them, on the main thread), means "never waits": a line is enqueued and the call returns without
+    waiting even with the writer blocked; the tests' `_reset` (no lock held, between tests) is the one reset."""
+    import threading
+    import time as _time
+    from agent_comms import hostlog, session_host
+    release = threading.Event()
+
+    def act(r):
+        if r.getMessage() == "blocks":
+            release.wait(10)
+    with _Records(act=act):
+        try:
+            with hostlog.enqueue_only():
+                session_host.log.warning("blocks")
+            assert _wait(lambda: hostlog._state["busy"] is not None)
+            for stale in ("depth", "registration"):
+                if stale == "depth":
+                    hostlog._local.depth = 1
+                else:
+                    hostlog.ENQUEUE_ONLY.add(threading.get_ident())
+                t0 = _time.monotonic()
+                session_host.log.warning("with stale bookkeeping")
+                assert not hostlog.may_wait() and _time.monotonic() - t0 < 0.1, stale
+                hostlog._reset(idle_seconds=0.1)
+                assert hostlog.may_wait(), stale
+        finally:
+            release.set()
+
+
+def test_r22_only_later_and_facts_make_a_value_the_writer_renders():
+    """R22: a `_Later` made directly (not by `later()` or `facts()`) is not rendered by the writer: it is reduced to
+    its type's name like any other object, so it can never carry an exception's text into a line."""
+    from agent_comms import hostlog
+    direct = hostlog._Later(str, (KeyError("SECRET-TEXT"),))
+    assert hostlog._reduce(direct) == "_Later"
+    assert type(hostlog._reduce(hostlog.later(str.upper, "x"))) is hostlog._Later
+    assert type(hostlog._reduce(hostlog.facts(KeyError("k")))) is hostlog._Later
+
+
+def test_r19_the_nodes_dispatch_helpers_log_through_hostlog(tmp_path, monkeypatch):
+    """R19 (A5): the node hands its hostlog logger (`agent_comms.dispatch`) to the two dispatch helpers it calls, so
+    their lines are written by the writer; called without one (`board dispatch`, standalone), they log through
+    dispatch's own logger, synchronously, as before."""
+    import threading
+    from agent_comms import dispatch, hostlog, node
+    seen = []
+    h = logging.Handler(logging.DEBUG)
+    h.emit = lambda r: seen.append((r.name, r.getMessage(), threading.current_thread().name))
+    lg = logging.getLogger("agent_comms")
+    lg.addHandler(h)
+    try:
+        monkeypatch.setattr(dispatch, "uses_codex", lambda t: True)
+        monkeypatch.setattr(dispatch, "codex_board_server", lambda t, e: {"url": "http://x"})
+        with hostlog.enqueue_only():
+            dispatch.with_managed_env(["codex", "{prompt}"], {"AGENT_COMMS_MANAGED": "1"},
+                                      logger=node.DISPATCH_LOG)
+        dispatch.with_managed_env(["codex", "{prompt}"], {"AGENT_COMMS_MANAGED": "1"})
+        assert hostlog.flush(5)
+    finally:
+        lg.removeHandler(h)
+    names = sorted((n, t == hostlog.WRITER_NAME) for n, m, t in seen if "AGENT_COMMS_MANAGED" in m)
+    assert names == [("agent_comms.dispatch", False), ("agent_comms.dispatch", True)], seen
+
+
+def test_r19_the_node_passes_its_hostlog_logger_at_every_call_of_the_two_helpers():
+    """R19, statically: every call of `remove_browser_output` and `with_managed_env` in node.py passes
+    `logger=DISPATCH_LOG` (a hostlog logger). This pin does NOT check other node-main-thread calls into unconverted
+    modules (the rest of `dispatch`, `config`, third-party libraries): what is outside is stated in the notes."""
+    import ast
+    tree, _ = _module("node.py")
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and getattr(n.func, "id", getattr(n.func, "attr", None)) in ("remove_browser_output", "with_managed_env")]
+    assert calls and all(any(k.arg == "logger" and ast.unparse(k.value) == "DISPATCH_LOG" for k in c.keywords)
+                         for c in calls), [ast.unparse(c) for c in calls]
 
 
 # ---------------------------------------------------------------- R13: the real exit path, a real SIGTERM

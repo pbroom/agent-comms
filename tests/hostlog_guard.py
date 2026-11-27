@@ -52,23 +52,36 @@ class OwnerLock:
 
 
 def own(obj, attr):
-    """Replace `obj.attr` (a host lock) by one that knows its owner, keeping the host's own wrapper (`HostLock`) when
-    there is one: the instrumented lock is the wrapper's inner lock."""
+    """Replace `obj.attr` (a host lock: a native lock, entered by the host as `with hostlog.BOUNDARY, lock:`) by one
+    that knows its owner."""
     lock = getattr(obj, attr)
-    if hostlog is not None and isinstance(lock, hostlog.HostLock):
-        if not isinstance(lock._lock, OwnerLock):
-            lock._lock = OwnerLock(lock._lock)
-        return lock._lock
     if not isinstance(lock, OwnerLock):
         lock = OwnerLock(lock)
         setattr(obj, attr, lock)
     return lock
 
 
+class _HeldAsTheNodeHoldsIt:
+    """(Tests) `with` this: the boundary, then the lock, as the node enters its runner lock
+    (`with hostlog.BOUNDARY, self.lock:`)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __enter__(self):
+        hostlog.BOUNDARY.__enter__()
+        self.inner.acquire()
+        return self
+
+    def __exit__(self, *a):
+        self.inner.release()
+        hostlog.BOUNDARY.__exit__(*a)
+
+
 def runner_lock():
     """A stand-in for the node's runner lock, as the node holds it around its host calls."""
     inner = OwnerLock(threading.Lock())
-    return (hostlog.HostLock(inner) if hostlog is not None else inner), inner
+    return (_HeldAsTheNodeHoldsIt(inner) if hostlog is not None else inner), inner
 
 
 class _Owned:
@@ -77,8 +90,7 @@ class _Owned:
 
     def __init__(self, obj, attr):
         lock = getattr(obj, attr)
-        inner = lock._lock if hostlog is not None and isinstance(lock, hostlog.HostLock) else lock
-        if hasattr(inner, "_is_owned"):
+        if hasattr(lock, "_is_owned"):
             self.mine = lock._is_owned
         else:
             self.mine = own(obj, attr).mine

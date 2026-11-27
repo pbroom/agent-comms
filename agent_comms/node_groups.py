@@ -34,9 +34,10 @@ class Groups:
     LIVE, STOPPING = "live", "stopping"
 
     def __init__(self) -> None:
-        # THE registry lock, a host lock (hostlog.HostLock): a spawn callback runs under it (`start`), and no log
-        # handler runs on a thread that holds it (what is logged meanwhile is written once it is let go)
-        self.lock = hostlog.HostLock(threading.RLock())
+        # THE registry lock, a host lock (a native RLock, entered as `with hostlog.BOUNDARY, self.lock:`, R18): a spawn
+        # callback runs under it (`start`), and no log handler runs on a thread that holds it (what is logged
+        # meanwhile is written by the writer)
+        self.lock = threading.RLock()
         self.entries: dict[Hashable, dict[Hashable, list]] = {}     # dir key -> group token -> [state, cwd]
 
     def start(self, cwd: Any, token: Hashable, spawn: Callable[[], Any], k: Hashable | None = None) -> tuple[bool, Any]:
@@ -45,7 +46,7 @@ class Groups:
         raises records nothing. `k`: the directory's key, computed once by the caller (who keeps it with the process:
         session_host `_spawn`, review round 1 of the enabling PR, A3); else computed here."""
         k = key(cwd) if k is None else k
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             if any(state == self.STOPPING for state, _ in self.entries.get(k, {}).values()):
                 return False, None
             self.entries.setdefault(k, {})[token] = [self.LIVE, cwd]
@@ -57,7 +58,7 @@ class Groups:
 
     def stopping(self, token: Hashable) -> None:
         """The group is being stopped (signalled, or its leader went on its own and members are left)."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             for groups in self.entries.values():
                 if token in groups:
                     groups[token][0] = self.STOPPING
@@ -74,26 +75,27 @@ class Groups:
         STOPPING entry is inserted for `token` under that key (RESERVED: this call made it), so nothing is admitted on
         that checkout until the verified reap removes it (`gone`). Nothing is ever undone here: once reserved, the
         caller arms the stop's escalation before anything else (session_host `_reserved_stop`)."""
-        if not self.lock.acquire(blocking=False):
-            return self.BUSY
-        try:
-            for groups in self.entries.values():
-                if token in groups:
-                    if groups[token][0] == self.STOPPING:
-                        return self.ALREADY
-                    groups[token][0] = self.STOPPING
+        with hostlog.BOUNDARY:      # (R18.2: the native acquire and release, in main's own shape, inside a boundary)
+            if not self.lock.acquire(blocking=False):
+                return self.BUSY
+            try:
+                for groups in self.entries.values():
+                    if token in groups:
+                        if groups[token][0] == self.STOPPING:
+                            return self.ALREADY
+                        groups[token][0] = self.STOPPING
+                        return self.RESERVED
+                if barrier is not None:
+                    k, cwd = barrier
+                    self.entries.setdefault(k, {})[token] = [self.STOPPING, cwd]
                     return self.RESERVED
-            if barrier is not None:
-                k, cwd = barrier
-                self.entries.setdefault(k, {})[token] = [self.STOPPING, cwd]
-                return self.RESERVED
-            return self.MISSING
-        finally:
-            self.lock.release()
+                return self.MISSING
+            finally:
+                self.lock.release()
 
     def gone(self, token: Hashable) -> None:
         """The whole group is gone: leader reaped, no member left."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             for k in list(self.entries):
                 self._drop(k, token)
 
@@ -106,10 +108,10 @@ class Groups:
 
     def blocked(self, cwd: Any) -> bool:
         """A group being stopped is in this directory."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             return any(state == self.STOPPING for state, _ in self.entries.get(key(cwd), {}).values())
 
     def stopping_dirs(self) -> set[str]:
         """The directories (as recorded) that hold a group being stopped."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             return {cwd for groups in self.entries.values() for state, cwd in groups.values() if state == self.STOPPING}

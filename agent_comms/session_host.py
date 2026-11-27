@@ -145,13 +145,10 @@ HOLD = {"outcome": None, "why": "held"}     # `_steer_end`'s word for a held end
 STEER_S_CUT = "its own turn was cut: {why}"     # S's result when its proved own turn is cut (part D)
 
 
-@contextmanager
-def received_under(lock, clock):
-    """Part E's receipt rule, in one place (R4-02): a receipt time is the clock read AFTER `lock` is taken, never one
-    sampled before waiting for it. Used for an acknowledgement in an attempt's record (`SteerSlot.ack`, the record's
-    lock) and for a fetch's answer (node_sessions, the lock that freezes the fetch's history)."""
-    with lock:
-        yield clock()
+# Part E's receipt rule (R4-02): a receipt time is the clock read AFTER the lock is taken, never one sampled before
+# waiting for it: an acknowledgement in an attempt's record (`SteerSlot.ack`, the record's lock) and a fetch's answer
+# (node_sessions, the lock that freezes the fetch's history), each as `with hostlog.BOUNDARY, lock:` then the read
+# (review round 3, R18: no generator holds a host lock; this was `received_under`, a context manager).
 
 
 def group_alive(pgid: int) -> bool:
@@ -231,8 +228,8 @@ class SteerSlot:
     cover_until: float | None = None
     stopping: bool = False          # the node is stopping: set under `lock` (`steer_stopping`), never written then
     # (Host-side logging, review round 1, R1) a lock a line can be logged under (callbacks of the write gate): a
-    # boundary (hostlog.HostLock)
-    lock: Any = field(default_factory=lambda: hostlog.HostLock(threading.RLock()), repr=False, compare=False)
+    # host lock (native, entered as `with hostlog.BOUNDARY, lock:`, R18)
+    lock: Any = field(default_factory=lambda: threading.RLock(), repr=False, compare=False)
     # (R9-02) The process this attempt was taken for. The slot goes when that process is let go of
     # (`_release_steer`); a cut is only ever made for the current process's own slot.
     process: Any = field(default=None, repr=False, compare=False)
@@ -256,7 +253,7 @@ class SteerSlot:
 
     def contact_ran_out(self, now: float) -> bool:
         """The attempt's own contact clock has run out (whatever else revoked its writing): latched, for good."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             self._expire(now)
             return self.expired
 
@@ -266,10 +263,11 @@ class SteerSlot:
 
     def ack(self, sent: float, clock: Callable[[], float], about: str | None, n: Any) -> None:
         """An acknowledgement, SENT at `sent`, received now: its receipt time is `clock` read under this record's
-        lock (`received_under`, R4-02). A hello (`about` None), or a report on `about` whose answer named `n` in
+        lock (R4-02). A hello (`about` None), or a report on `about` whose answer named `n` in
         flight. It counts for this attempt only if it is evidence for exactly this session and N; received after the
         contact ran out, it latches the break for good instead (S2-03, R2-07)."""
-        with received_under(self.lock, clock) as received:
+        with hostlog.BOUNDARY, self.lock:
+            received = clock()      # (R4-02: the receipt time is read AFTER the lock is taken)
             if self.cover_until is None or self.expired or (self.revoked is not None and not self.holds):
                 return      # (round 3, step 2 parity: a revoked Codex attempt's contact is main's: not extended)
             if about is not None and not (about == self.session_id and type(n) is int and str(n) == self.into):
@@ -283,7 +281,7 @@ class SteerSlot:
 
     def contact_ok(self, now: float) -> bool:
         """The contact holds at `now` (read under this lock); run out, the break is latched for good."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             self._expire(now)
             return self.revoked is None
 
@@ -727,9 +725,9 @@ class SessionHost:
         import threading
         self.usage: dict[str, dict] = {}
         self.usage_lock = threading.Lock()
-        # The steering stop latch's (above): THE cutoff lock, a host lock (hostlog.HostLock: no log handler runs on a
+        # The steering stop latch's (above): THE cutoff lock, a host lock (native, `with hostlog.BOUNDARY, ...:`, R18: no log handler runs on a
         # thread that holds it)
-        self._steer_stop_lock = hostlog.HostLock(threading.RLock())
+        self._steer_stop_lock = threading.RLock()
         # (Review round 2, ruling I) Every event the host publishes goes here at the moment of publication; `tick`,
         # `close`, `cancel`, `stop_turns` and `stop_all` return it, emptied, when they return. An exception that
         # escapes one of them leaves it as it is, and the next of them delivers it: exactly once.
@@ -1099,7 +1097,7 @@ class SessionHost:
                 # Not this attempt (another steer, or this uuid for another N): rejected before it touches anything
                 # of the record (R3-02). Said by the caller, once per held attempt, outside its locks (R8-04).
                 return "not the held attempt"
-            with slot.lock:
+            with hostlog.BOUNDARY, slot.lock:
                 if authorized and slot.revoked is None and slot.refused is None and slot.outcome is None:
                     # Only an offer the node's authority held for (fresh, within the cap), of this very steer for this
                     # very N, adds authority or lifts a fence (S2-05, R2-02); a stale one changes nothing.
@@ -1113,7 +1111,7 @@ class SessionHost:
         hook = self.steer_install_hook
         if hook is not None:
             hook("before", s)
-        with self._steer_stop_lock:
+        with hostlog.BOUNDARY, self._steer_stop_lock:
             # (R5-01) serialized with the stop latch: installed before it (and then marked by it), or born stopped.
             slot = SteerSlot(uuid, into, text, authorized=bool(authorized) and refused is None, refused=refused,
                              session_id=s.session_id, cover_until=cover_until, process=s.child)
@@ -1134,7 +1132,7 @@ class SessionHost:
         slot = s.steer if s is not None else None
         if slot is None or slot.uuid != uuid or (into is not None and slot.into != into):
             return
-        with slot.lock:
+        with hostlog.BOUNDARY, slot.lock:
             if slot.revoked is None:
                 slot.revoked = why[:40]
 
@@ -1144,10 +1142,10 @@ class SessionHost:
         stopped). Each record is marked under its own lock, so a write already inside its critical section has
         returned when this does. The node publishes its stopping event only after this returns (`_Stopping`)."""
         self._stop_pending = True
-        with self._steer_stop_lock:
+        with hostlog.BOUNDARY, self._steer_stop_lock:
             self.steer_stopped = True
             for slot in self.attempts():
-                with slot.lock:
+                with hostlog.BOUNDARY, slot.lock:
                     slot.stopping = True
 
     def _steer_stopped(self, slot: SteerSlot) -> bool:
@@ -1169,7 +1167,7 @@ class SessionHost:
         held steer is written until an authoritative listing lists it again (S2-05). Nothing is revoked."""
         s = self.sessions.get(session_id)
         if s is not None and s.steer is not None:
-            with s.steer.lock:
+            with hostlog.BOUNDARY, s.steer.lock:
                 s.steer.fenced = True
 
     def steer_live(self, session_id: str) -> tuple[str, str] | None:
@@ -1248,7 +1246,7 @@ class SessionHost:
                 hook = self.steer_drain_hook
                 if hook is not None:
                     hook(s)
-                with self._steer_stop_lock:
+                with hostlog.BOUNDARY, self._steer_stop_lock:
                     # A batch is admitted only here, under the latch's lock: not once the node began to stop
                     # (R6-01), nor once a stop is waiting for this lock (R7-04, R8-03: read inside it, so a stop that
                     # announces itself before this lock is taken is never overtaken by a fresh batch).
@@ -2279,7 +2277,7 @@ class SessionHost:
         every callback above (R2-03): a callback that takes time cannot carry the write past it. `fence`: False asks
         whether only the fence stands in the way. Under the attempt's lock (re-entrant: the write boundary holds it
         across this check and its write, R3-01), the contact read on a clock taken under that lock."""
-        with slot.lock:
+        with hostlog.BOUNDARY, slot.lock:
             return self._steer_gate_locked(s, slot, fence)
 
     def _steer_gate_locked(self, s: Session, slot: SteerSlot, fence: bool) -> bool:
@@ -2324,7 +2322,7 @@ class SessionHost:
         elif slot.fenced and self._steer_gate(s, slot, now, fence=False):
             self._steer_unqueue(s, slot, keep=True)
         else:
-            with slot.lock:
+            with hostlog.BOUNDARY, slot.lock:
                 slot.revoked = slot.revoked or "gate"
             self._steer_unqueue(s, slot)
 
@@ -2340,7 +2338,7 @@ class SessionHost:
         hook = self.steer_write_hook
         if hook is not None:
             hook("before", s)
-        with slot.lock:
+        with hostlog.BOUNDARY, slot.lock:
             ok = self._steer_gate_locked(s, slot, True)
             n = None
             if ok:
@@ -2397,7 +2395,7 @@ class SessionHost:
                 and not self._steer_gate(s, slot, now, fence=False)):
             # Once authorized, a gate other than the fence that is seen closed is latched, as for a frame in the
             # buffer (S2-04, R2-02), whether a frame was made yet or not (R4-01): never written from then on.
-            with slot.lock:
+            with hostlog.BOUNDARY, slot.lock:
                 slot.revoked = slot.revoked or "gate"      # (the node's authority may have said "contact" just now)
             if slot.frame is not None:
                 self._steer_drop_frame(s, slot)
@@ -2468,7 +2466,7 @@ class SessionHost:
                 else:
                     self._save_state()
             return
-        with self._steer_stop_lock:
+        with hostlog.BOUNDARY, self._steer_stop_lock:
             # (R6-01) The cut takes ownership under the stop latch's lock: it cannot begin once the node began to stop
             # (the stop of every turn decides N then, nothing else is done here), and the latch is never set in the
             # middle of this check and the cut's first act. Its drain stops reading at the latch.
@@ -2503,7 +2501,7 @@ class SessionHost:
         slot = s.steer
         if slot is None or slot.into != msg_id or slot.outcome is not None:
             return None
-        with self._steer_stop_lock:
+        with hostlog.BOUNDARY, self._steer_stop_lock:
             # (R7-01) S's evidence eligibility is the ONE global latch, read under its lock, so the decision is
             # linearized with `steer_stopping` setting it: evidence processed once it is set never counts for S,
             # whether or not this slot was marked yet (rule 2). N's own end is handled as on main either way.
@@ -2574,7 +2572,7 @@ class SessionHost:
         if ev.steer is None or slot is None or slot.outcome is not None:
             return own
         retired = None
-        with self._steer_stop_lock:
+        with hostlog.BOUNDARY, self._steer_stop_lock:
             # (Review round 2, ruling H) Only the decision and the adapter's retirement are inside the cutoff lock;
             # the log line, the event and the state saved come after it.
             if slot.stopping or self.steer_stopped:
@@ -2619,7 +2617,7 @@ class SessionHost:
         held, s.held = s.held, None
         slot = s.steer
         if slot is not None and slot.into == held.end.message_id:
-            with slot.lock:
+            with hostlog.BOUNDARY, slot.lock:
                 slot.outcome = {"outcome": steer["outcome"], "why": steer["why"]}
             if slot.mark is None or s.child is None:
                 s.steer = None
@@ -2690,7 +2688,7 @@ class SessionHost:
             return
         if self.steer_stopped or (slot is not None and slot.stopping):
             return
-        with self._steer_stop_lock:
+        with hostlog.BOUNDARY, self._steer_stop_lock:
             # (Review round 4, ruling T) the latch check that matters is this one, under the cutoff lock, with the
             # expiry's own state change: a latch that came after the check above changes nothing here
             if self.steer_stopped or (slot is not None and slot.stopping):
@@ -2728,7 +2726,7 @@ class SessionHost:
         after the signal and once no host lock is held. The exception that propagates is the first: `decide`'s if it
         raised, else the stop's. A steering-only stop never comes here: `_reserved_stop`."""
         first: BaseException | None = None
-        with self._steer_stop_lock:
+        with hostlog.BOUNDARY, self._steer_stop_lock:
             if self.steer_stopped or (s.steer is not None and s.steer.stopping):
                 return False
             self._claimer = threading.get_ident()
@@ -2822,7 +2820,7 @@ class SessionHost:
         except Exception:
             alive = True        # (a probe that fails is taken as "still going", as at shutdown)
         barrier = (s.group_key, s.cwd) if alive else None
-        with self._steer_stop_lock:
+        with hostlog.BOUNDARY, self._steer_stop_lock:
             if self.steer_stopped or (s.steer is not None and s.steer.stopping):
                 return False
             got = self.groups.try_stopping(token, barrier)
@@ -3039,7 +3037,7 @@ class SessionHost:
                 start, length = s.restart_mark
                 s.restart_mark = (start - n, length)    # where its bytes are now; below zero: some are written
             if s.steer is not None and s.steer.mark is not None and steered is None:
-                with s.steer.lock:
+                with hostlog.BOUNDARY, s.steer.lock:
                     self._steer_count(s, s.steer, n)    # (a write that held no steer byte: only the mark moves)
             if s.steer is not None and s.steer.mark is None and s.steer.outcome is not None:
                 s.steer = None      # its turn was already decided: the frame is whole, nothing is left

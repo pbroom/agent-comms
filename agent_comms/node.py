@@ -36,6 +36,10 @@ from .node_sessions import SessionRunner
 from .session_host import STATE_FILE as SESSION_STATE_FILE, SessionHost
 
 log = hostlog.get("agent_comms.node")     # (host-side logging: every line a deferred record, hostlog)
+# (Review round 3, R19, A5) the logger the node hands to the two dispatch helpers it calls (`remove_browser_output`,
+# `with_managed_env`): dispatch's own logger name, through hostlog; called without it (`board dispatch`), they keep
+# dispatch's plain logger
+DISPATCH_LOG = hostlog.get("agent_comms.dispatch")
 
 HELLO_SECONDS = 10.0
 # Without hub contact this long, the node stops its own runs: the hub counts them lost after
@@ -377,7 +381,8 @@ class Node:
                     fresh = True        # fresh per run; never reused
                 template = with_headless_browser(template, headless_browser_overrides(
                     self.config.headless_browser, origins, str(out_dir)))
-            template = with_managed_env(template, child_env(agent, self.config, runtime=r.get("runtime")))
+            template = with_managed_env(template, child_env(agent, self.config, runtime=r.get("runtime")),
+                                        logger=DISPATCH_LOG)
             argv = render_argv(template, prompt=prompt, project=cwd, thread_id=int(r.get("thread_id") or 0))
             # Account folders, at the spawn, on the command line as it will run: its cwd, the workspace a Codex
             # runner names itself and every writable root it is given, generated ones included (agent_accounts.py);
@@ -430,7 +435,7 @@ class Node:
         if out is None:
             return
         remove_browser_output({"run_id": run_id, "log": str(self.log_dir / f"{run_id}.log"),
-                               "headless_browser": {"output_dir": str(out)}})
+                               "headless_browser": {"output_dir": str(out)}}, logger=DISPATCH_LOG)
 
     def _stop(self, local: _Local, how: str) -> None:
         # Before EITHER signal (a hub's kill can come without its terminate): nothing starts in its checkout until its
@@ -602,8 +607,16 @@ def _exit_if_stalled(status: int) -> None:
     handler: the process ends now with `status`, without waiting for that handler (a handler stuck holding its own
     lock would hold `logging.shutdown()` for good). That skips the interpreter's exit work (atexit hooks,
     `logging.shutdown()`, a traceback for an escaping exception, buffered output): every child was signalled and
-    every report and save made by then, and the lines still queued behind the stuck handler are lost."""
-    if not hostlog.final_flush(EXIT_FLUSH_SECONDS):
+    every report and save made by then, and the lines still queued behind the stuck handler are lost.
+    (Review round 3, R21) An interrupt during the final wait (a second SIGTERM, or Ctrl-C) counts as stalled: the
+    process ends now with the status already selected, rather than escaping into the interpreter's
+    `logging.shutdown()`, which could block on a stuck handler. On the main thread the wait is a poll outside the
+    queue's lock (hostlog `_wait_for`), so the interrupt leaves no lock held."""
+    try:
+        idle = hostlog.final_flush(EXIT_FLUSH_SECONDS)
+    except KeyboardInterrupt:
+        idle = False
+    if not idle:
         os._exit(status)
 
 
