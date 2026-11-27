@@ -1,24 +1,14 @@
-# The output of scripts/steering-mutation-check.py (review round 9): only round 9's rows (D1-D3, E1, E2, F), plus
-# four rows re-anchored on lines this round rewrote (C1's two, the interrupted timeout's and the broken pipe's cutoff),
-# as the round asked. Round 8's "a failed SIGTERM starts no kill clock" is gone with the code (the ruling was
-# withdrawn). The whole set (139 rows) last ran in round 6. Run on 864e1b6: all 14 caught.
+# The output of scripts/steering-mutation-check.py (review round 10): only round 10's rows (G1 and H2; G2 is tests
+# only, with no code row). On 790a25a two rows were MISSED: the switch, and the attempt's recorded Claude identity.
+# Both terms are redundant in every reachable state, so no scenario tells them apart; c6b40d3 pins each term
+# directly. The whole set (139 rows) last ran in round 6. Run on c6b40d3: all 4 caught.
 
-commit 864e1b6
-CAUGHT  D1 a raising SIGTERM keeps main's clock  test_r9_d1_a_reserved_stop_whose_sigterm_raises_is_mains
-CAUGHT  D2 the held turn's own timeout reserves without waiting  test_r9_d2_a_held_turns_own_timeout_never_waits_on_the_registry
-CAUGHT  E2 a registry miss is not a refusal  test_r9_e2_a_registry_miss_is_not_a_verified_exit[alive]
-CAUGHT  E1 only the attempt's own reservation undone  test_r9_e1_a_commit_that_fails_early_undoes_only_its_own_reservation[stopping]
-CAUGHT  E1 the attempt's reservation undone  test_r9_e1_a_commit_that_fails_early_undoes_only_its_own_reservation[live]
-CAUGHT  D3 a barrier there before is ALREADY  test_r9_e1_a_commit_that_fails_early_undoes_only_its_own_reservation[stopping]
-CAUGHT  F the adapter steers only with the switch on  test_r9_f_with_the_default_no_steer_mode_no_slot_no_hold
-CAUGHT  F the host sets the switch on each adapter  test_r9_f_with_the_default_no_steer_mode_no_slot_no_hold
-CAUGHT  F the one place a hold is made asks the switch  test_r9_f_the_one_place_a_hold_is_made_is_guarded
-CAUGHT  F off by default  test_r9_f_claude_steering_is_off_by_default
-CAUGHT  C1 the checkout reserved before the claim (re-anchored)  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
-CAUGHT  C1 registry busy: no stop committed (re-anchored)  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
-CAUGHT  T the interrupted timeout's cutoff (re-anchored)  test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[interrupted_timeout]
-CAUGHT  T the broken pipe's cutoff (re-anchored)  test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[broken_pipe]
-rows: 14
+commit c6b40d3
+CAUGHT  G1 the predicate-false path is main's  (exit 1)
+CAUGHT  G1 the predicate asks the switch  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
+CAUGHT  G1 the predicate asks for a Claude attempt or a hold  test_r10_g1_each_term_of_the_predicate_alone_makes_it_false
+CAUGHT  H2 the predicate reads the attempt, not the advertised holds  test_r10_h2_a_claude_attempt_keeps_its_path_after_the_adapter_stops_advertising
+rows: 4
 stale or broken: []
 missed: []
 exit 0
