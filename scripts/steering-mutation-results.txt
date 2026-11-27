@@ -23,3 +23,55 @@ stale or broken: []
 missed: []
 exit 0
 existing row 'A1 only that session incarnation's' against pin 2 alone: FAILS (caught)
+
+# Host-side logging (PR-B; DESIGN_NOTES "Host-side logging"): the rows re-anchored on the code it changed, the
+# successors of the rows on code it deleted (3 rows of the deleted logging code had none and are gone: their
+# behaviour is pinned by the successors), and the rows for the new drain and boundary code (hostlog, key L) and
+# B8. 32 rows ran on 8a9ea35 (the code of this PR's head), in two parts: the first run was stopped at its 21st row
+# because that row's mutant deadlocks (below), and the rest ran in a second. ffb483c, earlier, MISSED
+# "L the drain runs only at depth 0" (every drain then came from a boundary's own depth-0 exit); the pin
+# test_no_drain_inside_a_boundary_even_when_asked was added and it is CAUGHT on 8a9ea35. A row on the
+# boundary's own depth-0 test was dropped as equivalent: the drain refuses inside a boundary itself.
+
+commit 8a9ea35 (part 1)
+CAUGHT  M the held end before its log line  test_r3_m_a_raising_log_handler_loses_no_held_end
+CAUGHT  T the claim checks the latch (re-anchored)  test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[cancel]
+CAUGHT  T no log handler under the cutoff lock (successor: a host lock)  test_each_host_lock_is_a_boundary_of_its_own[cutoff]
+CAUGHT  T nothing saved under the cutoff lock (re-anchored)  test_r5_small_emit_hold_saves_nothing_under_a_claim
+CAUGHT  N3 a watchdog thread never drains (successor)  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+CAUGHT  R7-2 stop_all is an entry point (successor)  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[held]
+CAUGHT  A3 the exception's type only (successor)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  T stop_all's final save in a finally (re-anchored)  test_r7_2_a_stop_all_that_raises_still_saves_for_real
+CAUGHT  E2 a registry miss is not a refusal (re-anchored)  test_r9_e2_a_registry_miss_is_not_a_verified_exit[gone]
+CAUGHT  C1 registry busy: no stop committed (re-anchored)  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  S2 busy commits nothing (re-anchored)  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  S2 escalation armed before the commit (re-anchored)  test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order
+CAUGHT  S3 a live child with no token gets one (re-anchored)  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[none]
+CAUGHT  R1 the claim runs the route's own stop  test_the_queued_s_close_finalizer_n_end_then_ended
+CAUGHT  A1 the stop runs whatever the decision raised  test_r1_a1_a_decision_that_raises_after_the_latch_still_reaches_the_stop
+CAUGHT  A1 the first exception propagates (re-anchored)  test_r1_a1_the_first_exception_propagates_when_the_stop_raises_too
+CAUGHT  A2 the runner lock is a host lock (successor)  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+CAUGHT  A2 the registry lock is a host lock (successor)  test_a_registry_callback_line_is_written_after_the_registry_is_let_go
+CAUGHT  A2 the host's public methods are entry points (successor)  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  L the drain runs only at depth 0  test_no_drain_inside_a_boundary_even_when_asked
+STOPPED  L a nested drain leaves its records to the active drainer  (the mutant deadlocks the drainer on itself: the suite hung at 0% CPU in test_claude_steering.py; run alone below)
+
+commit 8a9ea35 (part 2)
+CAUGHT  L a waiting drain waits for its own records  test_a_drain_with_another_drainer_stalled_is_bounded_when_asked
+CAUGHT  L one handler's failure never stops the others  test_a_handler_that_raises_is_caught_and_the_drain_goes_on
+CAUGHT  L the level is checked at the call  test_a_line_the_logger_would_not_emit_is_not_kept
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's caller is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's time is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  B8 the promoted event is taken from where it is  test_a1_the_promoted_event_is_taken_from_where_it_is_in_watched
+CAUGHT  B8 only an ended promotes  test_a1_only_an_ended_promotes_the_sessions_watched_events
+CAUGHT  L an exit with nothing of its own writes nothing  test_the_watchdogs_lines_are_written_at_the_runner_locks_release_not_by_an_entry_that_logged_nothing
+CAUGHT  L a host lock's release writes everything  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+
+commit 8a9ea35 (the nested-drain row alone, each pin bounded at 120 s)
+HUNG    L a nested drain leaves its records to the active drainer  test_a_handler_that_logs_and_calls_back_into_the_host_does_not_deadlock (120 s: the deadlock the row is about)
+
+commit ffb483c (before the pin; superseded above)
+MISSED  L the drain runs only at depth 0  
+rows: 32, caught: 31, hung (the predicted deadlock): 1, missed: 0

@@ -188,8 +188,7 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('NS', 'B8 the promoted event is taken from where it is', '                self.watched.pop(at)', '                self.watched.pop(0)'),
     ('NS', 'B8 only an ended promotes', '            if not late and e.kind == "ended" and e.ident is not None:', '            if not late and e.ident is not None:'),
     ('L', 'L an exit with nothing of its own writes nothing', '        if (not _queue and not _state["dropped"]) or _state["done"] >= target:', '        if not _queue and not _state["dropped"]:'),
-    ('L', "L a host lock's release writes everything", '        self._lock.release()\n        BOUNDARY.leave(everything=True)', '        self._lock.release()\n        BOUNDARY.leave()'),
-    ('L', 'L only the outermost exit drains', '        _local.depth = depth if depth > 0 else 0\n        if depth <= 0:', '        _local.depth = depth if depth > 0 else 0\n        if True:')]
+    ('L', "L a host lock's release writes everything", '        self._lock.release()\n        BOUNDARY.leave(everything=True)', '        self._lock.release()\n        BOUNDARY.leave()')]
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
          "tests/test_hostlog.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",

@@ -16690,7 +16690,8 @@ exception's message) is now reduced to its type's name.
   the outer boundary on a normal and an exceptional exit, each host lock is a boundary of its own, a raising handler
   is caught and the next handler still gets the record, a handler that logs and calls back into the host does not
   deadlock and its records are written by the active drainer before the outer call returns, a blocked drainer does not
-  delay the watchdog's SIGTERM or SIGKILL, a watchdog thread never drains, an entry that logged nothing writes nothing
+  delay the watchdog's SIGTERM or SIGKILL, a watchdog thread never drains, the drain refuses inside a boundary even
+  when called directly, an entry that logged nothing writes nothing
   (the watchdog's lines go at the runner lock's release), a drain with another drainer stalled is bounded when asked.
 - **Pins of the old mechanism, rewritten** (each with its successor):
   - `test_r1_a_claimed_main_route_..._writes_its_lines_at_the_flush` became `..._at_the_calls_drain`: the handler is
@@ -16727,6 +16728,34 @@ exception's message) is now reduced to its type's name.
   promotes nothing.
 - `_deliver`'s docstring: the promotion applies wherever `watched` waits, also at `pass_once`'s handoff before the
   reconciliation and at `_after_tick`'s. No change to its behaviour.
+
+### Mutation check and runs
+
+- **Mutation rows** (scripts/steering-mutation-check.py, now 172 rows; tests/test_hostlog.py joins the first group).
+  Re-anchored on the code this PR changed: 10 (the claim's latch check and save rule, `_reserved_stop`'s E2, C1, S2,
+  S2 escalation and S3 rows, which lost a level of indentation with the deleted `try`, `stop_all`'s final save, A1's
+  first exception). Successors of rows on deleted code: 7 (no handler under the cutoff lock, the runner lock and the
+  registry lock as host locks, a watchdog thread never drains, `stop_all` an entry point, the host's public methods
+  entry points, the exception's type only); 3 rows of deleted code have none (their behaviour is the successors').
+  New: 11 for hostlog (key L) and 2 for B8. 32 ran on 8a9ea35: 31 CAUGHT; "L a nested drain leaves its records to
+  the active drainer" deadlocks the drainer on itself (the hazard it is about), which hangs a whole pytest run, so its
+  pin was run alone and bounded: HUNG at 120 s. A row on the boundary's own depth test was dropped as equivalent
+  (the drain refuses inside a boundary itself, pinned by `test_no_drain_inside_a_boundary_even_when_asked`, which was
+  added when that row MISSED on ffb483c). The results are in scripts/steering-mutation-results.txt.
+- **Runs.** The serial suite on 8a9ea35, the code head (the commit after it holds notes and results only); the
+  parallel suite and the e2e runs on 9e5f1cf, whose product code is 8a9ea35's (8a9ea35 adds one test and one mutation
+  row). Stand-ins only: the real CLIs were not run in this PR.
+
+  | Run | Stand-ins |
+  | --- | --- |
+  | full suite, serial | 5435 passed, 10 skipped, 13 min 2 s (the mutation run alongside); no failure |
+  | full suite, `-n auto --dist worksteal` | 5434 passed, 10 skipped, 4 min 8 s (9e5f1cf) |
+  | `--only steer` | PASS, 27 |
+  | `--only steering` | PASS, 115 |
+  | `--only correlation` | PASS, 24 |
+  | `--only structured` | PASS, 36 |
+  | `--only tree` | PASS, 143 |
+  | Full e2e | PASS, 395 |
 
 ### Known limits
 
