@@ -2,8 +2,11 @@
 directory: hosted sessions' processes (session_host.SessionHost) and dispatched runs (node.Node) alike.
 
 The invariant (review round 7, owner decision): nothing is started in a checkout directory that holds a process group
-in the STOPPING state, and every stopping group stays registered (and keeps receiving its kill) until the whole group
-is gone, leader reaped and no member left, however its leader ended. Live groups may share a directory (a parent
+in the STOPPING (or HELD) state, and every stopping group stays registered (and keeps receiving its kill) until the
+whole group is gone, leader reaped and no member left, however its leader ended. (Ownership until verified exit, C1)
+A group is let go only by `release`, with a proof; one it refuses where main would have let it go becomes HELD:
+fenced, and never signalled by number again (`may_signal`). This holds for a live node; across a restart, a group
+whose leader is gone is not restored (C3). Live groups may share a directory (a parent
 session and its shared-checkout children, a session beside a dispatched run the hub allowed): the rule is about
 groups being stopped.
 
@@ -21,6 +24,7 @@ import threading
 from typing import Any, Callable, Hashable
 
 PROC_PGRP_ONLY = 2      # libproc's `proc_listpids` type: the processes of one process group (sys/proc_info.h)
+_LISTING_ROOM = (64, 1024, 16384)   # slots added to the kernel's estimate, tried in turn until a listing is complete
 _LIBPROC: list = []
 
 
@@ -47,7 +51,7 @@ def group_members(pgid: int) -> tuple[int, ...] | None:
     lib = _libproc()
     if lib is None or isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1:
         return None
-    for extra in (64, 1024, 16384):
+    for extra in _LISTING_ROOM:
         need = lib.proc_listpids(PROC_PGRP_ONLY, pgid, None, 0)     # (an estimate, in bytes: every process's room)
         if need < 0:
             return None
@@ -81,11 +85,20 @@ def key(cwd: Any) -> Hashable:
 
 
 class Groups:
-    LIVE, STOPPING = "live", "stopping"
+    # (Ownership until verified exit, C1, review round 1) HELD: a group the release rule refused to let go where
+    # main would have (`release`). It fences its checkout as STOPPING does, but it is PROOF-ONLY: no numeric signal
+    # is ever sent to it again (`may_signal`), and it leaves only through `release` with a True proof. It never goes
+    # back to LIVE or STOPPING.
+    LIVE, STOPPING, HELD = "live", "stopping", "held"
+    _FENCE = ("stopping", "held")       # the states that admit nothing beside them
 
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.entries: dict[Hashable, dict[Hashable, list]] = {}     # dir key -> group token -> [state, cwd]
+        # (C1, review round 1) the HELD tokens, the same set as the HELD entries: written under the lock, at the
+        # transition and at the release, and read WITHOUT it by `may_signal`, so no signal site and no pass of the loop
+        # waits on the registry (a spawn holds it across process creation: round 8, ruling C1)
+        self.held: set = set()
 
     def start(self, cwd: Any, token: Hashable, spawn: Callable[[], Any], k: Hashable | None = None) -> tuple[bool, Any]:
         """Start a process group in `cwd` unless one being stopped is there: (False, None) and nothing is spawned;
@@ -94,7 +107,7 @@ class Groups:
         session_host `_spawn`, review round 1 of the enabling PR, A3); else computed here."""
         k = key(cwd) if k is None else k
         with self.lock:
-            if any(state == self.STOPPING for state, _ in self.entries.get(k, {}).values()):
+            if any(state in self._FENCE for state, _ in self.entries.get(k, {}).values()):
                 return False, None
             self.entries.setdefault(k, {})[token] = [self.LIVE, cwd]
             try:
@@ -107,7 +120,7 @@ class Groups:
         """The group is being stopped (signalled, or its leader went on its own and members are left)."""
         with self.lock:
             for groups in self.entries.values():
-                if token in groups:
+                if token in groups and groups[token][0] != self.HELD:      # (C1: HELD never goes back)
                     groups[token][0] = self.STOPPING
 
     RESERVED, ALREADY, BUSY, MISSING = "reserved", "already", "busy", "missing"
@@ -127,7 +140,7 @@ class Groups:
         try:
             for groups in self.entries.values():
                 if token in groups:
-                    if groups[token][0] == self.STOPPING:
+                    if groups[token][0] in self._FENCE:     # (C1: a HELD one too, unchanged)
                         return self.ALREADY
                     groups[token][0] = self.STOPPING
                     return self.RESERVED
@@ -139,18 +152,37 @@ class Groups:
         finally:
             self.lock.release()
 
-    def release(self, token: Hashable, proof: Callable[[], bool], forget: Callable[[], None]) -> bool:
+    def release(self, token: Hashable, proof: Callable[[], bool], forget: Callable[[], None],
+                fence: tuple[Hashable, Any] | None = None) -> bool:
         """(Ownership until verified exit, C1) THE one release rule: the only way a group's registry entry, and its
         owner's tracking record (whose durable entry is that record's projection), go. `proof()` answers whether the
         group is proved gone; it is supplied by the caller, so how absence is proved (today: the leader's exit observed
         by its owning handle and `group_absent`; later an anchor's own word) never touches this rule or its callers.
-        Not proved (False, or it raised): nothing is released and False; the caller keeps its handle, the exact token
-        and its durable entry, and asks again on its next pass. Proved: `forget()` drops the tracking record, then the
-        registry entry goes (`_gone`); True."""
+        Not proved (False, None, or it raised): nothing is released and False; the caller keeps its handle, the exact
+        token and its durable entry, and asks again on its next pass; and (review round 1, R1, R2, A2, A3) that exact
+        token is made HELD before this returns: its checkout admits nothing, and it is never signalled by number
+        again. Every caller is at main's release point (main would have let the group go here), so HELD marks exactly
+        the state C1 adds. With no entry for the token, `fence` (its checkout's known key and directory) gets a HELD
+        one, so admission sees the barrier anyway. Proved: `forget()` drops the tracking record, then the registry
+        entry goes (`_gone`); True. Scope: this is the removal path of a live node's started groups. A spawn that
+        fails removes its provisional registration in `start`, and a start never made or a claim lost has no group to
+        release."""
         try:
-            if proof() is not True:
-                return False
+            proved = proof() is True
         except Exception:
+            proved = False
+        if not proved:
+            with self.lock:
+                found = False
+                for groups in self.entries.values():
+                    if token in groups:
+                        groups[token][0], found = self.HELD, True
+                if not found and fence is not None:
+                    k, cwd = fence
+                    self.entries.setdefault(k, {})[token] = [self.HELD, cwd]
+                    found = True
+                if found:
+                    self.held.add(token)
             return False
         forget()
         self._gone(token)
@@ -161,6 +193,7 @@ class Groups:
         with self.lock:
             for k in list(self.entries):
                 self._drop(k, token)
+            self.held.discard(token)
 
     def _drop(self, k: Hashable, token: Hashable) -> None:
         groups = self.entries.get(k)
@@ -169,12 +202,28 @@ class Groups:
             if not groups:
                 del self.entries[k]
 
-    def blocked(self, cwd: Any) -> bool:
-        """A group being stopped is in this directory."""
+    def state(self, token: Hashable) -> str | None:
+        """The token's registry state (LIVE, STOPPING, HELD), or None."""
         with self.lock:
-            return any(state == self.STOPPING for state, _ in self.entries.get(key(cwd), {}).values())
+            for groups in self.entries.values():
+                if token in groups:
+                    return groups[token][0]
+        return None
+
+    def may_signal(self, token: Hashable) -> bool:
+        """(C1, review round 1, R2) THE one predicate of whether a group may be signalled by NUMBER: not once it is
+        HELD (a group not proved gone where main would have let it go: its pgid may already be a stranger's). Every
+        signal site a retained record can reach asks it, under the owner's serialization that also makes the HELD
+        transition (a session's: the node's runner lock; a dispatched run's: the node's one loop thread), so a HELD
+        transition can never come between the question and the signal. Read without the registry's lock (`held`)."""
+        return token not in self.held
+
+    def blocked(self, cwd: Any) -> bool:
+        """A group being stopped, or HELD, is in this directory."""
+        with self.lock:
+            return any(state in self._FENCE for state, _ in self.entries.get(key(cwd), {}).values())
 
     def stopping_dirs(self) -> set[str]:
-        """The directories (as recorded) that hold a group being stopped."""
+        """The directories (as recorded) that hold a group being stopped, or HELD."""
         with self.lock:
-            return {cwd for groups in self.entries.values() for state, cwd in groups.values() if state == self.STOPPING}
+            return {cwd for groups in self.entries.values() for state, cwd in groups.values() if state in self._FENCE}

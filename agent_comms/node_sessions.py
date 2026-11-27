@@ -1769,7 +1769,7 @@ class SessionRunner:
         self.stopping.set()     # (R4-01: every held steer record is marked first: no steer byte after this)
         with self.lock:
             for s in self.host.sessions.values():
-                if s.child is not None:
+                if s.child is not None and self.host.groups.may_signal(s.group_token):     # (C1: never a HELD one)
                     try:
                         s.child.terminate()
                     except Exception:
@@ -1788,7 +1788,7 @@ class SessionRunner:
         reporting; `shutdown()` then finds them gone."""
         with self.lock:
             for s in self.host.sessions.values():
-                if self._going(s):
+                if self._going(s) and self.host.groups.may_signal(s.group_token):     # (C1: never a HELD one)
                     s.child.kill()
 
     def shutdown(self) -> None:

@@ -32,6 +32,7 @@ from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_co
                        browser_output_path, make_browser_output,
                        signed_in_browser_overrides, signed_in_profile, spawn_piped, spawn_process, stop_verified,
                        with_headless_browser, with_managed_env, with_writable_roots)
+from .node_groups import key
 from .node_sessions import SessionRunner
 from .session_host import STATE_FILE as SESSION_STATE_FILE, SessionHost
 
@@ -58,6 +59,7 @@ class _Local:
     browser_out: str | None = None  # the browser output directory this start made (removed when the run ends)
     exit_code: int | None = None    # its leader's, once it went while members of its group were left
     terminating: bool = False       # SIGTERM sent
+    key: Any = None                 # (C1, A3) its checkout's registry key, the one its entry was made under
 
 
 def checkout_state(cwd: str | None) -> dict | None:
@@ -132,8 +134,10 @@ class Node:
 
     def recover(self) -> list[str]:
         """At startup, before any hub contact: runs an earlier node process on this machine left. Each still-live
-        process it can verify is terminated, then killed after the grace period. Their ends are reported once the hub
-        answers (tick), so an unreachable hub never leaves them running. Returns their run ids."""
+        leader it can verify is terminated, then its group killed after the grace period. Their ends are reported once
+        the hub answers (tick). Returns their run ids. (Known limit, C1: a group whose leader is already gone, with
+        members left, is not verified here and so not signalled, and its entry is dropped below; restoring such a
+        reservation before admitting work is C3's.)"""
         left = self._load_state()
         stop_verified([(d.get("pid"), d.get("proc_start")) for d in left.values() if isinstance(d, dict)],
                       probe=self.probe, signal_group=self.signal_group, sleep=self.sleep,
@@ -393,9 +397,10 @@ class Node:
             if fresh:
                 make_browser_output(self.config, out_dir)   # validated, then made exclusively
                 made = True
+            k = key(cwd)
             started, child = self.groups.start(cwd, ("run", rid), lambda: self.spawner(
                 argv, cwd=cwd, env=child_env(agent, self.config, runtime=r.get("runtime")),
-                log_path=self.log_dir / f"{rid}.log"))
+                log_path=self.log_dir / f"{rid}.log"), k=k)
             if not started:
                 self._say_wait(rid, "run %s waits: a process group in %s is now being stopped", cwd)
                 if made:
@@ -409,7 +414,8 @@ class Node:
             return
         self.waits_said.discard(rid)
         local = _Local(rid, child, self.clock(), float(r.get("timeout_seconds") or 1800),
-                       float(r.get("kill_grace_seconds") or 10), cwd=cwd, browser_out=str(out_dir) if made else None)
+                       float(r.get("kill_grace_seconds") or 10), cwd=cwd, browser_out=str(out_dir) if made else None,
+                       key=k)
         try:
             local.proc_start = self.start_of(child.pid)
         except Exception:
@@ -437,6 +443,8 @@ class Node:
                                "headless_browser": {"output_dir": str(out)}})
 
     def _stop(self, local: _Local, how: str) -> None:
+        if not self.groups.may_signal(("run", local.run_id)):
+            return      # (C1, R2) HELD: proof-only; no signal and no signal clock
         # Before EITHER signal (a hub's kill can come without its terminate): nothing starts in its checkout until its
         # whole group is gone (node_groups).
         self.groups.stopping(("run", local.run_id))
@@ -456,7 +464,7 @@ class Node:
         now = self.clock()
         for rid, local in list(self.running.items()):
             code = local.child.poll()
-            if code is not None and self.group_alive(local.child.pid):
+            if code is not None and self.group_alive(local.child.pid) and self.groups.may_signal(("run", rid)):
                 if local.exit_code is None:
                     local.exit_code = code
                 if local.terminated_at is None:
@@ -507,16 +515,24 @@ class Node:
         its reap and the shutdown's `report_stopped`: the leader's exit observed by its own handle AND a complete,
         successful membership observation of its group with no member. Proved: the run leaves `running` (and so
         its state entry, at the next save) with its registry entry. Not proved: everything is kept."""
-        return self.groups.release(("run", rid),
-                                   lambda: local.child.poll() is not None and self.group_absent(local.child.pid),
-                                   lambda: self.running.pop(rid, None))
+        token = ("run", rid)
+        was = token in self.groups.held
+        fence = (getattr(local, "key", None) or key(local.cwd), local.cwd)
+        released = self.groups.release(token,
+                                       lambda: local.child.poll() is not None and self.group_absent(local.child.pid),
+                                       lambda: self.running.pop(rid, None), fence)
+        if not released and not was:
+            log.warning("run %s: its process group could not be proved gone: its checkout stays held (no signal is "
+                        "sent to it again)", rid)
+        return released
 
     def report_stopped(self) -> None:
         for rid, local in list(self.running.items()):
             if not self._release(rid, local):
                 # (C1) its group is not proved gone at shutdown (a member survived its SIGKILL): the run keeps its
-                # registry entry, its handle and its state entry (saved below), and is not reported ended here: the
-                # next node process finds it on record and reports it once it has stopped it (`recover`)
+                # registry entry (HELD), its handle and its state entry (saved below), and is not reported ended
+                # here: the next node process finds it on record (`recover`). That recovery signals only a leader it
+                # verifies and then drops the entry: a leaderless survivor is C3's to stop.
                 continue
             self._remove_browser_output(rid, local.browser_out)
             c = checkout_state(local.cwd)

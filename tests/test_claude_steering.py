@@ -3742,8 +3742,10 @@ def test_r5_x_a_failed_handoff_keeps_its_lane(env):
 
 
 def test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded(henv, monkeypatch):
-    """Sol's blocker 3 (ruling Z): at shutdown a TERM-ignoring child whose KILL raises keeps its handle and its
-    group entry; its sibling is stopped; the final save records it; a later kill can stop it."""
+    """Sol's blocker 3 (ruling Z), with "Ownership until verified exit (C1)", review round 1, A1 (the name kept for
+    the record): at shutdown a TERM-ignoring child whose KILL raises keeps its handle and its group entry (HELD); its
+    sibling is stopped; the final save records it; and, delivery being uncertain, no later kill is sent by number
+    (identity-safe retries are C2 and C3)."""
     import json as _json
     (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
     host = henv.host
@@ -3763,7 +3765,7 @@ def test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded(henv, monkey
     c1.kill = real_kill
     henv.clock.advance(host.kill_grace + 1)
     host.kill_due()
-    assert c1.killed or getattr(c1, "kills", 0), "a later kill stops it"
+    assert not c1.killed and host.groups.state(token) == host.groups.HELD, "HELD: no later kill by number (A1)"
 
 
 def test_r5_z_a_failed_final_save_keeps_the_earlier_record(henv, monkeypatch):

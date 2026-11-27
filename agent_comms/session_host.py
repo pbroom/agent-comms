@@ -1531,11 +1531,9 @@ class SessionHost:
         if s.child is not None:
             self._read(s, now, out)
             self._reap(s, now, out)
-            if (s.child is not None and s.stopping_since is None and not s.parked and s.child.poll() is not None
-                    and not self.group_alive(s.child.pid)):
-                # (C1) its leader exited and its group is neither seen alive nor proved gone (`_release`): it is kept,
-                # and nothing more is done with it (no write, no stop of a process already gone) until a later pass
-                # proves it gone. (Main never reaches this: its reap let the group go in this very call.)
+            if s.child is not None and not self.groups.may_signal(s.group_token):
+                # (C1, R2) HELD (its group not proved gone where main let it go: `_release`): proof-only; nothing
+                # more is done with it (no write, no stop, no signal) until a later pass proves it gone.
                 return None
         if (s.child is not None and s.stopping_since is None and not s.ended and s.writing is not None
                 and s.turn_at is not None and s.writing.counted is None):
@@ -1763,7 +1761,7 @@ class SessionHost:
         code = s.child.poll()
         if code is None:
             return
-        if self.group_alive(s.child.pid):
+        if self.group_alive(s.child.pid) and self.groups.may_signal(s.group_token):
             if s.stopping_since is None and self.steer_stopped and (s.parked or self._steering(s)):
                 # (ruling T) after the latch the bulk stop owns a steering session: nothing decided or signalled
                 # here; its group is only registered as stopping, so nothing starts beside it. (Review round 5,
@@ -1842,7 +1840,14 @@ class SessionHost:
         def forget() -> None:
             s.child, s.proc_start, s.ready = None, None, False
             s.group_token = s.group_key = None
-        return self.groups.release(token, lambda: child.poll() is not None and self.group_absent(child.pid), forget)
+        was = token in self.groups.held
+        fence = (s.group_key if s.group_key is not None else node_groups.key(s.cwd), s.cwd)
+        released = self.groups.release(token, lambda: child.poll() is not None and self.group_absent(child.pid),
+                                       forget, fence)
+        if not released and not was:
+            log.warning("session %s: its process group could not be proved gone: its checkout stays held (no signal "
+                        "is sent to it again)", s.session_id)
+        return released
 
     LINGER_LOG_SECONDS = 60.0       # how often a process group that outlives its SIGKILL is said again
 
@@ -2206,6 +2211,8 @@ class SessionHost:
         by a clock read immediately before its SIGTERM (after the registry, `poll` and the group probe, R8-02), so no
         SIGKILL comes before the grace from it. Every other caller passes nothing: main's `now`, exactly as on main.
         Nothing about the dating is stored or inferred from a slot or a past drain."""
+        if s.child is not None and not self.groups.may_signal(s.group_token):
+            return      # (C1, R2) HELD: proof-only; no signal and no signal clock
         if s.child is not None and s.stopping_since is None:
             s.stopping_since = now
             # (Review round 9, ruling D1) `reserved`: the claim already marked the group STOPPING without waiting
@@ -3176,7 +3183,7 @@ class SessionHost:
 
     def _kill_if_due(self, s: Session, now: float) -> bool:
         if s.child is not None and s.stopping_since is not None and not s.killed \
-                and now - s.stopping_since >= self.kill_grace:
+                and now - s.stopping_since >= self.kill_grace and self.groups.may_signal(s.group_token):
             s.killed = True
             s.child.kill()
             return True
@@ -3288,7 +3295,7 @@ class SessionHost:
             failed: set[str] = set()
             for s in live:
                 try:
-                    if going(s):
+                    if going(s) and self.groups.may_signal(s.group_token):     # (C1, R2: never a HELD one)
                         s.child.kill()
                 except Exception:
                     failed.add(s.session_id)
@@ -3310,15 +3317,18 @@ class SessionHost:
                         log.exception("session %s: a step of its shutdown failed", s.session_id)
                 s.transcript_fd = None
                 try:
+                    # (C1, review round 1, A1) after the KILL attempt, sent or raised, a group not proved gone is
+                    # HELD: kept, fenced, and never signalled by number again (identity-safe retries are C2 and C3)
                     released = self._release(s, s.child)
                 except Exception:
                     released = s.child is None
                     log.exception("session %s: its group's record could not be cleared", s.session_id)
                 if not released:
-                    # (Review round 5, ruling Z; C1) its group is not proved gone (a member survived its SIGKILL, or
-                    # it cannot be told): the session keeps its process handle, its SIGTERM's time, the exact token and
-                    # its group's entry (no checkout is given away under it), and the final save below records it,
-                    # so a later kill (`kill_due`) or the next node process's recovery stops it. Its siblings go on.
+                    # (Review round 5, ruling Z; C1) its group is not proved gone (a member survived its SIGKILL, its
+                    # SIGKILL raised, or it cannot be told): the session keeps its process handle, the exact token and
+                    # its group's entry, HELD (no checkout is given away under it, and no signal is sent to it again),
+                    # and the final save below records it. Its siblings go on. (The next node process's recovery
+                    # signals only a leader it verifies: a leaderless survivor is C3's to stop.)
                     log.warning("session %s: its process group may still be running after shutdown: kept", s.session_id)
                     continue
                 s.stopping_since, s.killed = None, False
