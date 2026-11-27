@@ -4958,11 +4958,9 @@ def test_r9_f_with_the_default_no_steer_mode_no_slot_no_hold(henv, monkeypatch):
 def test_r9_f_the_one_place_a_hold_is_made_is_guarded(henv, monkeypatch):
     """Ruling F (off at every layer): even if an adapter said it steers while the node's switch is off, the host never
     holds N's end: the one place a hold is created asks the switch."""
-    _claude_steering_default(monkeypatch)
-    monkeypatch.setattr(ClaudeSession, "steering_on", True)      # (the adapter alone, as no host would set it)
-    monkeypatch.setattr(_SessionHost, "claude_steer", lambda self: False)
-    s, child, n = steered(henv, monkeypatch)
-    s.provider.steering_on = True
+    s, child, n = steered(henv, monkeypatch)        # (on: a steer written whole into N)
+    monkeypatch.setattr(_SessionHost, "claude_steer", lambda self: False)   # (the node's switch now off)
+    assert s.provider.steering_on, "the adapter alone still says it steers (as no host would leave it)"
     child.emit(owned(n, text="N's own"))
     out = henv.host.tick()
     assert s.held is None, "never a hold with the switch off"
