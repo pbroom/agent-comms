@@ -452,6 +452,7 @@ class Node:
             local.terminated_at = self.clock()
         if how == "kill" and not local.killed:
             local.killed = True
+            self.groups.veto(("run", local.run_id))     # (C1, R5: from this attempt on, sent or raised, proof-only)
             local.child.kill()
         elif how != "kill" and not local.terminating:
             local.terminating = True
@@ -516,7 +517,7 @@ class Node:
         successful membership observation of its group with no member. Proved: the run leaves `running` (and so
         its state entry, at the next save) with its registry entry. Not proved: everything is kept."""
         token = ("run", rid)
-        was = token in self.groups.held
+        was = self.groups.state(token) == self.groups.HELD
         fence = (getattr(local, "key", None) or key(local.cwd), local.cwd)
         released = self.groups.release(token,
                                        lambda: local.child.poll() is not None and self.group_absent(local.child.pid),

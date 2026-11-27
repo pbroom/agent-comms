@@ -152,9 +152,36 @@ class Groups:
         finally:
             self.lock.release()
 
+    def veto(self, token: Hashable) -> None:
+        """(C1, review round 2, R5 and A2) THE one place that makes a token proof-only after a KILL: called by every
+        site that sends a SIGKILL to a tracked group, at the attempt, before the signal (so a KILL that raises is
+        covered too), under the owner's serialization that also asks `may_signal` (a session's: the node's runner lock;
+        a dispatched run's: the node's one loop thread). It writes only the lock-free HELD index, so the due-KILL path
+        never waits on the registry; the group's entry is STOPPING already (that fences admission), and becomes HELD
+        at the release rule, where the registry is taken anyway."""
+        self.held.add(token)
+
+    def _fence(self, token: Hashable, fence: tuple[Hashable, Any] | None) -> None:
+        """(The registry's lock held.) The token's entry made HELD (with no entry, one under `fence`: A3), and the
+        HELD index with it."""
+        found = False
+        for groups in self.entries.values():
+            if token in groups:
+                groups[token][0], found = self.HELD, True
+        if not found and fence is not None:
+            k, cwd = fence
+            self.entries.setdefault(k, {})[token] = [self.HELD, cwd]
+            found = True
+        if found:
+            self.held.add(token)
+
     def release(self, token: Hashable, proof: Callable[[], bool], forget: Callable[[], None],
-                fence: tuple[Hashable, Any] | None = None) -> bool:
-        """(Ownership until verified exit, C1) THE one release rule: the only way a group's registry entry, and its
+                fence: tuple[Hashable, Any] | None = None, prepare: Callable[[], None] | None = None) -> bool:
+        """(Ownership until verified exit, C1; review round 2, R6 and A3) THE one release rule. FIRST, under the
+        registry's lock, the exact token is fenced (HELD, or a HELD entry under `fence` if it has none), so there is
+        no moment at which its entry is LIVE while the caller's last reads (`prepare`, outside the lock) or the proof
+        are in progress; then `prepare()`, then the proof, outside the lock. A True proof removes the entry and the
+        fence in one step (`_gone`); anything else leaves the token HELD. The only way a group's registry entry, and its
         owner's tracking record (whose durable entry is that record's projection), go. `proof()` answers whether the
         group is proved gone; it is supplied by the caller, so how absence is proved (today: the leader's exit observed
         by its owning handle and `group_absent`; later an anchor's own word) never touches this rule or its callers.
@@ -167,22 +194,15 @@ class Groups:
         entry goes (`_gone`); True. Scope: this is the removal path of a live node's started groups. A spawn that
         fails removes its provisional registration in `start`, and a start never made or a claim lost has no group to
         release."""
+        with self.lock:
+            self._fence(token, fence)
+        if prepare is not None:
+            prepare()
         try:
             proved = proof() is True
         except Exception:
             proved = False
         if not proved:
-            with self.lock:
-                found = False
-                for groups in self.entries.values():
-                    if token in groups:
-                        groups[token][0], found = self.HELD, True
-                if not found and fence is not None:
-                    k, cwd = fence
-                    self.entries.setdefault(k, {})[token] = [self.HELD, cwd]
-                    found = True
-                if found:
-                    self.held.add(token)
             return False
         forget()
         self._gone(token)

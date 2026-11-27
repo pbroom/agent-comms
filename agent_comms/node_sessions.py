@@ -1789,6 +1789,7 @@ class SessionRunner:
         with self.lock:
             for s in self.host.sessions.values():
                 if self._going(s) and self.host.groups.may_signal(s.group_token):     # (C1: never a HELD one)
+                    self.host.groups.veto(s.group_token)     # (C1, R5: from this attempt on, proof-only)
                     s.child.kill()
 
     def shutdown(self) -> None:

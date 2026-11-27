@@ -1531,8 +1531,9 @@ class SessionHost:
         if s.child is not None:
             self._read(s, now, out)
             self._reap(s, now, out)
-            if s.child is not None and not self.groups.may_signal(s.group_token):
-                # (C1, R2) HELD (its group not proved gone where main let it go: `_release`): proof-only; nothing
+            if s.child is not None and s.stopping_since is None and not self.groups.may_signal(s.group_token):
+                # (C1, R2; review round 2, A1: a stopping one keeps main's stop: its clock, its bounded publication,
+                # its reap and its lines) HELD (its group not proved gone where main let it go: `_release`): proof-only; nothing
                 # more is done with it (no write, no stop, no signal) until a later pass proves it gone.
                 return None
         if (s.child is not None and s.stopping_since is None and not s.ended and s.writing is not None
@@ -1761,7 +1762,7 @@ class SessionHost:
         code = s.child.poll()
         if code is None:
             return
-        if self.group_alive(s.child.pid) and self.groups.may_signal(s.group_token):
+        if self.group_alive(s.child.pid) and (s.stopping_since is not None or self.groups.may_signal(s.group_token)):
             if s.stopping_since is None and self.steer_stopped and (s.parked or self._steering(s)):
                 # (ruling T) after the latch the bulk stop owns a steering session: nothing decided or signalled
                 # here; its group is only registered as stopping, so nothing starts beside it. (Review round 5,
@@ -1792,14 +1793,18 @@ class SessionHost:
                     self._went_by_itself(s, code, s.ready, s.checking, out)
                     stop()
             return      # its leader is gone, but not its group: nothing starts beside that, nothing is reported reaped
-        self._read(s, now, out)     # what it wrote on its way out (a result that just made it still counts)
-        self._drain_before_stop(s, now, out)      # a live steer attempt: all it wrote, across reads (R3-05)
-        if not s.ready:
-            self._correct_start_mode(s)
-        was_ready, was_checking = s.ready, s.checking
-        child = s.child
-        if not self._release(s, child):
+        child, seen = s.child, {}
+
+        def last_reads() -> None:
+            # (C1, review round 2, A3: after the release rule fenced the checkout) main's last reads of it
+            self._read(s, now, out)     # what it wrote on its way out (a result that just made it still counts)
+            self._drain_before_stop(s, now, out)      # a live steer attempt: all it wrote, across reads (R3-05)
+            if not s.ready:
+                self._correct_start_mode(s)
+            seen["ready"], seen["checking"] = s.ready, s.checking
+        if not self._release(s, child, last_reads):
             return      # (C1) its leader exited; its group is not proved gone: kept, the next pass asks again
+        was_ready, was_checking = seen["ready"], seen["checking"]
         if s.held is not None and (s.held.fenced_at is not None or s.stopping_since is not None):
             # Its group is gone: published before any cleanup (B). (After #119, ruling A3) Also a held end whose stop
             # was armed but whose decision never ran (a reserved stop's commit, or a claim's decision, that raised
@@ -1827,7 +1832,7 @@ class SessionHost:
         s.held_since = None
         self._save_state()
 
-    def _release(self, s: Session, child: Any) -> bool:
+    def _release(self, s: Session, child: Any, prepare: Callable[[], None] | None = None) -> bool:
         """(Ownership until verified exit, C1) The session's side of THE release rule (`Groups.release`), for the
         reap and the shutdown: the proof is the leader's exit OBSERVED by its own handle (`poll()`) AND a complete,
         successful membership observation of its group showing no member (`group_absent`). Proved: the tracking
@@ -1840,10 +1845,10 @@ class SessionHost:
         def forget() -> None:
             s.child, s.proc_start, s.ready = None, None, False
             s.group_token = s.group_key = None
-        was = token in self.groups.held
+        was = self.groups.state(token) == self.groups.HELD
         fence = (s.group_key if s.group_key is not None else node_groups.key(s.cwd), s.cwd)
         released = self.groups.release(token, lambda: child.poll() is not None and self.group_absent(child.pid),
-                                       forget, fence)
+                                       forget, fence, prepare)
         if not released and not was:
             log.warning("session %s: its process group could not be proved gone: its checkout stays held (no signal "
                         "is sent to it again)", s.session_id)
@@ -3185,6 +3190,7 @@ class SessionHost:
         if s.child is not None and s.stopping_since is not None and not s.killed \
                 and now - s.stopping_since >= self.kill_grace and self.groups.may_signal(s.group_token):
             s.killed = True
+            self.groups.veto(s.group_token)     # (C1, R5: from this attempt on, sent or raised, proof-only)
             s.child.kill()
             return True
         return False
@@ -3296,6 +3302,7 @@ class SessionHost:
             for s in live:
                 try:
                     if going(s) and self.groups.may_signal(s.group_token):     # (C1, R2: never a HELD one)
+                        self.groups.veto(s.group_token)     # (C1, R5: from this attempt on, proof-only)
                         s.child.kill()
                 except Exception:
                     failed.add(s.session_id)

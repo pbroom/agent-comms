@@ -431,27 +431,29 @@ def test_a4_the_held_transition_cannot_come_between_the_signal_check_and_the_sig
 
 @pytest.mark.skipif(__import__("sys").platform != "darwin", reason="macOS libproc only")
 def test_r4_group_absent_against_real_children_of_this_test(monkeypatch, tmp_path):
-    """Review round 1, R4: `group_absent` and `group_members` against this test's own child processes only (its own
-    temporary directory): a live member is listed; a zombie leader is listed; a group with no member is absent; and
-    a listing that fills its buffer is no proof (the truncation rule)."""
-    import os
-    import signal
+    """Review rounds 1 and 2 (R4, R7): `group_absent` and `group_members` against this test's own child processes
+    only, in its own temporary directory: a leader and a member it puts into the leader's group, both its direct
+    children (so each is signalled through its own handle, and a handle that has been waited for is never signalled
+    again). A live member is listed; the leader's exit is OBSERVED (kqueue `NOTE_EXIT`, which does not reap it) and its
+    zombie is listed; the member alone once the leader is reaped; a listing that fills its buffer is no proof (the
+    truncation rule); and no member at all is absence."""
+    import select
     import subprocess
-    import sys
-    import time
-    leader = subprocess.Popen([sys.executable, "-c", "import subprocess, time; "
-                               "m = subprocess.Popen(['sleep', '30']); print(m.pid, flush=True); time.sleep(30)"],
-                              cwd=tmp_path, start_new_session=True, stdout=subprocess.PIPE, text=True,
-                              stdin=subprocess.DEVNULL)
-    member = int(leader.stdout.readline())
-    pg = leader.pid
+    # (a group of its own in this test's session: a process may join a group only in its own session)
+    leader = subprocess.Popen(["sleep", "60"], cwd=tmp_path, process_group=0, stdin=subprocess.DEVNULL)
+    member = None
+    kq = select.kqueue()
     try:
-        assert set(node_groups.group_members(pg)) == {pg, member} and not node_groups.group_absent(pg)
-        os.kill(pg, signal.SIGKILL)
-        time.sleep(0.3)
+        member = subprocess.Popen(["sleep", "60"], cwd=tmp_path, process_group=leader.pid, stdin=subprocess.DEVNULL)
+        pg = leader.pid
+        assert set(node_groups.group_members(pg)) == {pg, member.pid} and not node_groups.group_absent(pg)
+        kq.control([select.kevent(pg, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                  fflags=select.KQ_NOTE_EXIT)], 0)
+        leader.kill()                       # (its own handle; not yet waited for)
+        assert kq.control(None, 1, 10), "the leader's exit is observed, within ten seconds"
         assert pg in node_groups.group_members(pg), "a zombie leader is listed"
-        leader.wait()
-        assert node_groups.group_members(pg) == (member,), "the member alone, once the leader is reaped"
+        leader.wait(timeout=10)
+        assert node_groups.group_members(pg) == (member.pid,), "the member alone, once the leader is reaped"
 
         class Small:        # (the kernel's estimate made one slot: the real listing fills it)
             real = node_groups._libproc()
@@ -462,19 +464,18 @@ def test_r4_group_absent_against_real_children_of_this_test(monkeypatch, tmp_pat
         monkeypatch.setattr(node_groups, "_LISTING_ROOM", (0,))
         assert node_groups.group_members(pg) is None and not node_groups.group_absent(pg), "truncated: no proof"
         monkeypatch.undo()
-        os.kill(member, signal.SIGKILL)
-        deadline = time.monotonic() + 5
-        while node_groups.group_members(pg) and time.monotonic() < deadline:
-            time.sleep(0.05)
+        member.kill()
+        member.wait(timeout=10)             # (observed and reaped by its own handle: no member is left)
         assert node_groups.group_members(pg) == () and node_groups.group_absent(pg), "no member: absent"
     finally:
-        for pid in (member, pg):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        if leader.poll() is None:
-            leader.wait()
+        kq.close()
+        for proc in (member, leader):
+            if proc is None:
+                continue
+            if proc.returncode is None and proc.poll() is None:
+                proc.kill()                 # (only a handle not yet waited for is signalled)
+            if proc.returncode is None:
+                proc.wait(timeout=10)
 
 
 def test_r2_the_runners_shutdown_steps_never_signal_a_held_session(env):
@@ -530,3 +531,275 @@ def test_a3_a_runs_refused_release_with_its_entry_missing_still_fences_the_check
     assert rid in nenv.node.running and nenv.node.groups.state(("run", rid)) == nenv.node.groups.HELD
     started, _ = nenv.node.groups.start(nenv.node_dir, ("run", "next"), lambda: object())
     assert not started, "refused on that checkout"
+
+
+# ---------------------------------------------------------------- review round 2: R5 (the first KILL), R6 (fence first)
+
+
+def _killed_with_a_survivor(henv, raising=False):
+    """A session stopped by main's path (its turn timed out), its process ignoring SIGTERM; the kill scan's SIGKILL
+    (or one that raises) leaves a member of its group alive: (session, child, the stop's clock)."""
+    s, child = _a_turn(henv)
+    child.exits_on_terminate = False
+    henv.groups.add(child.pid)
+    henv.host._stop(s, henv.clock())
+    clock = s.stopping_since
+    if raising:
+        def bad():
+            raise OSError("the signal failed")
+        child.kill = bad
+    henv.clock.advance(henv.host.kill_grace + 1)
+    try:
+        henv.host.kill_due()
+    except OSError:
+        assert raising      # (the watchdog's pass logs a raising kill and goes on)
+    assert child.terminated == 1
+    return s, child, clock
+
+
+def _signals(child):
+    return child.terminated + child.killed
+
+
+@pytest.mark.parametrize("raising", [False, True])
+@pytest.mark.parametrize("then", ["pass", "cancel", "close", "stop_all", "stop_turns"])
+def test_r5_after_the_first_kill_no_numeric_signal_reaches_the_group_again(henv, then, raising):
+    """R5: the FIRST KILL attempt (sent, or raised) makes the token proof-only: a member survives, and a later pass,
+    a cancel, a close, shutdown (`stop_all`) or a stop of every turn sends no TERM and no KILL to it again (e6ebf95's
+    STOPPING with `killed` latched let shutdown TERM and KILL it again: `terminate()` is a `killpg`)."""
+    s, child, clock = _killed_with_a_survivor(henv, raising=raising)
+    before = _signals(child)
+    if then == "pass":
+        for _ in range(3):
+            henv.host.tick()
+    elif then == "cancel":
+        henv.host.cancel(SID, "1", "cancelled")
+    elif then == "close":
+        henv.host.close(SID, "closed")
+    elif then == "stop_all":
+        henv.host.stop_all()
+    else:
+        henv.host.stop_turns("the node lost the hub")
+    henv.clock.advance(henv.host.kill_grace + 1)
+    henv.host.kill_due()
+    assert _signals(child) == before, "no numeric signal after the first KILL attempt"
+    assert not henv.host.groups.may_signal(s.group_token)
+    assert s.stopping_since == clock, "the stop's clock is kept"
+    assert henv.host.groups.blocked(s.cwd), "the checkout stays fenced"
+
+
+def test_r5_the_runners_shutdown_steps_send_nothing_after_the_first_kill(env):
+    """R5: the node's own shutdown steps (`SessionRunner.signal`, `SessionRunner.kill`) send nothing to a group whose
+    first KILL was attempted (the kill scan's), its member alive."""
+    from test_hosted_sessions import start, tick
+    from test_hosted_tree import proc_of
+    runner = env.node.sessions
+    host = runner.host
+    sid = start(env, "a turn")["session_id"]
+    tick(env)
+    s = host.sessions[sid]
+    child = proc_of(env, sid)[1]
+    child.exits_on_terminate = False
+    env.groups.add(child.pid)
+    with runner.lock:
+        host._stop(s, env.clock())
+    env.clock.advance(host.kill_grace + 1)
+    with runner.lock:
+        host.kill_due()
+    before = child.terminated + child.killed
+    runner.signal()
+    runner.kill()
+    assert child.terminated + child.killed == before
+
+
+@pytest.mark.parametrize("then", ["reap", "signal_runs", "kill_runs", "report_stopped"])
+def test_r5_after_a_runs_first_kill_nothing_more_is_sent(nenv, then):
+    """R5, for a dispatched run: its SIGKILL (the reap's escalation after the grace) leaves a member; a later reap,
+    the shutdown's signal and kill steps and `report_stopped` send nothing more."""
+    from test_nodes import allow, human_post
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    nenv.node.tick()
+    [rid] = list(nenv.node.running)
+    child = nenv.node_spawner.children[0]
+    child.exits_on_terminate = False
+    nenv.node._stop(nenv.node.running[rid], "terminate")
+    nenv.clock.advance(nenv.node.running[rid].grace + 1)
+    nenv.node.tick()        # (the reap's escalation: its SIGKILL)
+    assert child.killed == 1
+    child.left_members = True
+    before = child.terminated + child.killed
+    if then == "reap":
+        for _ in range(3):
+            nenv.node.tick()
+    elif then == "signal_runs":
+        nenv.node.signal_runs()
+    elif then == "kill_runs":
+        nenv.node.kill_runs()
+    else:
+        nenv.node.report_stopped()
+    assert child.terminated + child.killed == before
+    assert rid in nenv.node.running
+
+
+def test_r5_a1_a_killed_held_group_keeps_its_stop_and_its_bounded_publication(henv, monkeypatch):
+    """Amendment A1: HELD after the KILL revokes signal eligibility only. A Claude end decided and fenced by the cut,
+    its group outliving the KILL: the bounded publication still publishes N's end at its deadline (two graces
+    from the SIGTERM); the stop's clock is kept; and once the group is gone, the reap's release reads what the
+    process wrote last and lets the group go."""
+    from test_claude_steering import steered
+    from test_claude_correlation import owned
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 10_000
+    child.emit(owned(n, text="N's own"))
+    henv.host.tick()
+    assert s.held is not None
+    child.exits_on_terminate = False
+    henv.groups.add(child.pid)
+    s.steer.cover_until = henv.clock() - 1
+    henv.host.tick()            # (the cut: decided, fenced, its SIGTERM)
+    assert s.held.decided is not None and s.held.fenced_at is not None and s.stopping_since is not None
+    clock = s.stopping_since
+    henv.clock.advance(henv.host.kill_grace + 1)
+    henv.host.kill_due()
+    assert child.killed == 1 and not henv.host.groups.may_signal(s.group_token)
+    henv.clock.advance(henv.host.kill_grace + 1)
+    out = henv.host.tick()
+    assert [e.text for e in out if e.kind == "turn_ended" and e.message_id == "1"] == ["N's own"], \
+        "the bounded publication is not skipped"
+    assert s.stopping_since == clock
+    child.emit(b'{"type": "system", "subtype": "note"}')
+    henv.groups.discard(child.pid)
+    child.code = -9
+    henv.host.tick()
+    assert s.child is None, "released at the proof"
+    assert b"note" in open(henv.host.transcript_path(SID), "rb").read(), "the final read"
+
+
+def test_r5_a1_a_killed_held_run_is_reported_ended_at_its_release(nenv):
+    """Amendment A1: a run killed with a member left keeps its pending report: it is reported ended at the release,
+    once the group is proved gone, as main reports it at its reap."""
+    from agent_comms import nodes
+    from test_nodes import allow, human_post
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    post = human_post(nenv, ["grok"])
+    nenv.d.tick()
+    nenv.node.tick()
+    [rid] = list(nenv.node.running)
+    child = nenv.node_spawner.children[0]
+    child.exits_on_terminate = False
+    nenv.node._stop(nenv.node.running[rid], "terminate")
+    nenv.clock.advance(nenv.node.running[rid].grace + 1)
+    nenv.node.tick()
+    child.left_members = True
+    nenv.node.tick()
+    assert nodes.run(nenv.board, rid)["state"] != "ended"
+    child.left_members = False
+    nenv.node.tick()
+    assert rid not in nenv.node.running and nodes.run(nenv.board, rid)["state"] == "ended"
+
+
+class _Gate:
+    """A proof that waits until the test opens it, then answers `answer`."""
+
+    def __init__(self, answer):
+        import threading
+        self.answer, self.entered, self.open = answer, threading.Event(), threading.Event()
+
+    def __call__(self, pgid):
+        self.entered.set()
+        assert self.open.wait(10)
+        if self.answer == "raises":
+            raise OSError("could not tell")
+        return self.answer
+
+
+@pytest.mark.parametrize("answer", [True, False, None, "raises"])
+def test_r6_the_checkout_is_fenced_while_the_proof_runs(henv, answer):
+    """R6: the leader exited, liveness answers false, and the reap's proof is in progress (blocked here): a session
+    and a run asking for that checkout are refused for the whole of it; after a True proof both are admitted, after
+    False, None or a raising proof both are still refused (HELD)."""
+    s, child = _a_turn(henv)
+    gate = _Gate(answer)
+    henv.host.group_absent = gate
+    child.code = 0
+    out, err, done = _run(lambda: henv.host.tick())
+    assert gate.entered.wait(5), "the proof started"
+    for tok in (("session", "another", 1), ("run", "r1")):
+        started, _ = henv.host.groups.start(s.cwd, tok, lambda: object())
+        assert not started, f"{tok} refused while the proof runs"
+    gate.open.set()
+    assert done.wait(5)
+    started, _ = henv.host.groups.start(s.cwd, ("run", "r2"), lambda: object())
+    assert started is (answer is True)
+
+
+def test_r6_a3_the_fence_is_in_before_the_reaps_drain(henv):
+    """Amendment A3: the reap's drain of what the process wrote comes after the fence (at the false liveness answer),
+    not just the proof: an admission during that drain is refused."""
+    s, child = _a_turn(henv)
+    seen = []
+    real = henv.host._drain_before_stop
+
+    def drain(sess, now, out):
+        if sess is s:
+            seen.append(henv.host.groups.start(s.cwd, ("run", "during-drain"), lambda: object())[0])
+        return real(sess, now, out)
+    henv.host._drain_before_stop = drain
+    henv.host.group_absent = lambda pgid: True
+    child.code = 0
+    henv.host.tick()
+    assert seen and seen[0] is False, "refused during the drain"
+    assert s.child is None, "then released by the True proof"
+
+
+def _run(fn):
+    import threading
+    out, err, done = [], [], threading.Event()
+
+    def go():
+        try:
+            out.extend(fn() or [])
+        except BaseException as e:      # noqa: BLE001
+            err.append(e)
+        finally:
+            done.set()
+    threading.Thread(target=go, daemon=True).start()
+    return out, err, done
+
+
+def test_r6_a4_a_run_refused_by_a_clean_exits_fence_waits_and_is_admitted_next(nenv):
+    """Amendment A4 (and R6.3): a run that meets a fence a clean exit's proof holds is deferred, as at a STOPPING
+    barrier (its "waits" line), never failed; its next attempt, once the proof came back True, starts it."""
+    from agent_comms import nodes
+    from test_nodes import allow, human_post
+    k = node_groups.key(nenv.node_dir)
+    nenv.node.groups.release(("session", "clean", 1), lambda: False, lambda: None, (k, nenv.node_dir))
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    nenv.node.tick()
+    assert nenv.node_spawner.calls == [], "deferred while fenced"
+    [r] = [r for r in nodes.runs(nenv.board) if r.get("node") == "laptop"] if hasattr(nodes, "runs") else [None]
+    nenv.node.groups.release(("session", "clean", 1), lambda: True, lambda: None)
+    nenv.node.tick()
+    assert len(nenv.node_spawner.calls) == 1, "admitted on its next attempt, not failed"
+
+
+def test_r6_a4_a_session_refused_by_a_clean_exits_fence_waits_and_starts_next(henv):
+    """Amendment A4: a session whose spawn meets that fence keeps its message in the inbox (deferred, as at a STOPPING
+    barrier), and starts once the fence is lifted."""
+    k = node_groups.key(henv.work)
+    henv.host.groups.release(("session", "clean", 1), lambda: False, lambda: None, (k, henv.work))
+    s = open_session(henv)
+    henv.host.send(SID, "a turn", message_id="1")
+    out = henv.host.tick()
+    assert s.child is None and [m.id for m in s.inbox] == ["1"], "deferred, not failed"
+    assert not [e for e in out if e.kind == "turn_ended"]
+    henv.host.groups.release(("session", "clean", 1), lambda: True, lambda: None)
+    henv.host.tick()
+    assert s.child is not None

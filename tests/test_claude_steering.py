@@ -3530,6 +3530,9 @@ def test_r5_w_kills_and_fences_with_a_drain_pending_and_a_raising_or_stalling_sa
         host._save_state = save
         c2.killed = getattr(c2, "killed", False)
         s2.killed = False
+        # (C1, review round 2, R5: the first KILL attempt makes a token proof-only; this test's own reset, to send a
+        # second due KILL with the other save, clears that too)
+        host.groups.held.discard(s2.group_token)
         t, done, ident, err = _on_watchdog(runner)
         assert done.wait(3), "the watchdog's pass returned"
         assert s2.killed, "the due SIGKILL was sent"
