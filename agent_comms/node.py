@@ -597,7 +597,8 @@ def _status(e: BaseException) -> int:
 
 def _exit_if_stalled(status: int) -> None:
     """The node's exit, after its last signal and report: ONE bounded wait for the log writer (EXIT_FLUSH_SECONDS,
-    `atexit`'s included). Idle: the process goes on to exit as ever (`logging.shutdown()` included). Still stuck in a
+    `atexit`'s included). Idle (or no writer could be started: no handler of ours runs, the queued lines are lost):
+    the process goes on to exit as ever (`logging.shutdown()` included). Still stuck in a
     handler: the process ends now with `status`, without waiting for that handler (a handler stuck holding its own
     lock would hold `logging.shutdown()` for good). That skips the interpreter's exit work (atexit hooks,
     `logging.shutdown()`, a traceback for an escaping exception, buffered output): every child was signalled and

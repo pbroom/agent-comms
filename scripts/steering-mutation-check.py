@@ -205,13 +205,14 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('N', 'C4 a stalled writer does not hold the exit', '    if not hostlog.final_flush(EXIT_FLUSH_SECONDS):\n        os._exit(status)', '    if False:\n        os._exit(status)'),
     ('N', "C1 the node's main thread is a lifecycle thread (re-anchored)", '    with hostlog.enqueue_only():\n        hostlog.start_writer(force=True)', '    with __import__("contextlib").nullcontext():\n        hostlog.start_writer(force=True)'),
     ('NS', 'W2 the session loop is a lifecycle thread', '        with hostlog.enqueue_only():    # (host-side logging: the session loop never waits for the log writer)', '        with __import__("contextlib").nullcontext():    # (host-side logging: the session loop never waits for the log writer)'),
-    ('L', 'R11 the seal is one step with the idle decision', '        ok = _idle_by(deadline)\n        _state["sealed"] = True     # (one step with the idle decision)', '        ok = _idle_by(deadline)\n    with _cond:\n        _state["sealed"] = True     # (one step with the idle decision)'),
+    ('L', 'R11 the seal is one step with the idle decision', '        ok = _idle_by(deadline, writerless_ok=True)\n        _state["sealed"] = True     # (one step with the idle decision)', '        ok = _idle_by(deadline, writerless_ok=True)\n    with _cond:\n        _state["sealed"] = True     # (one step with the idle decision)'),
     ('L', 'R11 a record after the seal is rejected', '        if _state["sealed"]:\n            return      # (R11', '        if False:\n            return      # (R11'),
     ('L', 'R12 a failed start is contained', '    except Exception:\n        pass\n    finally:\n        with _cond:\n            _state["starting"] = False', '    except ZeroDivisionError:\n        pass\n    finally:\n        with _cond:\n            _state["starting"] = False'),
     ('L', 'R12 nobody waits for a writer that is not running', '            if _state["starting"] or not _writer_alive():\n                return False', '            if False:\n                return False'),
     ('N', 'A4 the writer is started eagerly by node.run', '        hostlog.start_writer(force=True)    # (eagerly', '        pass    # (eagerly'),
     ('L', 'A4 an enqueue never starts the writer', '    # (A4) An enqueue never starts the writer', '    _lazy_start()\n    # (A4) An enqueue never starts the writer'),
-    ('L', 'A5 the start claim is let go however it ends', '            _state["starting"] = False\n            if started:', '            if started:')]
+    ('L', 'A5 the start claim is let go however it ends', '            _state["starting"] = False\n            if started:', '            if started:'),
+    ('L', 'R12 the final wait does not wait for a writer that cannot start', '        if writerless_ok and not _state["starting"] and not _writer_alive():\n            return True', '        if False:\n            return True')]
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
          "tests/test_hostlog.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",

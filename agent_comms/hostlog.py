@@ -619,9 +619,13 @@ def _idle() -> bool:
     return not _queue and not _state["dropped"] and _state["busy"] is None
 
 
-def _idle_by(deadline: float) -> bool:
-    """(Under `_cond`.) Wait until idle, at most until `deadline`. True: idle."""
+def _idle_by(deadline: float, writerless_ok: bool = False) -> bool:
+    """(Under `_cond`.) Wait until idle, at most until `deadline`. True: idle; with `writerless_ok` (the final wait),
+    also True as soon as no writer runs and no start is pending: no handler of ours can then be entered or stuck, so
+    the process may exit normally (what is queued is lost) instead of waiting out a budget nothing can use."""
     while not _idle():
+        if writerless_ok and not _state["starting"] and not _writer_alive():
+            return True         # (R12: a writer that cannot start costs the exit nothing but its queued lines)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
@@ -641,12 +645,13 @@ def final_flush(budget: float = 2.0) -> bool:
     """`node.run`'s ONE final bounded wait, after the last signal and report (and `atexit`'s, when nothing made it):
     the writer started if it is not running (the last safe start point), then the wait and the SEAL in one critical
     section (R11): from the moment "idle" is decided no record is accepted, so idle-and-sealed is never followed by a
-    handler entry. True: idle (the process may exit normally); False: the writer is stuck (or cannot start)."""
+    handler entry. True: no handler of ours is running (idle; or no writer could be started, and what was queued is
+    lost), so the process may exit normally; False: the writer is still in a handler at the deadline."""
     start_writer()
     deadline = time.monotonic() + budget
     with _cond:
         _state["exit_deadline"] = deadline
-        ok = _idle_by(deadline)
+        ok = _idle_by(deadline, writerless_ok=True)
         _state["sealed"] = True     # (one step with the idle decision)
     return ok
 

@@ -1643,8 +1643,8 @@ def test_r11_the_seal_and_the_idle_decision_are_one_step(monkeypatch):
     from agent_comms import hostlog, session_host
     real, go, done = hostlog._idle_by, threading.Event(), threading.Event()
 
-    def idle_by(deadline):
-        ok = real(deadline)
+    def idle_by(deadline, **k):
+        ok = real(deadline, **k)
         if ok:
             go.set()
             _time.sleep(0.3)        # (a producer runs now, while the decision is made)
@@ -1706,6 +1706,23 @@ def test_r12_a_writer_that_cannot_start_never_fails_a_log_call(monkeypatch):
     assert _time.monotonic() - t0 < 0.5
     assert len(calls) == 1, "one start attempt, not one per line"
     assert hostlog._writer[0] is None and not hostlog._state["starting"]
+
+
+def test_r12_the_final_wait_does_not_wait_for_a_writer_that_cannot_start(monkeypatch):
+    """R12 at the exit: lines are queued and the OS refuses the writer, so no handler of ours can be entered or stuck.
+    The final wait returns True at once (the node exits normally, its traceback and `logging.shutdown()` kept) instead
+    of spending its budget and taking the stalled `os._exit`; the queue is sealed; the queued lines are lost."""
+    import time as _time
+    from agent_comms import hostlog, session_host
+    _no_writer()
+    calls = _refuse_the_writer(monkeypatch)
+    with hostlog.enqueue_only():
+        session_host.log.warning("queued, never written")
+    assert hostlog._queue, "the line is queued"
+    t0 = _time.monotonic()
+    assert hostlog.final_flush(2.0) is True
+    assert _time.monotonic() - t0 < 0.5, "no wait for a writer that is not running"
+    assert calls and hostlog._state["sealed"]
 
 
 def test_r12_a_stop_and_a_save_complete_when_the_writer_cannot_start(henv, monkeypatch):
