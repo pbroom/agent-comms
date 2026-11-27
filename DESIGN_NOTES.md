@@ -16458,3 +16458,86 @@ Only session_host.py and node_groups.py product code changed, so structured and 
 - The `~/.codex/config.toml` hash was 18fcebe0d94018f8 before, after each real run and at the end.
 - The protected files are unchanged: tests/test_codex_steering.py, tests/test_claude_correlation.py and
   tests/fixtures/schema_free_main.json.
+
+## After #119: follow-ups
+
+#119 merged as 9838e1e, with a tree equal to 01a9e1d. This small PR comes first in the hardening split, and Sol checked
+its structure before the build. The rules are the same as before: no new state, one decision point, and main's code by
+identity. The tests are in tests/test_steering_followups.py, plus one route added to
+tests/test_claude_steering_enable.py.
+
+### A1. An explicit close follows that session's earlier terminal events (the node)
+
+- **The defect** was the reviewer's finding 1, probed on both versions.
+  - The watchdog's self-stop fails a session's turn into `watched`, because there is no hub contact.
+  - The listing that restores contact closes that SAME session.
+  - Since #119's lane rule (S5(c)), the close's `ended` was handed off ahead of the earlier `turn_ended`. The hub then
+    recorded "session ended: closed by the human" instead of the no-contact detail.
+  - On 256c3e6, and on main e6b421f, the order was `[turn_ended, ended]`.
+  - It applies to Codex and to nodes with the switch off.
+- **The fix** is at the existing handoff selector (`SessionRunner._deliver`), with no new flag or lane. While `watched`
+  waits, during a reconciliation, a session's `ended` that is about to be handed off makes THAT session incarnation's
+  earlier `watched` events eligible first, by publication sequence. Incarnation means the identity's session id and
+  generation, and earlier means a lower publication sequence. Other sessions' watched events stay where #119 put them,
+  and a LOST the reconciliation reports keeps its precedence over them.
+- **Tests.**
+  - `test_a1_a_close_of_the_self_stopped_session_follows_its_watched_turn_end[codex|claude_off|claude_default]` fails
+    on 9838e1e. The hub now ends with the no-contact detail.
+  - `test_s5c_...` closes a DIFFERENT session. It stays green and unchanged, and is the pin that the other session's
+    watched events stay behind its LOST.
+
+### A2. Small corrections
+
+- **`_claim`'s docstring.** No handler is called by the claim itself or for its deferred lines. The survivor reap's
+  own main stop still writes main's "left members of its group" warning before its SIGTERM, as main does. That is
+  inherited and left for the logging PR.
+- **A behavioural pin for an attempt whose adapter lost verification.** The reserved route matrix gains
+  `r_partial_write_unverified`. It runs under contention with a sibling's SIGKILL due, and with a raising commit.
+  `test_r10_h2_...` still pins the predicate, and is unchanged.
+- **"Enabling Claude steering", S2.** The bullet that said the reserved path computes the key with `node_groups.key`
+  is corrected to the cached key (`group_key`), pointing at "Enabling: review round 1", R2 and A3.
+- **"As on main with the switch off" is about the stop paths.** With `claude_steer = false` every stop path is
+  main's. Two things apply whatever the switch says:
+  - the lane rules: #119's S5(c) and A1 above;
+  - the moved flush: a node's host no longer flushes the deferred queue at its tick.
+
+### A3. A reserved stop whose commit raises (the host)
+
+- **Pinned first.** The commit raises after the reservation (an injected failure in the decision) on the watchdog's
+  cut. Escalation is armed, and the held end is neither decided nor fenced. Then:
+  - on 9838e1e, the verified reap did not publish it, because the reap settles only a FENCED hold;
+  - `_hold_cut` does not run without a process, and `_hold_to_timeout` neither;
+  - N stayed in flight, and the session "starting", for good. That held through 10 hours of clock, and through a
+    next message that started a new process. Nothing ever settled it.
+- **The fix**, small and direct at the existing place where the reap settles a hold (`_reap`), with no new state:
+  - The reap of a group whose stop was armed (`stopping_since`) settles its held end, whether or not it was fenced.
+  - A hold whose decision never ran is settled as the finalizer settles it: S `unconfirmed` (`turn_cut`), or
+    `next_turn` failed if S's own turn was proved. It is published at once, since the process is gone.
+  - The same covers a claim whose decision raised (round 1's A1, where the stop still runs).
+- **Tests.**
+  - `test_a3_after_a_raising_commit_the_verified_reap_settles_the_held_end`: N's native end once, S `unconfirmed`, at
+    the reap.
+  - `test_a3_after_a_raising_commit_the_held_turns_timeout_and_the_kill_settle_it_at_the_reap`: the process ignores
+    SIGTERM, and the held turn's own timeout passes. The process is already stopping, so nothing more is decided or
+    signalled. The kill scan's SIGKILL follows the grace, and N is settled once at the verified reap.
+- **Known limit.** Such an unfenced hold has no bounded publication of two graces (`_hold_fence` needs a fence). While
+  a member of the group outlives its SIGKILL, N waits for the verified reap, under the checkout's STOPPING barrier.
+  Only an injected failure leads here.
+
+### Mutation check and runs
+
+- **Mutation check.** 4 rows for the changed product code (A1: 2, A3: 2). On ae147aa all 4 are caught
+  (scripts/steering-mutation-results.txt). The script now has 160 rows.
+- **Runs** on 12785ed. The machine was loaded: another builder's suite and e2e were running alongside, with load
+  averages of 6 to 8. Claude Code 2.1.330 and codex-cli 0.172.0, run the way scripts/session-host-e2e.py runs them.
+
+  | Run | Real CLIs | Stand-ins |
+  | --- | --- | --- |
+  | `--only steer` | PASS, 28 | PASS, 27 |
+  | `--only steering` | PASS, 54 | PASS, 115 |
+  | `--only correlation` | PASS, 23 | PASS, 24 |
+  | Full e2e | not run | PASS, 395 |
+
+  - The full suite: 5338 passed, 10 skipped, in 12 min 40 s. No timing failure, so nothing was rerun.
+  - The `~/.codex/config.toml` hash was 18fcebe0d94018f8 before, after each real run and at the end.
+  - The protected files are unchanged.
