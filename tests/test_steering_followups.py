@@ -51,7 +51,7 @@ def test_a1_a_close_of_the_self_stopped_session_follows_its_watched_turn_end(env
 # ---------------------------------------------------------------- A3: a reserved stop whose commit raises
 
 
-def _held_cut_whose_commit_raises(henv, monkeypatch, exits_on_terminate):
+def _held_cut_whose_commit_raises(henv, monkeypatch, exits_on_terminate, s_turn=False):
     """A held N whose contact ran out; the watchdog's boundary cuts it (the reserved stop, no drain) and the commit
     raises after the reservation (an injected failure in the decision): escalation armed, the hold neither decided
     nor fenced. Then the decision works again: (session, child)."""
@@ -63,6 +63,12 @@ def _held_cut_whose_commit_raises(henv, monkeypatch, exits_on_terminate):
     child.emit(owned(n, text="N's own"))
     henv.host.tick()
     assert s.held is not None
+    if s_turn:
+        from test_claude_correlation import vinit
+        from test_claude_steering import S
+        child.emit(vinit(S))        # (an `init` echoing exactly [S]: S's own turn, proved)
+        henv.host.tick()
+        assert s.held.s_turn
     s.steer.cover_until = henv.clock() - 1
     real_fail = henv.host._fail
 
@@ -105,3 +111,81 @@ def test_a3_after_a_raising_commit_the_held_turns_timeout_and_the_kill_settle_it
     [end] = _ends(out)
     assert end.ok and end.text == "N's own" and end.steer["outcome"] == "unconfirmed"
     assert s.held is None and s.child is None
+
+
+def test_a3_after_a_raising_commit_a_proved_s_turn_settles_next_turn_failed_at_the_reap(henv, monkeypatch):
+    """Ruling A3 (the finalizer's other branch; Sol's should): S's own turn was proved before the cut, and the commit
+    raised after the reservation: at the verified reap N's native end is published once with S `next_turn` failed,
+    its detail the cut's."""
+    from agent_comms.session_host import STEER_S_CUT
+    s, child = _held_cut_whose_commit_raises(henv, monkeypatch, exits_on_terminate=True, s_turn=True)
+    [end] = _ends(henv.host.tick())
+    assert end.ok and end.text == "N's own"
+    assert end.steer["outcome"] == "next_turn" and end.steer["why"] == "own_turn_cut"
+    assert end.steer["result"]["ok"] is False
+    assert end.steer["result"]["detail"] == STEER_S_CUT.format(why="the process was stopped")
+    assert s.held is None and s.child is None
+
+
+# ---------------------------------------------------------------- A1's edges (Sol's should)
+
+
+def _a_session_and_its_ended(env):
+    """A Claude root on the node; its `ended` published into the host's outbox (by identity, with the next
+    publication sequence), not handed off yet: (runner, session, ended)."""
+    from agent_comms.session_host import HostEvent
+    runner = env.node.sessions
+    sid = start(env, "a turn")["session_id"]
+    tick(env)
+    host = runner.host
+    s = host.sessions[sid]
+    host._outbox.append(HostEvent(sid, "ended", detail="closed by the human"))
+    [ended] = [e for e in host._outbox.current() if e.session_id == sid and e.kind == "ended"]
+    return runner, s, ended
+
+
+def _watched(sid, gen, seq):
+    import dataclasses
+    from agent_comms.session_host import HostEvent
+    return dataclasses.replace(HostEvent(sid, "turn_ended", "1", ok=False, delivered=True, detail="watched"),
+                               ident=(sid, gen, seq))
+
+
+def _pending_kinds(runner, sid):
+    return [e["kind"] for x, e in runner.pending if x == sid]
+
+
+def test_a1_a_watched_event_published_after_the_ended_is_not_promoted(env):
+    """Ruling A1 (Sol's should): only EARLIER watched events of the session are promoted: one published after its
+    `ended` (a higher publication sequence) stays in its lane, behind it."""
+    runner, s, ended = _a_session_and_its_ended(env)
+    later = _watched(s.session_id, s.gen, ended.ident[2] + 100)
+    runner.watched.append(later)
+    with runner.lock:
+        runner._deliver(late=False)
+    assert _pending_kinds(runner, s.session_id) == ["ended"], "the ended alone"
+    assert runner.watched == [later] and runner.watched[0] is later, "the later event stays in its lane"
+
+
+def test_a1_a_watched_event_of_another_generation_is_not_promoted(env):
+    """Ruling A1 (Sol's should): only the SAME session incarnation's watched events are promoted: an earlier one of
+    another generation of that session id stays in its lane."""
+    runner, s, ended = _a_session_and_its_ended(env)
+    other = _watched(s.session_id, s.gen - 1, ended.ident[2] - 1)
+    runner.watched.append(other)
+    with runner.lock:
+        runner._deliver(late=False)
+    assert _pending_kinds(runner, s.session_id) == ["ended"], "the ended alone"
+    assert runner.watched == [other] and runner.watched[0] is other, "the other generation's event stays"
+
+
+def test_a1_the_same_incarnations_earlier_watched_event_is_promoted(env):
+    """Ruling A1 (the positive edge of the two pins above, at the selector itself): the same incarnation's earlier
+    watched event goes first, then the `ended`."""
+    runner, s, ended = _a_session_and_its_ended(env)
+    earlier = _watched(s.session_id, s.gen, ended.ident[2] - 1)
+    runner.watched.append(earlier)
+    with runner.lock:
+        runner._deliver(late=False)
+    assert _pending_kinds(runner, s.session_id) == ["turn_ended", "ended"]
+    assert runner.watched == []

@@ -175,7 +175,9 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('NS', "A1 a close's session's earlier watched events go first", '            if not late and e.kind == "ended" and e.ident is not None:', '            if False:'),
     ('NS', "A1 only that session incarnation's", '                           and w.ident[:2] == e.ident[:2] and w.ident[2] < e.ident[2]), None)', '                           and w.ident[2] < e.ident[2]), None)'),
     ('H', 'A3 the reap settles an armed hold whose decision never ran', '        if s.held is not None and (s.held.fenced_at is not None or s.stopping_since is not None):', '        if s.held is not None and s.held.fenced_at is not None:'),
-    ('H', 'A3 an undecided hold is finalized at the reap', '            if s.held.decided is None:\n                self._finalize_hold(s, "the process was stopped", out)', '            if False:\n                self._finalize_hold(s, "the process was stopped", out)')]
+    ('H', 'A3 an undecided hold is finalized at the reap', '            if s.held.decided is None:\n                self._finalize_hold(s, "the process was stopped", out)', '            if False:\n                self._finalize_hold(s, "the process was stopped", out)'),
+    ('NS', 'A1 only earlier watched events', '                           and w.ident[:2] == e.ident[:2] and w.ident[2] < e.ident[2]), None)', '                           and w.ident[:2] == e.ident[:2]), None)'),
+    ('NS', 'A1 the generation counts', '                           and w.ident[:2] == e.ident[:2] and w.ident[2] < e.ident[2]), None)', '                           and w.ident[0] == e.ident[0] and w.ident[2] < e.ident[2]), None)')]
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",
         "tests/test_session_restart_hub.py", "tests/test_structured_results.py", "tests/test_hosted_sessions.py",
