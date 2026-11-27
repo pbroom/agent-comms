@@ -16800,3 +16800,115 @@ loaded by other agents' suites, with load averages of 6.5 to 9.
   wrapper predated the new key argument, and they are fixed.
 - **The `~/.codex/config.toml` hash** was 18fcebe0d94018f8 before, after each real run and at the end.
 - The protected files are unchanged.
+
+### C1: review round 2 (on 3b62bc6; Sol: CHANGES, 2 blockers, 1 should; then an amendment, A1 to A4)
+
+Both blockers are edges of the HELD transition. After a KILL it came too late; before a proof it came too late.
+
+#### R5, A1 and A2: the first KILL attempt makes the token proof-only, on every path
+
+- **Owner:** `Groups.veto(token)`, the one place that makes a token proof-only after a KILL.
+- **When it is called:** by every site that sends a SIGKILL to a tracked group, at the attempt and BEFORE the signal,
+  so a KILL that raises is covered too. It runs under the same owner serialization as the signal: the node's runner
+  lock for hosted sessions, and the node's one loop thread for dispatched runs.
+- **What it writes (A2):** only the lock-free HELD index (`Groups.held`), so the due-KILL path never waits on the
+  registry.
+  - The entry is already STOPPING, which fences admission.
+  - It becomes HELD in the registry at the release rule, where the registry is taken anyway.
+  - From the veto on, `may_signal` is False for that token everywhere, shutdown's TERM included.
+- **What it keeps (A1).** The veto revokes signal eligibility only. A stopping HELD session takes main's steps in each
+  pass: its stop clock (`stopping_since`, never reset), the bounded publication of a decided and fenced Claude end
+  (`_hold_fence`), main's survivor branch (which signals nothing for a stopping session), `_lingering`'s line, and the
+  reap.
+  - The `_steps` guard returns early only for a HELD session that is NOT being stopped.
+  - At the proof-true release, the reap makes main's last reads, and a run is reported ended there as main reports it
+    at its reap.
+  - No turn's outcome changes. No report is lost: a report main sends at the reap comes at the release, which is later
+    only when a member survives the KILL.
+- **Do not rely on `s.killed`, or on a handle's call being harmless.** `PopenChild.terminate()` and `kill()` are a
+  numeric `killpg`, even after `poll()` has reaped the leader. Every such call for a tracked group goes through the
+  predicate.
+- **The signal sites and handle calls for a tracked group, each with the predicate and (for a KILL) the veto:**
+
+| Site | Call | Gate |
+| --- | --- | --- |
+| `SessionHost._stop` (every TERM route: close, cancel, timeout, `stop_turns`, park, the reserved stop, binding restarts, the cut, `_stop_all`'s TERM) | `child.terminate()` | `may_signal` first: a HELD record returns, with no clock and no signal |
+| `SessionHost._kill_if_due` (the kill scan of the loop and the watchdog) | `child.kill()` | `may_signal`; `veto` at the attempt |
+| `SessionHost._stop_all`'s KILL pass | `child.kill()` | `may_signal`; `veto` at the attempt |
+| `SessionHost._reap`'s survivor stop of a dead leader | via `_stop_from`, `_stop` | main's first stop, kept by identity, only while `may_signal`; for a stopping session main's branch, which signals nothing |
+| `SessionRunner.signal` (shutdown) | `child.terminate()` | `may_signal` |
+| `SessionRunner.kill` (shutdown) | `child.kill()` | `may_signal`; `veto` at the attempt |
+| `Node._stop` (hub stop, timeout, the reap's escalation, `signal_runs`, `kill_runs`) | `child.terminate()` / `child.kill()` | `may_signal` first; `veto` at the KILL attempt |
+| `Node._reap`'s survivor stop | via `Node._stop` | only while `may_signal` |
+
+- **Not in scope:**
+  - startup recovery (`stop_verified`, `recover`), which signals verified leaders of a previous process, not tracked
+    groups: that is C3;
+  - the in-process dispatcher, which has its own admission.
+
+#### R6, A3 and A4: the checkout is fenced before the last reads and the proof
+
+- **The order in `Groups.release` now:**
+  1. Under the registry lock, the exact token is fenced (HELD, or a HELD entry under its known key, as in A3).
+  2. Outside the lock, the caller's `prepare()` runs: the session reap's last reads (read, drain, start-mode check),
+     which now come AFTER the fence (A3).
+  3. The proof.
+  4. A True proof removes the entry and the fence in one step (`_gone`). Anything else leaves the token HELD.
+- **There is no moment at which the entry is LIVE** while the reads or the proof are in progress.
+- **A fence that lifts in the same call is silent.** The "could not be proved gone" line is written only when the
+  release is refused and the token was not HELD in the registry before.
+- **A4 and R6.3: a refusal at that fence defers, as a STOPPING refusal does today.** Neither fails the work:
+  - a session's spawn returns with its message still in its inbox, and is retried on the next pass;
+  - a dispatched run logs its "waits" line and is retried on the next tick.
+
+#### R7: the real-process pin, hardened
+
+`test_r4_group_absent_against_real_children_of_this_test`:
+- Both processes are this test's own direct children: the leader in a group of its own in this session, and the member
+  put into that group.
+- The leader's exit is OBSERVED with kqueue `NOTE_EXIT`, bounded to ten seconds and without reaping it, in place of a
+  fixed sleep.
+- Every signal goes through a handle, and a handle that has been waited for is never signalled.
+
+The first try put the leader in a new session, so the member could not join its group (EPERM). That left the
+leader's `sleep 60` running until it ended by itself; nothing signalled it.
+
+#### Tests (tests/test_ownership_c1.py)
+
+- **The reproductions, failing on 3b62bc6:**
+  - `test_r5_after_the_first_kill_no_numeric_signal_reaches_the_group_again[pass|cancel|close|stop_all|stop_turns ×
+    sent|raised]`;
+  - `test_r5_the_runners_shutdown_steps_send_nothing_after_the_first_kill`;
+  - `test_r5_a1_a_killed_held_group_keeps_its_stop_and_its_bounded_publication`;
+  - `test_r6_the_checkout_is_fenced_while_the_proof_runs[True|False|None|raises]`: a deterministic gate inside the
+    proof; a session's and a run's admission are refused while it runs;
+  - `test_r6_a3_the_fence_is_in_before_the_reaps_drain`.
+- **Pins that already passed there:**
+  - `test_r5_after_a_runs_first_kill_nothing_more_is_sent[...]`: `Node._stop`'s own latches already stopped repeats
+    there;
+  - `test_r5_a1_a_killed_held_run_is_reported_ended_at_its_release`;
+  - `test_r6_a4_a_run_refused_by_a_clean_exits_fence_waits_and_is_admitted_next`;
+  - `test_r6_a4_a_session_refused_by_a_clean_exits_fence_waits_and_starts_next`.
+- **An older pin adjusted:** `test_r5_w_kills_and_fences_with_a_drain_pending_and_a_raising_or_stalling_save`. It
+  resets `s2.killed` to send a second due KILL to the same group with its second save. Its reset now also clears the
+  veto that R5 sets.
+- **Pins added after the first mutation run:**
+  - `test_r5_shutdowns_kill_pass_vetoes_at_its_attempt`;
+  - `test_r5_the_runners_kill_step_vetoes_what_follows_it`;
+  - `may_signal` False in the run's test, from its first KILL attempt;
+  - `test_r5_a1_a_killed_group_that_outlives_its_kill_is_still_said_in_the_log` (its `_lingering` line, and its
+    entry STOPPING while seen alive).
+
+#### Mutation check (review round 2)
+
+15 rows: a veto per KILL site (4), the veto itself, fence-before-proof, fence-before-reads, the two A1 rows, and six
+round-1 rows re-anchored on lines this round rewrote.
+- **On 4256afc, 13 are caught.**
+  - Three KILL-site rows were caught only by the slow stand-in e2e test:
+    - shutdown's pass: the same `stop_all`'s release later makes the token HELD anyway;
+    - the runner's step;
+    - the run's: `Node._stop`'s own latches already stop repeats.
+  - The two A1 rows were missed. `_hold_deadline` publishes the bounded end first in every tick, so the early return
+    could not be seen there, and main's survivor branch differs only in the registry state.
+- **8d9ea81** pins each of those five directly, and all five are caught by those pins.
+- The script now has 197 rows. The results are in scripts/steering-mutation-results.txt.

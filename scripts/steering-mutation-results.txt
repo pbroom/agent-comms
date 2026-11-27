@@ -68,3 +68,41 @@ rows: 3
 stale or broken: []
 missed: []
 exit 0
+
+# Round 2 of C1's review (appended below the round-1 results):
+# - 15 rows on 4256afc: 13 caught. Three KILL-site rows (shutdown's pass, the runner's step, the run's) were caught
+#   only by the slow stand-in e2e test. Two A1 rows were missed: the bounded publication runs first in every tick,
+#   so the early return could not be seen there, and the survivor branch differs only in the registry state.
+# - 8d9ea81 adds targeted pins, and all five are caught by them.
+
+commit 4256afc
+CAUGHT  R5 the kill scan vetoes at its attempt  test_r5_after_the_first_kill_no_numeric_signal_reaches_the_group_again[pass-False]
+CAUGHT  R5 shutdown's KILL pass vetoes at its attempt  test_the_end_to_end_script_passes_with_the_stand_in
+CAUGHT  R5 the runner's KILL step vetoes at its attempt  test_the_end_to_end_script_passes_with_the_stand_in
+CAUGHT  R5 the run's KILL vetoes at its attempt  test_the_end_to_end_script_passes_with_the_stand_in
+CAUGHT  R5 the veto writes the HELD index  test_r5_after_the_first_kill_no_numeric_signal_reaches_the_group_again[pass-False]
+CAUGHT  R6 the rule fences before the proof  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+CAUGHT  A3 the reap's last reads come after the fence  test_r6_a3_the_fence_is_in_before_the_reaps_drain
+MISSED  A1 a stopping HELD session keeps main's steps  
+MISSED  A1 the reap keeps main's survivor branch for a stopping session  
+CAUGHT  C1 the reap keeps what is not proved gone (re-anchored)  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+CAUGHT  A2 a refused release makes the token HELD (re-anchored)  test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded
+CAUGHT  A3 a refused release fences a missing entry (re-anchored)  test_a3_a_refused_release_with_its_entry_missing_still_fences_the_checkout
+CAUGHT  R2 the HELD index is kept (re-anchored)  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+CAUGHT  R2 the reap's survivor stop only while it may be signalled (re-anchored)  test_r2_a_held_session_is_never_signalled_by_number_again[reap]
+CAUGHT  R2 a HELD session takes no further step (re-anchored)  test_c1_a_retained_process_is_left_alone_until_its_group_is_proved_gone
+rows: 15
+stale or broken: []
+missed: ["A1 a stopping HELD session keeps main's steps", "A1 the reap keeps main's survivor branch for a stopping session"]
+exit 0
+
+commit 8d9ea81
+CAUGHT  R5 shutdown's KILL pass vetoes at its attempt  test_r5_shutdowns_kill_pass_vetoes_at_its_attempt
+CAUGHT  R5 the runner's KILL step vetoes at its attempt  test_r5_the_runners_kill_step_vetoes_what_follows_it
+CAUGHT  R5 the run's KILL vetoes at its attempt  test_r5_after_a_runs_first_kill_nothing_more_is_sent[reap]
+CAUGHT  A1 a stopping HELD session keeps main's steps  test_r5_a1_a_killed_group_that_outlives_its_kill_is_still_said_in_the_log
+CAUGHT  A1 the reap keeps main's survivor branch for a stopping session  test_r5_a1_a_killed_group_that_outlives_its_kill_is_still_said_in_the_log
+rows: 5
+stale or broken: []
+missed: []
+exit 0
