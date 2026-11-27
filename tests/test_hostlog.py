@@ -487,6 +487,16 @@ def test_a_watchdog_thread_never_drains():
     assert written and ident not in written
 
 
+def test_no_drain_inside_a_boundary_even_when_asked():
+    """B4: the drain itself refuses inside a boundary (depth above 0), whoever calls it: the boundary's exit writes."""
+    from agent_comms import hostlog, session_host
+    with _Records() as rec:
+        with hostlog.BOUNDARY:
+            session_host.log.warning("inside")
+            assert hostlog.drain(everything=True) is False and rec.records == []
+        assert rec.messages() == ["inside"]
+
+
 def test_the_watchdogs_lines_are_written_at_the_runner_locks_release_not_by_an_entry_that_logged_nothing(env):
     """B4: what the watchdog queued is written by the loop when it lets go of the runner lock; an entry point that
     logged nothing itself (`attempts`, which the node's acknowledgement path calls under its ack lock) writes and
