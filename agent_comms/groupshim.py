@@ -18,9 +18,11 @@ The life of one shim:
    then EOF, an over-long, unparseable or unknown-version frame) never starts the CLI: the bound marker is published
    (`never_started`) and the shim exits 3.
 4. Spawn: fork. From the fork on, everything is in the single event loop: the command pipe, the launch handshake and
-   the child's exit. The child calls `setsid()` and says so (GROUP ESTABLISHED), restores a direct `Popen` child's
-   signal dispositions, takes back fds 0/1/2, closes every other fd, `chdir`s, waits for the shim's release byte (sent
-   only once its exit and exec are watched) and `execvpe`s (EXEC CONFIRMED: kqueue NOTE_EXEC). Nothing reaps it early.
+   the child's exit. The child calls `setsid()` and says so (GROUP ESTABLISHED), reads the shim's RELEASE byte before
+   any checkout work (it is written only once the child's exit and exec watch is INSTALLED; at EOF the child never
+   enters the checkout), restores a direct `Popen` child's signal dispositions, takes back fds 0/1/2, closes every
+   other fd, `chdir`s and `execvpe`s (EXEC CONFIRMED: kqueue NOTE_EXEC). Nothing reaps it early. RELEASE cannot keep
+   the watcher alive: a shim killed after writing it can still let the child exec (that launch is LOST).
 5. Watch: kqueue `EVFILT_PROC` `NOTE_EXIT | NOTE_EXITSTATUS | NOTE_EXEC`, never reaping: the zombie pins the pgid.
 6. `TERM` / `KILL`, from the fork on, only while the anchor holds (the child unreaped, signalling not latched off): to
    the child's pid until its group is observed established, to its group after (and then any pid-only TERM or KILL is
@@ -207,6 +209,13 @@ def write_marker(path: str, record: dict) -> tuple[str, int]:
     return PUBLISHED, 0
 
 
+def _close(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------- diagnostics, off the escalation path
 
 class Diag:
@@ -214,29 +223,42 @@ class Diag:
     and never opens, writes or waits on the log. One daemon thread alone opens the log and writes it; a log that blocks
     (a FIFO nobody reads, a stalled filesystem) stalls only that thread. The thread is started only after the shim's
     single fork (or at its exit, if it never forks), so the fork is made single-threaded. The exit waits for it at most
-    DIAG_FLUSH seconds."""
+    DIAG_FLUSH seconds. (Review round 2, R5) Starting the thread is BEST-EFFORT: if it cannot be made or started (the
+    system refuses a thread), the diagnostics are off: every line is dropped and counted, and supervision goes on."""
 
-    def __init__(self, path: str | None, clock):
+    def __init__(self, path: str | None, clock, fail_start: bool = False):
         self.path, self.clock = path, clock
+        self.fail_start = fail_start    # (TEST-ONLY: `fail-diag-start` in the test gate dir; the node never asks it)
         self.cond = threading.Condition(threading.Lock())
         self.lines: list[str] = []
         self.dropped = 0
         self.busy = False
+        self.failed = False             # the thread could not be started: diagnostics are off
         self.thread: threading.Thread | None = None
 
     def put(self, msg: str) -> None:
         line = f"{self.clock():.6f} shim {os.getpid()} {msg}\n"
         with self.cond:         # (the writer holds this lock only to swap the list, never across I/O)
-            if len(self.lines) >= DIAG_CAPACITY:
+            if self.failed or len(self.lines) >= DIAG_CAPACITY:
                 self.dropped += 1
                 return
             self.lines.append(line)
             self.cond.notify()
 
     def start(self) -> None:
-        if self.thread is None and self.path is not None:
-            self.thread = threading.Thread(target=self._run, name="shim-diag", daemon=True)
-            self.thread.start()
+        if self.thread is not None or self.failed or self.path is None:
+            return
+        try:
+            if self.fail_start:
+                raise RuntimeError("can't start new thread (injected, test-only)")
+            thread = threading.Thread(target=self._run, name="shim-diag", daemon=True)
+            thread.start()
+            self.thread = thread
+        except Exception:
+            self.failed = True
+            with self.cond:
+                self.dropped += len(self.lines)
+                self.lines = []
 
     def _run(self) -> None:
         try:
@@ -260,6 +282,8 @@ class Diag:
 
     def flush(self, bound: float = DIAG_FLUSH) -> None:
         self.start()
+        if self.thread is None:
+            return
         deadline = time.monotonic() + bound
         while time.monotonic() < deadline:
             with self.cond:
@@ -339,7 +363,8 @@ class Shim:
         self.hs_said = b""
         self.hs_eof = False
         self.hs_deferred = False        # (test-only: `defer-handshake` in the gate dir)
-        self.release_fd: int | None = None
+        self.hs_polled = False          # the handshake could not be registered: read on a short cadence instead
+        self.degraded = False           # the kqueue wait failed: everything is polled on a short cadence
         self.grace = 0.0
         self.leader_exited = False
         self.leader_code: int | None = None
@@ -367,7 +392,13 @@ class Shim:
     def emit(self, line: str) -> None:
         """One event to the node: non-blocking and atomic (shorter than PIPE_BUF). A full pipe drops it; a closed one
         (EPIPE, the node is gone) stops events for good. Neither ever delays or aborts what the shim does next: the
-        marker, not an event, is the proof."""
+        marker, not an event, is the proof. (Review round 2, R5) Nothing in it can raise into the caller."""
+        try:
+            self._emit(line)
+        except Exception:
+            pass
+
+    def _emit(self, line: str) -> None:
         if self.event_fd is not None:
             data = (line[:EVENT_MAX - 1] + "\n").encode("ascii", "replace")
             try:
@@ -393,7 +424,15 @@ class Shim:
     def gate(self, name: str, detail: str = "") -> None:
         """TEST-ONLY (`--test-gate DIR` with a `numbered` file in it; the node never passes it): announce `at.<n>` and
         wait, bounded, for `go.<n>`."""
-        if self.gate_dir is None or not os.path.exists(os.path.join(self.gate_dir, "numbered")):
+        if self.gate_dir is None:
+            return
+        try:
+            self._gate(name, detail)
+        except Exception:
+            pass
+
+    def _gate(self, name: str, detail: str) -> None:
+        if not os.path.exists(os.path.join(self.gate_dir, "numbered")):
             return
         self.gate_seq += 1
         n = self.gate_seq
@@ -475,62 +514,114 @@ class Shim:
 
     def spawn(self, spec: dict, stdio: tuple[int, int, int], ignored: frozenset) -> int | None:
         """Fork the child and return at once (None): the handshake, the child's exit and the commands are all read in
-        the loop (`run`). An exit status when the child was never forked (fork failed)."""
+        the loop (`run`). An exit status when the child was never forked.
+
+        (Review round 2, R5) Everything that can fail for ordinary reasons and is needed to supervise (the pipes, the
+        kqueue, the command pipe's registration, the handshake's non-blocking mode) is made BEFORE the fork, where a
+        failure is a never-started launch with its marker. After the fork nothing may end the shim while it holds the
+        unreaped child: every step is either essential and answered by an existing outcome, or contained (DESIGN_NOTES
+        C3-1 review round 2 has the table)."""
         self.grace = spec["kill_grace"]
-        hs_r, hs_w = os.pipe()          # (close-on-exec: EOF at the child's exec or death)
-        rel_r, rel_w = os.pipe()        # the release byte: the child execs only after the shim watches it
+        made: list[int] = []
+        try:
+            hs_r, hs_w = os.pipe()          # (close-on-exec: EOF at the child's exec or death)
+            made += [hs_r, hs_w]
+            rel_r, rel_w = os.pipe()        # RELEASE: the child does no checkout work before reading it
+            made += [rel_r, rel_w]
+            os.set_blocking(hs_r, False)
+            self.kq = select.kqueue()
+            if not self.eof:
+                self.kq.control([select.kevent(self.cmd_fd, select.KQ_FILTER_READ, select.KQ_EV_ADD)], 0)
+        except OSError as e:
+            for fd in (*made, *stdio):
+                _close(fd)
+            self.emit(f"START_FAILED {e.errno}")
+            self.diag(f"could not prepare the launch (errno {e.errno})")
+            return self.never_started("fork")
         try:
             pid = os.fork()
         except OSError as e:
-            for fd in (hs_r, hs_w, rel_r, rel_w, *stdio):
-                os.close(fd)
+            for fd in (*made, *stdio):
+                _close(fd)
             self.emit(f"START_FAILED {e.errno}")
             self.diag(f"fork failed (errno {e.errno})")
             return self.never_started("fork")
         if pid == 0:
-            _child(spec, stdio, hs_w, rel_r, ignored, self.gate_dir)      # never returns
+            _child(spec, stdio, hs_w, rel_r, ignored, self.gate_dir, (hs_r, rel_w))      # never returns
+        # ---- from here the shim holds an unreaped child: nothing below may end it (R5)
+        self.pgid, self.hs_fd = pid, hs_r
         for fd in (hs_w, rel_r, *stdio):
-            os.close(fd)                # the CLI's stdio is the CLI's alone now
-        self.pgid, self.hs_fd, self.release_fd = pid, hs_r, rel_w
-        os.set_blocking(hs_r, False)
+            _close(fd)                # the CLI's stdio is the CLI's alone now
         if self.sink is not None:
-            self.sink.start()           # (after the one fork: the fork was single-threaded)
-        self.kq = select.kqueue()
+            try:
+                self.sink.start()       # (after the one fork: the fork was single-threaded; best-effort)
+            except Exception:
+                pass
         self.gate("register", str(pid))
         try:
             self.kq.control([select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_CLEAR,
                                            PROC_FFLAGS)], 0)
             self.watching = True
         except OSError as e:
-            # ESRCH: it is already a zombie (it cannot be gone: nothing reaped it); it never got the release byte, so it
-            # never exec'd. Its status, without reaping.
-            self.diag(f"exit registration refused (errno {e.errno}): the child exited before it")
+            # ESRCH: it is already a zombie (nothing reaped it); without RELEASE it never exec'd. Otherwise its exit is
+            # polled (waitid) in the loop, and it gets no RELEASE: it never execs.
+            self.diag(f"exit registration refused (errno {e.errno}): the child is not released")
         if self.watching:
+            # RELEASE (review round 2, R6): written only AFTER the exit-and-exec watch is INSTALLED, so no exec can
+            # happen unwatched. It cannot keep the watcher alive: a shim killed after this write can still let the
+            # child exec, and that CLI then runs unsupervised. That launch is LOST (`ShimChild.lost()`), and its
+            # checkout stays retained.
             try:
-                os.write(rel_w, b"G")       # the child may exec now: its exec and exit are watched
+                os.write(rel_w, b"G")
             except OSError:
                 pass
-        os.close(rel_w)                 # (unwatched: EOF instead, and the child never execs)
-        self.release_fd = None
+        _close(rel_w)                   # (not written: EOF, and the child never enters the checkout)
         self.diag(f"forked the child, pid {pid}")
-        self.hs_deferred = self.gate_dir is not None and os.path.exists(os.path.join(self.gate_dir, "defer-handshake"))
+        self.hs_deferred = self._gate_file("defer-handshake")
         if not self.hs_deferred:
-            self.kq.control([select.kevent(hs_r, select.KQ_FILTER_READ, select.KQ_EV_ADD)], 0)
-        if not self.watching:
+            self._watch_handshake()
+        if not self.watching and self._exited() is not None:
             self._leader_exit(None)
         return None
+
+    def _gate_file(self, name: str) -> bool:
+        """TEST-ONLY: whether the gate dir has `name` (False without a gate dir, or on any error)."""
+        try:
+            return self.gate_dir is not None and os.path.exists(os.path.join(self.gate_dir, name))
+        except Exception:
+            return False
+
+    def _watch_handshake(self) -> None:
+        try:
+            self.kq.control([select.kevent(self.hs_fd, select.KQ_FILTER_READ, select.KQ_EV_ADD)], 0)
+        except (OSError, TypeError):
+            self.hs_polled = True       # (contained: the loop reads it on a short cadence instead)
+
+    def _exited(self) -> int | None:
+        """`waitid(WNOWAIT)` on our child, contained: None when it has not exited or the call failed."""
+        try:
+            return self.waitid(self.pgid)
+        except Exception:
+            return None
+
+    def _members(self) -> tuple | None:
+        """The group's complete listing, contained: None (no proof) on any failure."""
+        try:
+            return self.members(self.pgid)
+        except Exception:
+            return None
 
     # -------- the loop
 
     def run(self) -> int:
+        """The loop. The kqueue wait itself is contained: if it fails, the loop goes on at a short cadence and polls
+        everything (the command pipe, the handshake, the child's exit by `waitid`)."""
         assert self.kq is not None and self.pgid is not None
-        if not self.eof:
-            self.kq.control([select.kevent(self.cmd_fd, select.KQ_FILTER_READ, select.KQ_EV_ADD)], 0)
         self._take_commands()           # (anything sent behind GO)
         while True:
-            if self.hs_deferred and os.path.exists(os.path.join(self.gate_dir, "defer-handshake.go")):
+            if self.hs_deferred and self._gate_file("defer-handshake.go"):
                 self.hs_deferred = False
-                self.kq.control([select.kevent(self.hs_fd, select.KQ_FILTER_READ, select.KQ_EV_ADD)], 0)
+                self._watch_handshake()
             now = self.clock()
             if self.kill_due is not None and now >= self.kill_due:
                 self._kill_now()
@@ -541,9 +632,19 @@ class Shim:
             now = self.clock()
             dues = [d for d in (self.kill_due, self.check_due) if d is not None]
             timeout = max(0.0, min(dues) - now) if dues else None
-            if self.hs_deferred:
+            polling = self.hs_deferred or self.hs_polled or self.degraded or (not self.watching
+                                                                               and not self.leader_exited)
+            if polling:
                 timeout = 0.05 if timeout is None else min(timeout, 0.05)
-            for ev in self.kq.control(None, 8, timeout):
+            try:
+                events = self.kq.control(None, 8, timeout)
+            except OSError as e:
+                if not self.degraded:
+                    self.degraded = True
+                    self.diag(f"the kqueue wait failed (errno {e.errno}): polling from here")
+                events = []
+                time.sleep(0.05 if timeout is None else min(timeout, 0.05))
+            for ev in events:
                 if ev.filter == select.KQ_FILTER_PROC:
                     if ev.fflags & select.KQ_NOTE_EXEC:
                         self._exec_seen()
@@ -553,6 +654,12 @@ class Shim:
                     self._pump_commands()
                 elif ev.filter == select.KQ_FILTER_READ and ev.ident == self.hs_fd:
                     self._pump_handshake()
+            if self.degraded and not self.eof:
+                self._pump_commands()
+            if (self.degraded or self.hs_polled) and not self.hs_deferred:
+                self._pump_handshake()
+            if (self.degraded or not self.watching) and not self.leader_exited and self._exited() is not None:
+                self._leader_exit(None)
 
     def _pump_commands(self) -> None:
         for _ in range(16):             # bounded per wake: timers are looked at between
@@ -730,7 +837,7 @@ class Shim:
         code = None
         if ev is not None and ev.fflags & NOTE_EXITSTATUS:
             code = decode_status(ev.data)
-        seen = self.waitid(self.pgid)       # (the self-check: the status of our unreaped child, without reaping)
+        seen = self._exited()       # (the self-check: the status of our unreaped child, without reaping)
         if seen is not None and seen != code:
             if code is not None:
                 self.diag(f"kqueue's exit status {code} disagrees with waitid's {seen}: waitid's is taken")
@@ -748,17 +855,17 @@ class Shim:
         self.check_due = None
         if not self.leader_exited or self.reaped:
             return None
-        members = self.members(self.pgid)
+        members = self._members()
         # Only a COMPLETE, successful listing (None: failed, malformed or possibly truncated) holding nothing but the
         # exited, unreaped leader. (Empty would mean the child never formed the group: no group by that id can exist
         # while the child's pid is pinned.)
-        if members is None or not set(members) <= {self.pgid} or self.waitid(self.pgid) is None:
+        if members is None or not set(members) <= {self.pgid} or self._exited() is None:
             self.check_due = self.clock() + self.check_step
             self.check_step = min(CHECK_MAX, self.check_step * 2)
             return None
         self.latched = True             # signalling OFF, for good, BEFORE the anchor goes
         self._reap()
-        after = self.members(self.pgid)
+        after = self._members()
         if after is None or after != ():
             self.emit("UNPROVED")
             self.diag(f"after the reap the group is not proved absent ({after!r}): no marker, no more signals")
@@ -776,8 +883,10 @@ class Shim:
             if self.leader_code is None and code is not None:
                 self.leader_code = code
                 self.emit(f"LEADER_EXIT {code}")
-        except ChildProcessError:
-            self.diag("the CLI was already reaped (it is gone either way)")
+        except OSError as e:
+            # (ECHILD: already reaped, it is gone either way. Any other failure: signalling is latched off already and
+            # the listing that follows decides; a zombie still listed there is UNPROVED.)
+            self.diag(f"the reap answered errno {e.errno}")
         self.reaped = True
         self.diag(f"reaped the CLI, pid {self.pgid}")
 
@@ -785,7 +894,8 @@ class Shim:
 def _child_gate(gate_dir: str | None, name: str, member_spec: list) -> None:
     """TEST-ONLY, in the child (`--test-gate DIR` and a `pause.<name>` file there; the node never passes either): pause
     at `name`, announcing `<name>.at` (its pid, and a member's), until `<name>.go` (bounded). The pause file may ask to
-    ignore SIGTERM and to fork a member (which notes a TERM in `member_term_file`)."""
+    ignore SIGTERM, to fork a member (which notes a TERM in `member_term_file`), to exit there (`exit`), or only to
+    announce (`wait: false`)."""
     if gate_dir is None:
         return
     pause = os.path.join(gate_dir, f"pause.{name}")
@@ -811,22 +921,38 @@ def _child_gate(gate_dir: str | None, name: str, member_spec: list) -> None:
         member_spec.append(member)
     at = os.path.join(gate_dir, f"{name}.at")
     with open(at + ".tmp", "w") as f:
-        f.write(json.dumps({"pid": os.getpid(), "member": member}))
+        f.write(json.dumps({"pid": os.getpid(), "member": member, "cwd": os.getcwd()}))
     os.rename(at + ".tmp", at)
+    if "exit" in opts:
+        os._exit(int(opts["exit"]))
+    if opts.get("wait") is False:
+        return
     end = time.monotonic() + GATE_WAIT
     while time.monotonic() < end and not os.path.exists(os.path.join(gate_dir, f"{name}.go")):
         time.sleep(0.005)
 
 
 def _child(spec: dict, stdio: tuple[int, int, int], hs_w: int, rel_r: int, ignored: frozenset,
-           gate_dir: str | None) -> None:
-    """In the forked child: become the CLI, or say why not on the handshake pipe and `_exit(127)`."""
+           gate_dir: str | None, shims_ends: tuple[int, ...] = ()) -> None:
+    """In the forked child: become the CLI, or say why not on the handshake pipe and `_exit(127)`. `shims_ends`: the
+    shim's ends of the two pipes (the handshake's read end and RELEASE's write end), closed first: while the child
+    held its copy of RELEASE's write end, a shim gone before writing it would never give it EOF (found in review
+    round 2)."""
     stage = "setsid"
+    for fd in shims_ends:
+        _close(fd)
     try:
         _child_gate(gate_dir, "before-setsid", [])
         os.setsid()
         os.write(hs_w, b"S")
         _child_gate(gate_dir, "after-setsid", [])
+        stage = "release"
+        # RELEASE, before any checkout work (review round 2, R5): the shim writes it once our exec and exit are
+        # watched. At EOF (the shim never wrote it: refused, or gone before it) we never enter the checkout.
+        if os.read(rel_r, 1) != b"G":
+            raise OSError(0, "not released")
+        os.close(rel_r)
+        _child_gate(gate_dir, "after-release", [])
         stage = "signals"
         for s in (signal.SIGPIPE, signal.SIGXFSZ):      # what Popen's restore_signals resets (Python ignores them)
             signal.signal(s, signal.SIG_DFL)
@@ -838,17 +964,14 @@ def _child(spec: dict, stdio: tuple[int, int, int], hs_w: int, rel_r: int, ignor
         stage = "fds"
         for name in os.listdir("/dev/fd"):
             fd = int(name)
-            if fd > 2 and fd not in (hs_w, rel_r):
+            if fd > 2 and fd != hs_w:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
         stage = "chdir"
         os.chdir(spec["cwd"])
-        stage = "release"
-        if os.read(rel_r, 1) != b"G":       # the shim watches us now (or it is gone: then never exec)
-            raise OSError(0, "not released")
-        os.close(rel_r)
+        _child_gate(gate_dir, "after-chdir", [])
         stage = "exec"
         os.execvpe(spec["argv"][0], spec["argv"], spec["env"])
     except OSError as e:
@@ -899,7 +1022,9 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args is None:
         return EXIT_USAGE
-    sink = Diag(args["log"], time.monotonic)
+    gate = args["gate"]
+    sink = Diag(args["log"], time.monotonic,
+                fail_start=gate is not None and os.path.exists(os.path.join(gate, "fail-diag-start")))
     try:
         return _main(args, sink)
     finally:

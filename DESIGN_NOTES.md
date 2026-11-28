@@ -17541,18 +17541,22 @@ newline are kept as commands. In each of these cases the CLI is NEVER forked, th
 | `GO` with an unknown version | `version` |
 | (a failed `fork()`: `START_FAILED <errno>` first) | `fork` |
 
-**The spawn** (as changed by review round 1, R1).
+**The spawn** (as changed by review rounds 1 and 2: R1, R5 and R6).
 - **In the child (Python, after `fork()`; the shim is single-threaded at the fork):**
-  1. `setsid()` (the CLI leads its own session and group, as `start_new_session=True` gave it) and one byte `S` on the
+  1. close the shim's ends of the two pipes (round 2: while the child held its inherited copy of RELEASE's write end,
+     a shim gone before writing it could never give it EOF);
+  2. `setsid()` (the CLI leads its own session and group, as `start_new_session=True` gave it) and one byte `S` on the
      handshake pipe: GROUP ESTABLISHED;
-  2. SIGPIPE and SIGXFSZ back to their defaults (what Popen's `restore_signals` gives a direct child), and every signal
+  3. RELEASE: one byte `G` read, BEFORE any checkout work. The shim writes it only once the child's exit-and-exec watch
+     is INSTALLED. At EOF (the shim never wrote it: its registration refused, or it died before the write) the child
+     exits without ever entering the checkout. RELEASE cannot keep the watcher alive: a shim killed AFTER the write
+     can still let the child exec, and that CLI runs unsupervised (the launch is LOST);
+  4. SIGPIPE and SIGXFSZ back to their defaults (what Popen's `restore_signals` gives a direct child), and every signal
      that was ignored at the shim's start ignored again;
-  3. `dup2` of the three put-aside fds onto 0, 1 and 2;
-  4. every other fd closed (listed from `/dev/fd`), except the handshake's and the release pipe's;
-  5. `chdir(cwd)`;
-  6. one byte `G` read from the release pipe. The shim writes it only once the child's exit and exec are registered,
-     so the CLI never runs unwatched; at EOF (the shim gone, or its registration refused) the child never execs;
-  7. `execvpe(argv[0], argv, env)`: EXEC CONFIRMED is kqueue's NOTE_EXEC.
+  5. `dup2` of the three put-aside fds onto 0, 1 and 2;
+  6. every other fd closed (listed from `/dev/fd`), except the handshake's;
+  7. `chdir(cwd)`;
+  8. `execvpe(argv[0], argv, env)`: EXEC CONFIRMED is kqueue's NOTE_EXEC.
 
   A failure at any step writes `F<stage> <errno>` on the handshake and calls `_exit(127)`. No text goes into it.
 - **In the shim.** Right after the fork it closes its own copies of the CLI's stdio, so that the node's close of
@@ -17898,7 +17902,8 @@ The tables above have been brought up to date with this round.
   - **EXEC CONFIRMED:** kqueue's NOTE_EXEC. Measured: it is reported for an exec, also folded into a late exit event
     (fflags `0xa4000000`), and never for a death before exec.
   - **Why the release byte.** The child execs only after reading a release byte, which the shim writes once that
-    watch is registered. So no exec can happen unwatched, and a child whose shim is already gone never execs.
+    watch is registered. So no exec can happen unwatched, and a child whose shim is gone before it writes the byte
+    never execs (round 2, R6: only before the byte; a shim killed after it can still let the child exec).
   - `STARTED` is sent at EXEC CONFIRMED: that is what today's callers have once `Popen` returns (the CLI runs).
     `START_FAILED <errno>` is sent when the child gave up. `START_FAILED 0` is sent when it died before its exec
     without saying why: our own KILL to its pid, for instance.
@@ -18067,3 +18072,104 @@ The results are in scripts/steering-mutation-results.txt.
   and the tests read that. The grace row is re-anchored on the new line.
 
 **The rows again, on fe3c1ea** (load averages 8 to 11): 46 of 47 are caught, and the same equivalent row is missed.
+
+### Ownership C3-1: code review round 2 (Sol on 7dee459: CHANGES, 1 blocker, 1 should)
+
+Everything else was accepted:
+- the replay from the pid to the group;
+- the KILL gate;
+- the watch installed before RELEASE;
+- the coalesced exec-and-exit cases;
+- the marker reader, and `poll()` from the marker;
+- the sync outcomes;
+- the diagnostics thread kept apart from the marker publish.
+
+#### R5 [blocker]: nothing after the fork may end the shim without supervising its child
+
+- **The defect.** On 7dee459 `Diag.start()` ran after the fork and before the loop. If the system refused the
+  thread, the shim ended (EXIT_CRASH) while it held an unreaped child. That child did its `chdir` before reading
+  RELEASE, so it could already be in the checkout, or stuck in a `chdir` that hangs.
+- **Reproduced on 7dee459** (scratch copies, never committed):
+  - (A) unmodified: a child waiting for RELEASE already has the checkout as its cwd (libproc's cwd of the process);
+  - (B) with a raise injected into `Diag.start`: the shim ended with exit 5 while its child was ALIVE, orphaned to
+    launchd and unsupervised. A pause before its `chdir` stood in for a `chdir` that hangs.
+- **The fix, by kind (R5.3):**
+  1. The diagnostics start is best-effort. A thread that cannot be made or started turns the diagnostics off: every
+     line is dropped and counted, and supervision goes on.
+  2. RELEASE is read BEFORE any checkout work. The child's order is: close the shim's ends of the pipes, `setsid()`,
+     `S`, read RELEASE, the dispositions, the stdio, the fd closing, `chdir`, `exec`. A child whose shim is gone
+     before the byte never enters the checkout.
+  3. **Found by the new test:** the child held its own inherited copy of RELEASE's write end, so a shim that died
+     before writing it never gave it EOF. It is close-on-exec, but the child reads before any exec. The child now
+     closes the shim's ends of both pipes first.
+  4. Everything the shim needs in order to supervise, and that can fail for ordinary reasons, is made BEFORE the fork,
+     where a failure is a never-started launch with its marker: the two pipes, the handshake's non-blocking mode, the
+     kqueue, and the command pipe's registration.
+  5. After the fork every step is either essential, with an existing outcome, or contained:
+
+| Step after the fork | Kind | If it fails |
+| --- | --- | --- |
+| closing the child's ends and the stdio copies | housekeeping | contained (`_close`) |
+| the diagnostics thread's start | non-essential | contained: diagnostics off, lines dropped and counted |
+| the test gates (`register`, `signal`, `defer-handshake`) | test-only | contained (any exception) |
+| the exit-and-exec registration | essential | ESRCH: the child is a zombie; its status comes from `waitid`. Otherwise: no RELEASE (the child exits outside the checkout), and its exit is polled by `waitid` |
+| writing and closing RELEASE | essential | EPIPE: the child is gone, and its exit is watched; contained |
+| the handshake's registration | supporting | contained: read on a 50 ms cadence instead |
+| a diagnostic line | non-essential | queued only; a sink that raises is swallowed |
+| an event | non-essential | EAGAIN drops it, EPIPE closes the channel, anything else is swallowed |
+| the kqueue wait, in the loop | supporting | contained: the loop polls the command pipe, the handshake and `waitid` every 50 ms ("degraded") |
+| a read of the command pipe | essential | an OSError is taken as EOF: the escalation starts |
+| a read of the handshake | supporting | an OSError is taken as EOF |
+| a signal (`kill` / `killpg`) | essential | `FAILED <sig> <errno> <scope>`; the attempt still counts for the grace |
+| the listing, `waitid` | essential | any failure is "no proof": keep waiting |
+| the reap (`waitpid`) | essential | any OSError: signalling is latched off already, and the listing after it decides (a zombie still listed is `UNPROVED`) |
+| the publish | essential | `MARKER_FAILED` (nothing visible, exit 4) or `UNSYNCED` (visible, exit 6) |
+| an unexpected exception (a bug) | none | EXIT_CRASH, no marker: LOST, and the node keeps the checkout held |
+
+- **Tests (real processes, unless marked in-process):**
+  - `test_r5_a_failed_diagnostics_start_never_ends_supervision[after-setsid|after-release]`: the thread's start is
+    made to fail through the test gate (`fail-diag-start`), with the child paused before RELEASE or after it. After
+    the node's EOF: TERM and KILL to the group, `EMPTY`, exit 0, and no log ever opened.
+  - `test_r5_a_child_whose_shim_dies_before_release_never_enters_the_checkout`:
+    - a control launch's `after-chdir` announcement carries the checkout as its cwd;
+    - with the shim held before it writes RELEASE, the waiting child's cwd is `/`, the shim's;
+    - once the shim is killed through its handle, the child exits by itself, never announces `after-chdir`, and the
+      handle says `lost()`.
+  - `test_unit_r5_the_loop_survives_every_non_essential_failure` (in-process): with a kqueue whose every wait fails, a
+    gate and a sink that raise, and an fd that is not open as the event fd, the EOF still brings TERM, KILL at the
+    grace, the exit (polled), the proof and the marker.
+  - **Changed:** the exit-before-registration test's child now exits at a test-only pause after `setsid()`. No child
+    reaches its `chdir` before RELEASE any more.
+
+#### R6 [should]: what RELEASE guarantees
+
+- **It guarantees** that the child's exit-and-exec watch was INSTALLED before the exec. Since this round it also
+  guarantees that a child whose shim is gone before the byte is written never enters the checkout.
+- **It cannot guarantee** that the watcher is still alive. A shim killed AFTER writing the byte can still let the
+  child exec, even before the child reads it, and that CLI then runs unsupervised.
+- **For the node, that launch is LOST** (`ShimChild.lost()`: the shim exited and there is no marker). Its checkout
+  stays retained (HELD), for a human; recovery (C3-3) does the same.
+- The code's comments say exactly this, and the round-1 sentence that a gone shim's child "never execs" is narrowed to
+  "gone before the byte".
+- **The order is pinned:** the row that writes RELEASE before the registration is caught. With the shim held at its
+  register gate, the child then execs unwatched, NOTE_EXEC is missed, and `STARTED` never comes (the c2 test).
+
+#### Notes without code
+
+- **TERM twice.** When a TERM that went to the pid alone is replayed to the group at establishment, the leader
+  receives TERM twice. That is an intended difference from a direct spawn: the replay exists for members made before
+  the shim read `S`.
+- **The trusted marker directory, a requirement on C3-2.** The proof holds "within the trusted marker directory" (Sol).
+  The node creates the marker directory itself, private to its user (mode 0700, owned by that user), and nothing
+  else writes there. The reader's checks (a regular file, no symlink, the nonce and boot binding, exact types) assume
+  that directory.
+
+#### Mutation check (review round 2)
+
+The C3-1 rows are now 52:
+- **5 re-anchored:** the three "never empty" rows (the listing is called through a contained helper now), the stdio
+  copies row, and the release row.
+- **5 new:**
+  - R5: the best-effort diagnostics start, RELEASE before `chdir`, the child closing the shim's ends first, the
+    contained kqueue wait;
+  - R6: the watch installed before RELEASE is written.

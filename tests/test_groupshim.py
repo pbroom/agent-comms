@@ -229,16 +229,19 @@ class Kit:
         spec.setdefault("abort", self.abort)
         return [PY, str(self.standin), json.dumps(spec)]
 
-    def start(self, gate: bool = False, pauses: dict | None = None, defer: bool = False, **kw) -> ShimChild:
+    def start(self, gate: bool = False, pauses: dict | None = None, defer: bool = False, gate_files=(),
+              **kw) -> ShimChild:
         """`pauses`: the child's test-only pauses ({"before-setsid" | "after-setsid": options}); `defer`: the shim reads
         the launch handshake only once `defer-handshake.go` exists. Both imply the test gate."""
         self.n += 1
         d = self.tmp / f"shim{self.n}"
         d.mkdir()
         g = None
-        if gate or pauses or defer:
+        if gate or pauses or defer or gate_files:
             g = d / "gate"
             g.mkdir()
+            for name in gate_files:
+                (g / name).write_text("")
             if gate:
                 (g / "numbered").write_text("")     # (the shim's numbered gates: register, every signal)
             for name, opts in (pauses or {}).items():
@@ -263,7 +266,7 @@ class Kit:
             if c.gate_dir is not None:          # (release any gate it may be waiting at)
                 for i in range(1, 64):
                     (c.gate_dir / f"go.{i}").write_text("")
-                for name in ("before-setsid.go", "after-setsid.go", "defer-handshake.go", "abort"):
+                for name in ("before-setsid.go", "after-setsid.go", "after-release.go", "defer-handshake.go", "abort"):
                     (c.gate_dir / name).write_text("")
             if c.shim_poll() is None:
                 c.close_commands()              # (EOF: the shim stops its own group, then exits)
@@ -353,20 +356,20 @@ def test_c1_a_fast_exit_is_reported(kit):
 def test_c1_an_exit_before_its_registration_is_read_without_reaping(kit):
     """The test-only gate holds the shim between the fork and the kqueue registration until the child is already a
     zombie: the registration is refused (ESRCH), and the status is read by waitid(WNOWAIT), without reaping. (Since
-    review round 1 a child execs only after the shim watches it, so only a child that gives up before its release, here
-    at a `chdir` into a missing directory, can exit before the registration.)"""
-    c = kit.start(gate=True)
-    c.go(["/bin/sh", "-c", "exit 5"], cwd=str(kit.tmp / "missing"), env=ENV, kill_grace=1.0)
+    review rounds 1 and 2 a child does nothing in the checkout, let alone exec, before RELEASE, which the shim writes
+    only after the registration; so only a child that ends before its RELEASE can exit before the registration: here
+    it exits 3 at a test-only pause after its setsid().)"""
+    c = kit.start(gate=True, pauses={"after-setsid": {"exit": 3}})
+    c.go(["/bin/sh", "-c", "exit 5"], cwd=str(kit.work), env=ENV, kill_grace=1.0)
     name, pid = gate_reach(c, 1).split()
     assert name == "register"
     pid = int(pid)
     assert wait_for(lambda: (kinfo(pid) or (0,))[0] == SZOMB), "the child exited before its registration"
     gate_open(c, 1)
     assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
-    assert c.poll() == 127 and c.start_errno == 2 and c.cli_pid is None and c.empty()
+    assert c.poll() == 3 and c.start_errno == 0 and c.cli_pid is None and c.empty()
     assert kinds(c) == ["START_FAILED", "LEADER_EXIT", "EMPTY"]
-    log = (c.dir / "shim.log").read_text()
-    assert "exit registration refused (errno 3)" in log and "chdir failed (errno 2)" in log
+    assert "exit registration refused (errno 3)" in (c.dir / "shim.log").read_text()
 
 
 def test_c1_an_exec_failure_is_said_and_then_proved_empty(kit):
@@ -1477,3 +1480,99 @@ def test_unit_the_signal_target_follows_establishment_and_the_replay_keeps_the_c
     shim._signal(signal.SIGKILL)
     shim._established()
     assert f.calls == [("kill", signal.SIGKILL, False, False), ("killpg", signal.SIGKILL, False, False)]
+
+
+# ---------------------------------------------------------------- code review round 2 (Sol on 7dee459)
+
+class _VnodePath(ctypes.Structure):     # struct proc_vnodepathinfo: pvi_cdir (vnode_info 152 bytes + path 1024), ...
+    _fields_ = [("cdir_info", ctypes.c_char * 152), ("cdir_path", ctypes.c_char * 1024),
+                ("rdir_info", ctypes.c_char * 152), ("rdir_path", ctypes.c_char * 1024)]
+
+
+def cwd_of(pid: int) -> str | None:
+    """A live process's current directory (libproc PROC_PIDVNODEPATHINFO), or None."""
+    from agent_comms import procinfo
+    v = _VnodePath()
+    n = procinfo._libproc().proc_pidinfo(pid, 9, ctypes.c_uint64(0), ctypes.byref(v), ctypes.sizeof(v))
+    return v.cdir_path.decode(errors="replace") if n == ctypes.sizeof(v) else None
+
+
+@pytest.mark.parametrize("where", ["after-setsid", "after-release"])
+def test_r5_a_failed_diagnostics_start_never_ends_supervision(kit, where):
+    """R5: the diagnostics thread cannot be started (injected through the test gate: `fail-diag-start`) while the
+    child is paused before RELEASE (just after its setsid) or after it (before its chdir). The node lets go (EOF): the
+    shim still sends TERM, KILL at the grace (the paused child ignores TERM), proves the group gone and publishes the
+    marker. The diagnostics are off: no log is ever opened. (On 7dee459 a refused thread ended the shim: EXIT_CRASH,
+    the child unsupervised.)"""
+    c = kit.start(pauses={where: {"ignore_term": True}}, gate_files=("fail-diag-start",))
+    c.go(kit.argv(), cwd=str(kit.work), env=ENV, kill_grace=0.5)
+    assert child_at(c, where), "the child paused"
+    c.close_commands()
+    assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
+    seq = [e for e in c.events if e[0] in ("SENT", "FAILED", "EMPTY")]
+    assert seq == [("SENT", "TERM", "group"), ("SENT", "KILL", "group"), ("EMPTY",)], seq
+    assert c.empty() and not (c.dir / "shim.log").exists(), "supervised to the proof, with no diagnostics at all"
+
+
+def test_r5_a_child_whose_shim_dies_before_release_never_enters_the_checkout(kit):
+    """R5: the shim is held (its test gate) before it registers the watch and writes RELEASE; its child, already past
+    setsid(), waits for RELEASE with its cwd still the shim's ("/"), not the checkout. The shim is killed (its own
+    handle): the child reads EOF and exits without ever changing directory (its `after-chdir` announcement never
+    appears). A control launch shows the announcement does appear, with the checkout as its cwd, once released. (On
+    7dee459 the child did its chdir before waiting for RELEASE.)"""
+    ok = kit.start(pauses={"after-chdir": {"wait": False}})
+    ok.go(["/bin/sh", "-c", "exit 0"], cwd=str(kit.work), env=ENV, kill_grace=1.0)
+    assert shim_exit(ok) == groupshim.EXIT_EMPTY
+    seen = read_json(ok.gate_dir / "after-chdir.at")
+    assert seen and seen["cwd"] == os.path.realpath(kit.work), "the control: released, it entered the checkout"
+    c = kit.start(gate=True, pauses={"after-chdir": {"wait": False}})
+    c.go(kit.argv(), cwd=str(kit.work), env=ENV, kill_grace=1.0)
+    name, pid = gate_reach(c, 1).split()
+    pid = int(pid)
+    time.sleep(0.5)                         # (time for the child to reach its read of RELEASE)
+    assert cwd_of(pid) == "/", f"waiting for RELEASE, the child is not in the checkout ({cwd_of(pid)!r})"
+    c.proc.kill()                           # (its own handle; the shim never wrote RELEASE)
+    assert shim_exit(c) == -signal.SIGKILL
+    assert wait_for(lambda: kinfo(pid) is None), "the child exited by itself (and launchd reaped it)"
+    assert not (c.gate_dir / "after-chdir.at").exists(), "it never entered the checkout"
+    assert c.lost() and not c.empty(), "that launch is LOST: no proof, the checkout stays retained"
+
+
+def test_unit_r5_the_loop_survives_every_non_essential_failure(shim):
+    """R5.3, in process: the kqueue wait fails on every call (the loop polls instead), the test gate cannot work, the
+    diagnostics sink raises, the event fd is unusable. The node's EOF still brings TERM, KILL at the grace, the child's
+    exit (polled by waitid), the proof and the marker."""
+    f = Fakes(shim, [(shim.pgid,), ()])
+    exited = {"code": None}
+    shim.waitid = lambda pid: exited["code"]
+
+    class BrokenKq:
+        def control(self, *a, **k):
+            raise OSError(9, "injected EBADF")
+
+    class Broken:
+        def put(self, msg):
+            raise RuntimeError("injected")
+
+        def start(self):
+            raise RuntimeError("injected")
+    real_kill = f._killpg
+
+    def killpg(pid, sig):
+        real_kill(pid, sig)
+        if sig == signal.SIGKILL:
+            exited["code"] = -signal.SIGKILL       # (the fake child dies of the KILL)
+    shim.killpg = killpg
+    shim.kq, shim.sink, shim.gate_dir = BrokenKq(), Broken(), 12345   # (a gate dir that cannot even be joined)
+    os.close(shim.event_fd)
+    shim.event_fd = 99999                  # (an fd that is not open: EBADF on every event)
+    shim.watching, shim.hs_fd = True, None
+    shim.eof = True
+    shim.first_term_at = None
+    shim._kill_request()                   # (the node's EOF, as `_on_eof` makes it)
+    ticks = iter(range(1000))
+    shim.clock = lambda: 100.0 + next(ticks) * 0.05
+    assert shim.run() == groupshim.EXIT_EMPTY
+    sigs = [c[1] for c in f.calls if c[0] == "killpg"]
+    assert sigs[:2] == [signal.SIGTERM, signal.SIGKILL] and marker_proves(shim.marker, shim.nonce, shim.boot)
+    assert shim.degraded and shim.leader_code == -signal.SIGKILL
