@@ -18065,3 +18065,5 @@ The results are in scripts/steering-mutation-results.txt.
   TERM's stamp came about 12 µs after the attempt the grace is counted from.
 - **The fix.** Each signal's log line now carries its attempt time (`attempted at`), the very value the grace uses,
   and the tests read that. The grace row is re-anchored on the new line.
+
+**The rows again, on fe3c1ea** (load averages 8 to 11): 46 of 47 are caught, and the same equivalent row is missed.
