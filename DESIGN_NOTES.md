@@ -20665,3 +20665,100 @@ test_shim_static.py, test_shim_mutation_rows.py, test_groupshim.py, test_spawn_d
 test_ownership_c1.py, test_hostlog.py: 658 passed. Parallel suite (`-n auto --dist worksteal`): 6062 passed, 10
 skipped, 8 failed, all eight this environment's (AGENT_COMMS_MANAGED=1): the `wait.sh` tests in
 tests/test_interactive_wake.py and test_interactive_wake_round1.py (5) and three in tests/test_hosted_spawn.py.
+
+### Ownership C3-2b-1: review round 2 (Sol on 1d4d40f: R2, R3 resolved; 2 blockers)
+
+Accepted by the reviewer: the unreaped pre-GO shim parked without a fence (a stated limit), plain dict operations for
+STORAGE in `Owners`, and string results from `release`. Each ruling had its reproduction test first, run against
+1d4d40f (its failure there is given with the test).
+
+**R5 [blocker]. The fence holds until the RECEIVER owns the handle; LIVE is the last transition.** Was: `launch` called
+`confirm_live` itself, so between that and its return (an interrupt there) the entry was LIVE and a sibling start could
+be admitted before `_unwind` made it HELD, beside a CLI whose GO had succeeded. Now (`shimlaunch.py`):
+- Nothing in `launch` makes the entry LIVE. It returns STARTED with GO confirmed (the CLI may run) and the entry still
+  PROVISIONAL: the checkout fenced.
+- `Launch.accept(groups)` is the RECEIVER's last step, taken after it has stored the launch where its own stop and
+  shutdown paths find it: under the launch's own lock, for a HANDED_OFF launch only, `Groups.confirm_live`, whose result
+  is RETURNED: True only when a PROVISIONAL entry became LIVE. False, nothing changed, when the entry was made STOPPING
+  or HELD meanwhile or is gone (or the launch is not HANDED_OFF): the caller treats the launch as STOPPING, never as
+  started. An exception or interrupt inside `accept` makes the entry HELD again (`restore_held`) before it is raised.
+  So until `accept` has returned True, no CLI that got GO runs beside an admissible checkout.
+- After `accept` C1's sharing rule applies as for a direct start.
+
+**R6 [blocker]. An ACTIVE launch is findable but not eligible for cleanup.** Was: a sweep calling `release` on a parked
+launch before it had a handle found "no record, no handle", answered RELEASED and unparked it; the launch went on,
+and a later `release` answered ALREADY_RELEASED with its record and its reservation still in place. Now:
+- `Launch.lifecycle`, changed only under the launch's own lock (`Launch.state_lock`, the round-1 release lock
+  renamed: a host lock, on tests/test_hostlog.py's lists): ACTIVE (created so; being launched by its thread) ->
+  HANDED_OFF (returned STARTED: unparked FIRST, while still ACTIVE, then moved) or ABANDONED (NOT_ADMITTED,
+  REFUSED_AFTER_COMMIT and GO_FAILED before they return; every raised launch at the end of `_unwind`, in a `finally`,
+  from ACTIVE or HANDED_OFF, since it never reached its receiver) -> RELEASED.
+- `release` answers KEPT and does nothing for an ACTIVE launch; only HANDED_OFF and ABANDONED ones are eligible.
+  RELEASED is set only by the call that removed the record and lifted the reservation through `Groups.release`, or
+  that found a launch which never committed and whose shim (if any) is reaped by its handle. ALREADY_RELEASED is
+  answered only after that, so never while a record or reservation exists.
+- `Owners` says it only STORES: being parked makes a launch findable, not eligible; the lifecycle is serialised by each
+  launch's lock, never by the table.
+- One case remains, and fails closed: a sweep that took its snapshot while a launch was ACTIVE and parked, and calls
+  `release` on it just after it was handed off, finds it HANDED_OFF and eligible; while its CLI runs there is no
+  proof, so the entry becomes HELD (C1's refused-proof rule). The receiver's `accept` then answers False, and the
+  launch is treated as stopping. Nothing is admitted beside it, nothing is released early; the cost is a launch stopped
+  for nothing. The wiring PR's sweep should release only launches it found ABANDONED.
+
+The launch-state table, updated (rows not shown are as in round 1; each launch's lifecycle added):
+
+| Exit | State | Record | Registry | Lifecycle | Owner |
+| --- | --- | --- | --- | --- | --- |
+| NOT_ADMITTED | (a) | none | none | ABANDONED | never parked |
+| every raised row of (a) | (a) | none | none | ABANDONED | unparked |
+| every raised row of (b) | (b) | kept (or left) | HELD | ABANDONED | parked |
+| REFUSED_AFTER_COMMIT, GO_FAILED (returned) | (b) | kept | HELD, STOPPING | ABANDONED | parked, returned |
+| raised after GO, or after the hand-off before the return (`went`, `handed`) | (b) | kept | HELD | ABANDONED | parked |
+| STARTED | (c) GO confirmed, PROVISIONAL, returned to the caller | kept | PROVISIONAL (fences) | HANDED_OFF | unparked: the caller's |
+| `accept()` True | (d) accepted | kept | LIVE | HANDED_OFF | the caller's |
+| `accept()` False (fenced meanwhile, or gone) | stopping | kept | as it was (STOPPING, HELD) | HANDED_OFF | the caller's: it stops and releases |
+| an interrupt inside `accept()` | stopping | kept | HELD | HANDED_OFF | the caller's |
+
+**What the wiring PR must do** (added to "What the next PR ... must contain"): at every supervised spawn site, on
+STARTED, first STORE the launch where that site's stop, reap and shutdown paths find it (the hosted session's record,
+the dispatched run's `_Local`), THEN call `launch.accept(groups)`; on False (or an exception from it) treat the launch
+as STOPPING from that moment (send its stop through `request_term`/`request_kill`, release on proof), never as
+started. Launches returned in (b) and those raised are in `Owners`; a cleanup sweep calls `release` on the ABANDONED
+ones only.
+
+Tests (tests/test_shim_launch.py):
+- `test_r5_launch_returns_with_the_entry_still_provisional_and_only_accept_makes_it_live`: STARTED with PROVISIONAL,
+  fenced, HANDED_OFF, unparked; `accept` True then LIVE and a sibling admitted; a second `accept` False. On 1d4d40f:
+  the state was LIVE on return.
+- `test_r5_until_accept_returns_success_the_checkout_stays_fenced[returned|accept-before|accept-after]`: fenced after
+  the return and inside `accept` before and after the registry's change; HELD after an interrupt in `accept`. On
+  1d4d40f: `returned` found the checkout not fenced (`[False]`); `accept` did not exist.
+- `test_r5_accept_reports_a_refusal_when_the_entry_is_no_longer_provisional[stopping|held|gone]`: False, nothing
+  changed. On 1d4d40f: `accept` did not exist.
+- `test_r6_a_sweep_racing_a_launch_never_takes_an_active_one[handed-off|fails-before-the-commit]`: a real sweeping
+  thread over `owners.parked()` while this thread runs 12 real launches (each in its own checkout, since a PROVISIONAL
+  entry fences its own); each ends HANDED_OFF with its record and fencing entry until its stop and the release on its
+  proof, or (failing before its commit) with nothing left; every RELEASED/ALREADY_RELEASED anyone got was for a launch
+  with no record and no entry (`released_means_gone`), at most one RELEASED per launch. On 1d4d40f: `handed-off`
+  failed, the final release answering `already_released` with the record still there; `fails-before-the-commit`
+  passed there (nothing is left either way).
+- Changed: `settled_b` (every (b) row) now checks ABANDONED, a refused `accept`, and the invariant;
+  `test_launch_no_registry_entry_exists_before_the_durable_commit` (PROVISIONAL at `went`, `handed` and on return,
+  LIVE after `accept`); the R1 lock test ends with `accept`; the every-step test's points are now the seven inside
+  `launch` (`live-before`, `live-after` and `live` moved to `accept`), all fenced but `admit-before`.
+
+**Mutation check (review round 2).** Not run here; tests/test_shim_mutation_rows.py passes (44 C3-2b-1 rows, 9 named
+"C3-2b-1 r2"). Applied by hand, each alone, and caught: every new row below.
+- **New (6):** "C3-2b-1 r2 R5 launch never makes the entry LIVE"; "C3-2b-1 r2 R5 accept checks confirm_live's result";
+  "C3-2b-1 r2 R5 an interrupt inside accept fences again"; "C3-2b-1 r2 R6 an ACTIVE launch is not eligible for
+  release"; "C3-2b-1 r2 R6 RELEASED only by the caller that retired the record"; "C3-2b-1 r2 R6 a failed launch
+  becomes ABANDONED".
+- **Re-anchored (3):** "C3-2b-1 no registry entry before the commit (re-anchored: C3-2b-1 r2)"; "C3-2b-1 r1 R4 a
+  release is reported once (re-anchored: C3-2b-1 r2)"; "C3-2b-1 r1 R4 a release holds the launch's own lock
+  (re-anchored: C3-2b-1 r2)".
+- Removed: none.
+
+**Runs (review round 2).** Targeted (test_shim_launch, test_shim_journal, test_shim_restore, test_shim_static,
+test_shim_mutation_rows, test_groupshim, test_nodes, test_ownership_c1, test_hostlog): 666 passed. No parallel suite
+(as asked). The two race tests also ran three more times outside the full runs (once with the R5 tests, twice on
+their own): passed each time.

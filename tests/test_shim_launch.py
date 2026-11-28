@@ -59,7 +59,7 @@ class Env:
             h.gate_dir = gate
             self.kit.children.append(h)
 
-    def launch(self, argv, grace=1.0, gate_files=(), numbered=False, pause=None, **kw):
+    def launch(self, argv, grace=1.0, gate_files=(), numbered=False, pause=None, cwd=None, **kw):
         self.n += 1
         gate = None
         if gate_files or numbered:
@@ -76,7 +76,8 @@ class Env:
                 pause(step, launch)
         try:
             launch = shimlaunch.launch(groups=self.groups, journal=self.journal, owners=self.owners,
-                                       marker_dir=self.markers, cwd=self.cwd, argv=argv, env=ENV, kill_grace=grace,
+                                       marker_dir=self.markers, cwd=cwd or self.cwd, argv=argv, env=ENV,
+                                       kill_grace=grace,
                                        log=str(self.kit.tmp / f"shim{self.n}.log"),
                                        stderr_log=str(self.kit.tmp / f"stderr{self.n}.log"),
                                        test_gate=None if gate is None else str(gate), pause=hook, **kw)
@@ -92,11 +93,13 @@ class Env:
     def release(self, launch, pause=None):
         return shimlaunch.release(self.groups, self.journal, self.owners, launch, pause=pause)
 
-    def fenced(self) -> bool:
+    def fenced(self, cwd=None) -> bool:
         """The checkout admits nothing: `blocked`, and a direct start is refused with nothing spawned."""
-        spawned = []
-        refused = self.groups.start(self.cwd, ("run", "probe"), lambda: spawned.append(1)) == (False, None)
-        return self.groups.blocked(self.cwd) and refused and not spawned
+        cwd, spawned = cwd or self.cwd, []
+        refused = self.groups.start(cwd, ("run", "probe"), lambda: spawned.append(1)) == (False, None)
+        if not refused:
+            self.groups._gone(("run", "probe"))     # (the probe's own entry, if it was admitted)
+        return self.groups.blocked(cwd) and refused and not spawned
 
 
 @pytest.fixture
@@ -144,8 +147,11 @@ def settled_b(env, launch) -> None:
     assert env.groups.state(launch.token) in (HELD, STOPPING) and env.fenced(), env.groups.state(launch.token)
     assert launch.handle._cmd is None, "the command writer is closed: the shim cleans up on EOF"
     assert launch in env.owners.parked(), "its owner is parked where a later release finds it"
+    assert launch.lifecycle == shimlaunch.Launch.ABANDONED, "(R6) eligible for cleanup"
+    assert launch.accept(env.groups) is False and env.fenced(), "(R5) never accepted"
     assert shim_exit(launch.handle) in (groupshim.EXIT_NOGO, groupshim.EXIT_EMPTY), launch.handle.events
-    assert env.release(launch) == RELEASED and env.release(launch) == ALREADY
+    got = env.release(launch)
+    assert got == RELEASED and released_means_gone(env, launch, got) and env.release(launch) == ALREADY
     assert env.ids() == [] and env.groups.entries == {} and env.owners.parked() == []
 
 
@@ -219,8 +225,9 @@ def test_launch_a_failure_before_the_commit_leaves_no_record_no_entry_and_no_unr
 def test_launch_no_registry_entry_exists_before_the_durable_commit(env):
     """At injected pauses: right after the shim started there is no record and no entry; right after the commit the
     record is durable and there is STILL no entry; once admitted, and while GO is written, the entry is PROVISIONAL
-    (it fences); LIVE only once GO was confirmed whole. The launch ends STARTED, handed to its caller (not parked), and
-    its whole life ends in a release by the proof."""
+    (it fences); it is STILL PROVISIONAL when the launch ends STARTED and is handed to its caller (not parked,
+    HANDED_OFF), and LIVE only once the receiver `accept()`s it (review round 2, R5). Its whole life ends in a release
+    by the proof."""
     at = {}
 
     def pause(name, launch):
@@ -231,7 +238,9 @@ def test_launch_no_registry_entry_exists_before_the_durable_commit(env):
     assert at["started"] == ([], None)
     assert at["committed"] == ([lid], None), "the durable record, and no registry entry yet"
     assert at["admitted"] == at["go"] == ([lid], PROVISIONAL), "provisional, fencing, before GO"
-    assert at["went"] == ([lid], PROVISIONAL) and at["live"] == ([lid], LIVE)
+    assert at["went"] == at["handed"] == ([lid], PROVISIONAL)
+    assert env.groups.state(launch.token) == PROVISIONAL, "returned still fencing"
+    assert launch.accept(env.groups) is True and env.groups.state(launch.token) == LIVE
     assert shim_exit(launch.handle) == groupshim.EXIT_EMPTY
     assert env.release(launch) == RELEASED and env.ids() == [] and env.groups.entries == {}
 
@@ -373,7 +382,8 @@ def test_r1_nothing_holds_the_registry_lock_while_go_is_written_and_the_checkout
             la.handle._kill_shim(signal.SIGCONT)
     t.join(WAIT)
     assert "error" not in out, out
-    assert out["launch"].outcome == shimlaunch.STARTED and env.groups.state(out["launch"].token) == LIVE
+    assert out["launch"].outcome == shimlaunch.STARTED and env.groups.state(out["launch"].token) == PROVISIONAL
+    assert out["launch"].accept(env.groups) and env.groups.state(out["launch"].token) == LIVE
 
 
 class CutRegistry(node_groups.Groups):
@@ -403,19 +413,19 @@ class CutRegistry(node_groups.Groups):
         return got
 
 
-# Every step from the provisional install to the LIVE transition (and the registry's own code on both sides of it),
-# and the last line before the return: after the owner was handed over (unparked), an interrupt parks it again (b)
-POINTS = ["admit-before", "admit-after", "admitted", "go", "last-byte", "went", "live-before", "live-after", "live",
-          "handed"]
-FENCED_AT = {"admit-after", "admitted", "go", "last-byte", "went", "live-before"}
+# Every step of `launch` from the provisional install on (the registry's own code on both sides of it), to the last
+# line before the return: after the owner was handed over (unparked, HANDED_OFF), an interrupt parks it again, (b).
+# (Review round 2, R5: `launch` makes nothing LIVE; the points from its return to `accept` are test_r5_until_...)
+POINTS = ["admit-before", "admit-after", "admitted", "go", "last-byte", "went", "handed"]
+FENCED_AT = {"admit-after", "admitted", "go", "last-byte", "went", "handed"}
 
 
 @pytest.mark.parametrize("point", POINTS)
 def test_r1_an_interrupt_at_every_step_from_the_provisional_install_to_live_keeps_the_entry_fencing(kit, monkeypatch,
                                                                                                    point):
-    """R1: an interrupt injected at each step from the provisional install to the LIVE transition, including "the last
-    GO byte was written, then an interrupt" and inside the registry's own code. At each point up to the LIVE
-    transition the entry exists and fences: another start for the checkout is refused (`probe`, from the launching
+    """R1 (and R5): an interrupt injected at each step of `launch` from the provisional install to its return,
+    including "the last GO byte was written, then an interrupt", inside the registry's own code, and after the hand-off.
+    At each point the entry exists and fences: another start for the checkout is refused (`probe`, from the launching
     thread itself). After the interrupt: the entry still fences (HELD, never dropped), the record stays, the writer is
     closed (the shim cleans up on EOF: never started, or its CLI stopped), the owner is parked; release on the proof."""
     groups = CutRegistry()
@@ -637,6 +647,140 @@ def test_a_cli_that_exits_while_a_member_of_its_group_survives_is_not_released_u
     Path(member_go).write_text("")
     assert shim_exit(launch.handle) == groupshim.EXIT_EMPTY
     assert env.release(launch) == RELEASED and env.ids() == [] and env.groups.entries == {}
+
+
+# ---------------------------------------------------------------- review round 2: R5, the receiver accepts; R6, ACTIVE
+
+
+def released_means_gone(env, launch, result) -> bool:
+    """R6.2, the invariant: a launch reported RELEASED or ALREADY_RELEASED has no journal record and no registry entry
+    (`exists` is an lstat: safe beside a concurrent commit, unlike `load`)."""
+    if result not in (RELEASED, ALREADY):
+        return True
+    return not env.journal.exists(launch.launch_id) and env.groups.state(launch.token) is None
+
+
+def stop_and_release(env, launch) -> None:
+    """The receiver's stop (the writer closed: the shim stops its CLI), then the release on the proof, once."""
+    launch.handle.close_commands()
+    assert shim_exit(launch.handle) in (groupshim.EXIT_EMPTY, groupshim.EXIT_NOGO), launch.handle.events
+    got = env.release(launch)
+    assert got == RELEASED and released_means_gone(env, launch, got)
+    assert env.release(launch) == ALREADY and not env.journal.exists(launch.launch_id)
+    assert env.groups.state(launch.token) is None
+
+
+def test_r5_launch_returns_with_the_entry_still_provisional_and_only_accept_makes_it_live(env):
+    """R5: `launch` returns STARTED (GO confirmed, the CLI running) with the entry still PROVISIONAL: the checkout is
+    fenced and a sibling start refused. Only the receiver's `accept()` makes it LIVE (True); then C1's sharing rule
+    applies as for a direct start (a sibling start is admitted beside it). A second `accept()` changes nothing."""
+    launch = env.launch(env.kit.argv(wait_abort=True))
+    assert launch.outcome == shimlaunch.STARTED and launch.handle.went
+    assert env.groups.state(launch.token) == PROVISIONAL and env.fenced(), env.groups.state(launch.token)
+    assert launch.lifecycle == shimlaunch.Launch.HANDED_OFF and env.owners.parked() == []
+    assert launch.accept(env.groups) is True and env.groups.state(launch.token) == LIVE
+    assert env.groups.start(env.cwd, ("run", "sibling"), lambda: "spawned") == (True, "spawned"), "C1's sharing"
+    env.groups._gone(("run", "sibling"))
+    assert launch.accept(env.groups) is False and env.groups.state(launch.token) == LIVE
+    stop_and_release(env, launch)
+
+
+@pytest.mark.parametrize("point", ["returned", "accept-before", "accept-after"])
+def test_r5_until_accept_returns_success_the_checkout_stays_fenced(kit, point):
+    """R5.3: between GO's confirmation and a successful `accept()`, at every point the checkout is fenced (a sibling
+    start refused): after `launch` returned and before `accept` is called (the receiver interrupted there: it never
+    accepts), and an interrupt inside `accept` before and after the registry's change (the entry is then made HELD,
+    never left LIVE). (The points inside `launch`, `went` and `handed`, are
+    `test_r1_an_interrupt_at_every_step_...`.) Then the receiver's stop and the release on the proof."""
+    groups = CutRegistry()
+    env = Env(kit, groups)
+    probed = []
+    groups.probe = lambda: probed.append(env.fenced())
+    launch = env.launch(env.kit.argv(wait_abort=True))
+    assert launch.outcome == shimlaunch.STARTED
+    probed.append(env.fenced())                 # (returned to its receiver, not yet accepted)
+    if point != "returned":
+        groups.at = "live-before" if point == "accept-before" else "live-after"
+        with pytest.raises(Crash):
+            launch.accept(groups)
+        assert env.groups.state(launch.token) == HELD, env.groups.state(launch.token)
+    assert all(probed) and probed, probed
+    assert env.fenced() and env.groups.state(launch.token) in (PROVISIONAL, HELD)
+    stop_and_release(env, launch)
+
+
+@pytest.mark.parametrize("how", ["stopping", "held", "gone"])
+def test_r5_accept_reports_a_refusal_when_the_entry_is_no_longer_provisional(env, how):
+    """R5.2: the entry was fenced meanwhile (a stop marked it STOPPING; it was made HELD) or is gone: `accept()`
+    answers False and changes nothing; the caller treats the launch as stopping, never as started."""
+    launch = env.launch(env.kit.argv(wait_abort=True))
+    if how == "stopping":
+        env.groups.stopping(launch.token)
+    elif how == "held":
+        env.groups.restore_held(launch.token, [launch.key], env.cwd)
+    else:
+        env.groups._gone(launch.token)
+    before = env.groups.state(launch.token)
+    assert launch.accept(env.groups) is False and env.groups.state(launch.token) == before
+    if how == "gone":
+        env.groups.restore_held(launch.token, [launch.key], env.cwd)    # (the test's own: so release has its entry)
+    stop_and_release(env, launch)
+
+
+def sweeper(env, stop, seen):
+    """R6: a cleanup sweep, as the node's passes will be: `release` on every parked launch, in a loop."""
+    while not stop.is_set():
+        for la in env.owners.parked():
+            got = env.release(la)
+            seen.append((la, got, released_means_gone(env, la, got)))
+
+
+@pytest.mark.parametrize("ends", ["handed-off", "fails-before-the-commit"])
+def test_r6_a_sweep_racing_a_launch_never_takes_an_active_one(env, ends):
+    """R6, real threads and real shims: a sweeping thread calls `release` on every parked launch in a loop while this
+    thread runs `launch()`, many times. An ACTIVE launch is findable but never eligible: each launch ends HANDED_OFF
+    with its record and its fencing entry intact until the release on its proof (or, failing before its commit, with
+    nothing left at all). Every RELEASED or ALREADY_RELEASED any caller got was for a launch with no record and no
+    entry, and at most one caller per launch got RELEASED."""
+    stop, seen, facts = threading.Event(), [], []
+    t = threading.Thread(target=sweeper, args=(env, stop, seen), daemon=True)
+    t.start()
+    launches = []
+    try:
+        for i in range(12):
+            if ends == "handed-off":
+                cwd = env.kit.tmp / f"checkout-{i}"     # (its own checkout: a PROVISIONAL one fences its own)
+                cwd.mkdir()
+                launch = env.launch(env.kit.argv(wait_abort=True), cwd=str(cwd))
+                assert launch.outcome == shimlaunch.STARTED
+                assert env.journal.exists(launch.launch_id), "the record is intact"
+                facts.append((env.groups.state(launch.token), env.fenced(str(cwd)),
+                              getattr(launch, "lifecycle", None)))
+            else:
+                got = []
+
+                def pause(name, la):
+                    got.append(la)
+                    if name == "started":
+                        raise OSError(5, "injected")
+                with pytest.raises(OSError):
+                    env.launch(env.kit.argv(wait_abort=True), pause=pause)
+                launch = got[0]
+                assert reaped_by_its_handle(launch.handle)
+                assert not env.journal.exists(launch.launch_id) and env.groups.state(launch.token) is None
+            launches.append(launch)
+    finally:
+        stop.set()
+        t.join(WAIT)
+    for launch in launches:
+        if ends == "handed-off":
+            assert env.journal.exists(launch.launch_id) and env.groups.state(launch.token) is not None
+            stop_and_release(env, launch)
+    assert all(ok for _, _, ok in seen), [(la.launch_id, got) for la, got, ok in seen if not ok]
+    for launch in launches:
+        assert len([1 for la, got, _ in seen if la is launch and got == RELEASED]) <= 1
+    for state, fenced, life in facts:            # (each launch as it was handed off, the sweep running)
+        assert state in (PROVISIONAL, HELD) and fenced and life == "handed_off", (state, fenced, life)
 
 
 # ---------------------------------------------------------------- commands: QUEUED, PENDING, CLOSED
