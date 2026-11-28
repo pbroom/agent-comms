@@ -19997,7 +19997,118 @@ each was caught: the secret on the argv, the pair's first half, and the original
   `ShimChild.start(marker_dir=...)`; never pass a path.
 - Ask `refused()` (nothing started), `lost()` (held) and `empty()` (proved) on every reap and shutdown path, before
   reading `poll() is None` as "still running".
-- Never ignore SIGCHLD, set `SA_NOCLDWAIT`, or reap with `waitpid(-1)` in the node.
+- Never ignore SIGCHLD, set `SA_NOCLDWAIT`, or reap with `waitpid(-1)` in the node (since review round 1 any of these
+  makes every shim's status UNKNOWN: safe, but every launch is then held).
+- Release on `refused()` only as ruled in review round 1 (an observed exit 2 or 7 of the trusted shim launch).
 - Keep every node spawn `close_fds=True` (the F6 scan catches a regression inside `agent_comms` only).
 - Keep the handle's locks as host locks (`with hostlog.BOUNDARY, lock:`), as before.
 - C3-3 decides proof after a restart (above); until then a restarted node holds every unproved reservation.
+
+### Ownership C3-2a: review round 1 (Sol on 7047f3a: 2 blockers, 2 shoulds)
+
+Accepted as built: the secret's channel, the domain-separated canonical encoding and exact field validation, the four
+matching (status, outcome) pairs (exit 6 with either outcome included), the boot UUID read, the forked child's exit
+path, and the degraded loop's rules once it is entered.
+
+**The two decisions, answered.**
+- **`refused()`:** the wiring MAY release on it, but only on a genuinely OBSERVED exit 2 or 7 of the trusted shim
+  launch. A signal exit, an unknown status (R3) or an untrusted launcher is not enough. `refused()` now answers True
+  only for an int status observed by the handle's own `waitpid`.
+- **SIGCHLD:** the finding stands; R3 replaces the disposition guard with something stronger (below).
+
+#### R1 [blocker]: publishing the marker never replaces a file
+
+- **The defect.** `start()` checked the path, but the shim published with a replacing `rename`. A same-user process
+  can read the path on the shim's argv, put a file there while the CLI runs, and have it overwritten at cleanup. Also,
+  after a failed exclusive create of its temp name, the shim unlinked that name, though it was not its own.
+- **Now** (`write_marker`): the temp file `<marker>.<pid>.tmp` is created exclusively (`O_EXCL | O_NOFOLLOW`), synced,
+  and published by `os.link(temp, path)`, which fails with EEXIST if anything is at the path (a dangling symlink
+  included) and never replaces it; then the temp name is unlinked; then the directory is synced, as before. The temp
+  name is unlinked only if THIS call created it (`created`). On any failure up to the link: `MARKER_FAILED <errno>`
+  (17 when something was already there), no `EMPTY`, exit 4, no marker of ours, and whatever was there left exactly
+  as it was. Exit 4 is in no release pair: the node sees a launch not proved, `lost()`, held.
+- **A consequence:** a forgery the CLI leaves at the marker path now blocks the publish (held), rather than being
+  replaced by the shim's marker; the F1 forger test says so. A file put there AFTER the publish (the escaped
+  descendant's case) still makes the pair fail, as before.
+- **Tests** (real): `test_rr1_publishing_never_replaces_a_file_at_the_marker_path[empty|never_started]`: the planted
+  file is there byte for byte, `MARKER_FAILED 17`, exit 4, `empty()` False, `lost()`, no temp file left. Both fail on
+  7047f3a (exit 0 / 3: replaced). `test_rr1_a_temp_name_the_shim_did_not_create_is_never_unlinked`: fails on 7047f3a
+  (the planted temp file is gone).
+
+#### R2 [blocker]: nothing runs between a post-fork crash and the degraded stop
+
+- **The defect.** `_main` called `traceback.format_exc()` before `stop_after_crash`. It reads source files
+  (`linecache`); if that stalled with a live CLI, no cleanup TERM was ever sent, even after the node's EOF.
+- **Now.** After an exception past the fork the FIRST call is `shim.stop_after_crash(e)`. The crash is described only
+  after the first TERM (or after the refusal, when the anchor cannot be confirmed): `crash_frames` takes the type name
+  and the innermost 32 (file, line, function) triples from the traceback objects' code objects (memory only: no
+  `traceback`, no `linecache`); the TEXT is made by `render_crash`, which only the diagnostics writer thread calls
+  (`Diag.put_lazy`). A rendering that stalls stalls that thread alone; one that raises gives a placeholder line. The
+  crash before the fork is described the same way. `groupshim` no longer imports `traceback`.
+- **The rest checked:** every other handler between an exception and a signal (the loop's `OSError` handlers, the
+  event writer, the reads) only formats an errno into a queued line; signals are sent before their diagnostics.
+- **Test** (real): `test_rr2_a_stalled_crash_description_never_holds_up_the_degraded_stop`: the shim runs under a
+  stand-in interpreter (a shell script passed as `python=`) whose traceback formatters, `linecache` and
+  `groupshim.render_crash` all stall until the test's `abort`. With the CLI and its member ignoring TERM, an injected
+  crash past the fork still brings the TERM at once, KILL at the 1 s grace, the proof and the marker: exit 0 within
+  8 s. Fails on 7047f3a (no TERM within 5 s).
+
+#### R3 [should]: the handle owns the shim's wait status; an unknown status proves nothing
+
+- **The defect.** `Popen.poll()` turns ECHILD into exit 0. An earlier auto-reap (SIGCHLD ignored, `SA_NOCLDWAIT`) or
+  another waiter therefore gave a status nobody observed. The SIGCHLD-disposition guard of 7047f3a could not see
+  `SA_NOCLDWAIT` nor another waiter.
+- **Now.** `ShimChild._observe` is the ONE place the shim is reaped: `os.waitpid(pid, WNOHANG)`, the status recorded
+  exactly once (`os.waitstatus_to_exitcode`: negative for a signal). `ChildProcessError` (ECHILD) records
+  `STATUS_UNKNOWN`. `shim_poll()` answers None (running), the status, or `STATUS_UNKNOWN`.
+- **Popen is neutralised:** at construction the handle sets the shim's `Popen.returncode` to a sentinel
+  (`_HandleOwnsStatus`). `Popen.poll()`, `wait()`, `send_signal()`/`kill()`, `__del__` and subprocess's `_cleanup` of
+  collected Popens all act only while `returncode` is None, so none of them ever waits on or signals the shim. The
+  handle keeps it privately (`_popen`), for its stdio pipes only; `proc` is no longer exposed. Tests signal the shim
+  through `_kill_shim()` (test-only), which signals only while the handle has not reaped it.
+- **The SIGCHLD guard is dropped:** with SIGCHLD ignored the kernel reaps the shim, the handle's `waitpid` gets ECHILD,
+  and the status is UNKNOWN, which proves nothing (and this also covers `SA_NOCLDWAIT` and other waiters).
+- **UNKNOWN answers:** `empty()` False, `refused()` False, `lost()` True (held, for a human or a later proof),
+  `poll()` the `LEADER_EXIT` code if that event was read, else None (never a code from the marker).
+
+| `LEADER_EXIT` seen | shim | authentic marker | `poll()` | `empty()` | `lost()` | `refused()` |
+| --- | --- | --- | --- | --- | --- | --- |
+| yes / no | status UNKNOWN (reaped by another waiter, or by the kernel) | any or none | the event's code / None | False | **True** | False |
+
+  (Added to the C3-2a table above; every other row stands, with "exited N" meaning a status the handle observed.)
+- **Tests** (real): `test_rr3_a_shim_reaped_by_another_waiter_has_an_unknown_status_and_proves_nothing[proved|refused]`
+  (this test process reaps the shim first: UNKNOWN, `empty()` and `refused()` False, `lost()`): `proved` fails on
+  7047f3a (`empty()` True), `refused` fails there on the missing `STATUS_UNKNOWN`.
+  `test_rr3_popen_cannot_reap_the_shim_behind_the_handle` (the shim exited; its Popen's `poll()`, `wait()` and
+  `kill()` leave it this process's unreaped child; the handle then observes 0): fails on 7047f3a (Popen reaped it).
+  `test_c6_signal_dispositions_...` (the node stand-in ignores SIGCHLD): both shims' status is now `unknown`; fails on
+  7047f3a (`[0, 0]`).
+
+#### R4 [should]: the stricter spawn pin is NOT built: two existing call sites do not fit
+
+The rule (only direct calls `subprocess.<spawn>(argv, ...)` or a name imported from subprocess unrenamed; one
+positional argument; `close_fds` absent or the literal True by keyword; no `*args`/`**kwargs`; no assignment, alias,
+attribute lookup or `getattr` that hands a spawn function on) was checked against `agent_comms/` with a scratch scan
+before any change. Type annotations (`proc: subprocess.Popen` in dispatch.py and shimchild.py) hand nothing on and
+would be exempt. Two sites do not fit, both in modules this PR may not change:
+- `agent_comms/notify.py:99`: `popen: Callable[..., Any] = subprocess.Popen` (a default argument; called as
+  `self.popen(...)` with `close_fds=True` at line 109);
+- `agent_comms/waiter.py:491`: `run = run or subprocess.run` (called as `run([...], stdin=DEVNULL, ...)`, no
+  `close_fds`, so subprocess's default True).
+
+As ruled, the rule is not loosened: R4 stops here for a decision. The committed F6 scan (direct forms, any literal
+non-True `close_fds`, `**kwargs` on direct calls, the fork family) is unchanged.
+
+#### Mutation check (review round 1)
+
+The GS and SC rows are now 72; every anchor occurs exactly once (the scratch check). The script was not run here; the
+R1 "no replace", R2 and R3 "unknown" mutants were applied by hand and each was caught by its test.
+- **New (5):** "C3-2a R1 publishing never replaces a file"; "C3-2a R1 only a temp file this publisher created is
+  unlinked"; "C3-2a R2 nothing runs between a post-fork crash and the degraded stop"; "C3-2a R3 a status nobody
+  observed is UNKNOWN, never a status"; "C3-2a R3 Popen never reaps the shim behind the handle".
+- **Re-anchored (4):** "C3-1R4 a temp-file sync failure publishes nothing (re-anchored: C3-2a review round 1)"; "C3-2a
+  the release needs the shim's own terminal status (the pair's first half; re-anchored: review round 1)"; "C3-2a the
+  release needs the authenticated marker (the pair's second half; re-anchored: review round 1)"; "C3-2a a crash after
+  the fork goes to the degraded stop (re-anchored: review round 1)".
+- **Removed (1):** "C3-2a no release pair while this process ignores SIGCHLD" (its guard is dropped; R3's rows
+  replace it).
