@@ -19719,8 +19719,10 @@ KeyboardInterrupt raised directly, or an ordinary exception, out of the loop; an
 signal in the few bytecodes before `latch()` takes effect raises (the handler latches first) and replaces the
 exception in flight. That KeyboardInterrupt leaves the `except` clause it landed in:
 - **In `_run`'s two clauses:** the cleanup that clause would have started (`shut_down`, or the sessions' shutdown)
-  is not run. `run`'s exit takes the interrupt: the further signals are said, the final wait runs, and the status is
-  130. What was not stopped is left to the next node process's recovery.
+  is not run. `run`'s exit takes the interrupt: the further signals are said and the final wait runs. If the log
+  writer is stalled the process ends there with status 130; otherwise `run` re-raises the KeyboardInterrupt and the
+  interpreter's own exit decides the status (Sol's correction to this sentence). What was not stopped is left to
+  the next node process's recovery.
 - **In `run`'s own clause:** it leaves `run` before the final wait, into the interpreter's exit, as on main.
 
 It cannot recreate the acquire-window deadlock. The main thread's two explicit acquisitions (`unproved`'s and the
