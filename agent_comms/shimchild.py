@@ -52,6 +52,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Callable
 
 from . import groupshim, hostlog
 from .dispatch import PipedChild
@@ -69,6 +70,9 @@ _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(groupshim.__file
 _BOOT = ("import sys; sys.path.append(sys.argv.pop(1)); from agent_comms.groupshim import entry; "
          "entry(sys.argv[1:])")
 EVENTS_PER_PUMP = 256 * 1024        # bytes one pump takes at most (non-blocking: never waits)
+# (C3-2b-1) A launch given up before GO: the bound on waiting for its shim to exit on EOF (`abandon_before_go`), twice
+# at most (the second after a SIGKILL of the node's own unreaped, pinned child)
+ABANDON_SECONDS = 5.0
 
 
 def wait_writable(fd: int, timeout: float) -> None:
@@ -238,7 +242,8 @@ class ShimChild:
 
     @classmethod
     def start(cls, *, marker_dir: str, log: str, stderr_log: str, cwd: str = "/", python: str | None = None,
-              test_gate: str | None = None, piped: bool = True) -> "ShimChild":
+              test_gate: str | None = None, piped: bool = True,
+              adopt: Callable[["ShimChild"], None] | None = None) -> "ShimChild":
         """Spawn the shim and send it this launch's secret; return before GO. `marker_dir`: the node's private marker
         directory (`make_marker_dir`; checked again here); the marker's path in it is drawn afresh for this launch
         (`self.marker`), and an existing path, in any form, is refused before anything is spawned, never overwritten or
@@ -250,7 +255,14 @@ class ShimChild:
 
         The secret (fresh random bytes, `secrets.token_bytes`) goes only into ONE `NONCE` frame on the command pipe,
         written here, before GO: it is never on the shim's argv, in its environment, or in any file. If that write
-        fails, the command pipe is closed: the shim sees no valid frame, starts nothing and exits 7 (`refused()`)."""
+        fails, the command pipe is closed: the shim sees no valid frame, starts nothing and exits 7 (`refused()`).
+
+        (C3-2b-1, review round 1, R4) The hand-off: `adopt(handle)` is called with the handle as soon as it exists,
+        before the secret is sent and before this returns, so the caller's owner holds it from the moment a shim
+        process has a handle (shimlaunch.launch passes one). Anything raised from the spawn on, an interrupt included,
+        before this returns abandons the shim before GO (`abandon_before_go`, which only a GO attempt could refuse, and
+        none can have been made) and is raised: a shim whose spawn returned but whose handle was never made gets one
+        made for it in `_launch`, and is reaped by it. (A double abandon, by this and by the owner, is harmless.)"""
         boot = boot_id()
         if boot is None:
             raise OSError(errno.ENOTSUP, "this boot's identity (kern.bootsessionuuid) cannot be read or validated: "
@@ -264,8 +276,13 @@ class ShimChild:
         else:
             raise FileExistsError(errno.EEXIST, "the marker path exists: refused, and left as it is", marker)
         child = cls._launch(marker=marker, key=secrets.token_bytes(groupshim.KEY_BYTES), boot=boot, log=log,
-                            stderr_log=stderr_log, cwd=cwd, python=python, test_gate=test_gate, piped=piped)
-        child._send_secret()
+                            stderr_log=stderr_log, cwd=cwd, python=python, test_gate=test_gate, piped=piped,
+                            adopt=adopt)
+        try:
+            child._send_secret()
+        except BaseException:
+            child.abandon_before_go(ABANDON_SECONDS)
+            raise
         return child
 
     def _send_secret(self) -> None:
@@ -281,39 +298,55 @@ class ShimChild:
 
     @classmethod
     def _launch(cls, *, marker: str, key: bytes, boot: str, log: str, stderr_log: str, cwd: str = "/",
-                python: str | None = None, test_gate: str | None = None, piped: bool = True) -> "ShimChild":
+                python: str | None = None, test_gate: str | None = None, piped: bool = True,
+                adopt: Callable[["ShimChild"], None] | None = None) -> "ShimChild":
         """Spawn the shim with nothing sent yet (`start` sends the secret; tests call this directly to send their own
-        frames)."""
+        frames). (Review round 1, R4) The handle is made right after the spawn returns and handed to `adopt`; if
+        anything is raised once the spawn returned (an interrupt included) and before this returns, the shim is
+        abandoned before GO through a handle (one made here for it if none was), so the one reaping path (`_observe`)
+        reaps it. Not covered: an interrupt inside `subprocess.Popen` itself after its fork (CPython's own code): both
+        of the node's pipe ends are then closed here, so the shim sees EOF before its secret and exits 7 having
+        started nothing, and CPython's own bookkeeping of that lost `Popen` reaps it (DESIGN_NOTES, its limits)."""
         cmd_r, cmd_w = os.pipe()        # (close-on-exec: no other child of the node inherits either end)
         evt_r = evt_w = err_fd = -1
+        proc = child = None
         try:
-            evt_r, evt_w = os.pipe()
-            flags = os.O_APPEND if piped else os.O_EXCL
-            err_fd = os.open(stderr_log, os.O_WRONLY | os.O_CREAT | flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            os.fchmod(err_fd, 0o600)
-            # (C3-2a) No secret on the argv, nor in the environment below: the CLI, the shim's child, can read both.
-            argv = [python or sys.executable, "-I", "-S", "-c", _BOOT, _PACKAGE_ROOT,
-                    "--version", str(groupshim.PROTOCOL), "--boot", boot, "--marker", marker, "--cmd-fd", str(cmd_r),
-                    "--event-fd", str(evt_w), "--log", log]
-            if test_gate is not None:
-                argv += ["--test-gate", test_gate]
-            proc = subprocess.Popen(argv, shell=False, cwd=cwd, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-                                    stdin=subprocess.PIPE if piped else subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE if piped else err_fd,
-                                    stderr=err_fd if piped else subprocess.STDOUT, close_fds=True,
-                                    pass_fds=(cmd_r, evt_w), start_new_session=True, bufsize=0)
+            try:
+                evt_r, evt_w = os.pipe()
+                os.set_blocking(cmd_w, False)
+                os.set_blocking(evt_r, False)
+                flags = os.O_APPEND if piped else os.O_EXCL
+                err_fd = os.open(stderr_log, os.O_WRONLY | os.O_CREAT | flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                os.fchmod(err_fd, 0o600)
+                # (C3-2a) No secret on the argv, nor in the environment below: the CLI, the shim's child, can read both.
+                argv = [python or sys.executable, "-I", "-S", "-c", _BOOT, _PACKAGE_ROOT,
+                        "--version", str(groupshim.PROTOCOL), "--boot", boot, "--marker", marker,
+                        "--cmd-fd", str(cmd_r), "--event-fd", str(evt_w), "--log", log]
+                if test_gate is not None:
+                    argv += ["--test-gate", test_gate]
+                proc = subprocess.Popen(argv, shell=False, cwd=cwd, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                                        stdin=subprocess.PIPE if piped else subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE if piped else err_fd,
+                                        stderr=err_fd if piped else subprocess.STDOUT, close_fds=True,
+                                        pass_fds=(cmd_r, evt_w), start_new_session=True, bufsize=0)
+            finally:
+                for fd in (cmd_r, evt_w, err_fd):       # the shim's ends are the shim's alone now
+                    if fd >= 0:
+                        os.close(fd)
+            child = cls(proc, cmd_w, evt_r, key=key, boot=boot, marker=marker)
+            if adopt is not None:
+                adopt(child)
         except BaseException:
-            for fd in (cmd_w, evt_r):
-                if fd >= 0:
-                    os.close(fd)
+            if child is None and proc is not None:      # (spawned, but its handle was never made: make one now)
+                child = cls(proc, cmd_w, evt_r, key=key, boot=boot, marker=marker)
+            if child is not None:
+                child.abandon_before_go(ABANDON_SECONDS)    # (no GO was possible: EOF, never started, reaped)
+            else:
+                for fd in (cmd_w, evt_r):
+                    if fd >= 0:
+                        os.close(fd)
             raise
-        finally:
-            for fd in (cmd_r, evt_w, err_fd):       # the shim's ends are the shim's alone now
-                if fd >= 0:
-                    os.close(fd)
-        os.set_blocking(cmd_w, False)
-        os.set_blocking(evt_r, False)
-        return cls(proc, cmd_w, evt_r, key=key, boot=boot, marker=marker)
+        return child
 
     def go(self, argv: list[str], *, cwd: str, env: dict[str, str], kill_grace: float, timeout: float = 5.0) -> None:
         """Write GO: the CLI's argv, checkout cwd, its WHOLE environment (the shim runs with a minimal one of its own,

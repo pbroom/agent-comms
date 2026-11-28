@@ -14,10 +14,13 @@ shim's pid and start time (DIAGNOSTIC ONLY: they confer no signalling or release
 signals them). NOT the launch secret: it stays in the node's memory (proof after a restart is a later PR's).
 
 - `commit(record)`: creates the file exclusively (never replacing one), writes it whole, syncs the file, then the
-  directory (and, the first time, the directory's parent). On any failure it removes what it created and raises.
-- `remove(launch_id)`: unlinks, then syncs the directory (a record already gone is no error).
+  directory (and the directory's parent until one parent sync has returned in this process: review round 1, R2). On
+  a failure it removes NOTHING and raises (review round 1, R3): a failed or partial record is left in place.
+- `remove(launch_id)`: unlinks, then syncs the directory (a record already gone is no error). After proof only: the
+  only unlink in the module.
 - `load()`: every record, or `JournalUnreadable` if the directory or ANY entry in it cannot be read, parsed or
-  validated (a bad file is never skipped). An absent directory is an empty journal, and nothing is created.
+  validated (a bad file is never skipped; a partial record a failed commit left is one: the reason names its path).
+  An absent directory is an empty journal, and nothing is created.
 
 `restore(groups, data_dir)` is the node's start-up step (agent_comms/node.py `Node.__init__`, before any thread, hub
 contact or admission): every record becomes a HELD reservation in the shared registry (`Groups.restore_held`); an
@@ -184,6 +187,9 @@ def _check_private(path: str) -> None:
 class Journal:
     def __init__(self, directory: Any):
         self.directory = os.path.abspath(os.fspath(directory))
+        # (Review round 1, R2) Whether THIS process has synced the journal directory's parent, so that the directory's
+        # own entry is durable: set only after a parent sync RETURNED (`make`). Until then every commit syncs it.
+        self._parent_synced = False
 
     def _path(self, launch_id: str) -> str:
         if type(launch_id) is not str or not _ID.fullmatch(launch_id):
@@ -191,24 +197,35 @@ class Journal:
         return os.path.join(self.directory, f"{launch_id}.json")
 
     def make(self) -> None:
-        """The journal's directory: made 0700 if absent (its parent too, 0700, as the node makes its data
-        directory), the parent synced when it was made; in either case checked private (an unsafe one is refused,
-        never repaired)."""
+        """The journal's directory: made 0700 if absent (its parent too, 0700, as the node makes its data directory)
+        and checked private (an unsafe one is refused, never repaired). (Review round 1, R2) The parent is synced
+        (the directory's own entry made durable) on every call until a parent sync has returned in this process,
+        whether or not this call made the directory: a first `mkdir` whose parent sync failed (or was interrupted)
+        is completed by the next commit, never skipped because the directory now exists. A sync that fails raises:
+        the commit that called this fails before it creates anything."""
         parent = os.path.dirname(self.directory)
         os.makedirs(parent, mode=0o700, exist_ok=True)
         try:
             os.mkdir(self.directory, 0o700)
         except FileExistsError:
             pass
-        else:
+        if not self._parent_synced:
             _sync_dir(parent)
+            self._parent_synced = True
         _check_private(self.directory)
 
     def commit(self, record: Record) -> None:
         """Make `record` durable: created exclusively (O_EXCL | O_NOFOLLOW, 0600; an existing record is never
-        replaced: FileExistsError), written whole, the file synced, then the directory. Any failure after the create
-        removes the file (and syncs the directory) before it raises: a failed commit leaves no record. (A record that
-        cannot be removed then is left; the next start restores it: held, the conservative direction.)"""
+        replaced: FileExistsError), written whole, the file synced, then the directory (and, until it has been synced
+        once in this process, the directory's parent first: `make`). Only a commit that RETURNS is durable.
+
+        (Review round 1, R3) A commit NEVER removes anything. Exclusive creation establishes ownership of the open
+        inode only, not of the pathname, which a same-user process can substitute before an unlink. So a failure
+        after the create LEAVES the file in place (partial, or whole but not known durable) and raises; the caller
+        abandons the launch before GO and fences that record until its proof (shimlaunch.launch). A partial record
+        found at a later start cannot be told from damage to a committed one: `load` raises JournalUnreadable for it,
+        admission stays closed, and the node's one WARNING names the file's path for a person to check and remove.
+        `remove` (after proof) is the only unlink in this module (tests/test_shim_journal.py pins it)."""
         record.check()
         data = (json.dumps(record.to_json(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
                 + "\n").encode("ascii")
@@ -218,23 +235,28 @@ class Journal:
         self.make()
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            try:
-                _write_all(fd, data)
-                _fullsync(fd)
-            finally:
-                os.close(fd)
-            _sync_dir(self.directory)
-        except BaseException:
-            try:
-                os.unlink(path)
-                _sync_dir(self.directory)
-            except OSError:
-                pass
-            raise
+            _write_all(fd, data)
+            _fullsync(fd)
+        finally:
+            os.close(fd)
+        _sync_dir(self.directory)
+
+    def exists(self, launch_id: str) -> bool:
+        """(Review round 1, R3) Whether anything may be at this launch's record path: True unless an lstat says there
+        is nothing there (any other failure to look is True: the conservative answer). Asked after a commit that
+        raised, to tell "nothing was created" from "a record, whole or partial, may be left"."""
+        try:
+            os.lstat(self._path(launch_id))
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
 
     def remove(self, launch_id: str) -> None:
         """Remove a record: unlink, then sync the directory. A record already gone is no error (the directory is
-        synced all the same, so a removal whose sync failed is completed by a retry). Raises OSError otherwise."""
+        synced all the same, so a removal whose sync failed is completed by a retry). Raises OSError otherwise. Called
+        only after the launch's proof (shimlaunch.release): the only unlink in this module."""
         path = self._path(launch_id)
         try:
             os.unlink(path)
@@ -246,26 +268,32 @@ class Journal:
         """Every record, or JournalUnreadable. Absent directory: []. The directory must be this user's private one,
         and EVERY entry in it a regular file named `<launch id>.json` holding one valid record line (no symlink, FIFO,
         subdirectory, stray or temporary name, partial or empty file is skipped: any of them makes the whole journal
-        unreadable)."""
+        unreadable). (Review round 1, R3) A partial record, which a commit that failed leaves in place, is
+        indistinguishable from damage to a committed one: it too is unreadable, and the reason names the file's full
+        path, so the node's one WARNING says which file a person must check (no CLI of that launch running) and
+        remove before the node, restarted, admits work again."""
         try:
             os.lstat(self.directory)
         except FileNotFoundError:
             return []
         except OSError as e:
-            raise JournalUnreadable(f"the journal directory cannot be looked at (errno {e.errno})") from None
+            raise JournalUnreadable(f"the journal directory {self.directory!r} cannot be looked at "
+                                    f"(errno {e.errno})") from None
         try:
             _check_private(self.directory)
             names = sorted(os.listdir(self.directory))
         except OSError as e:
-            raise JournalUnreadable(f"the journal directory is not readable as the node's own (errno {e.errno})") \
-                from None
+            raise JournalUnreadable(f"the journal directory {self.directory!r} is not readable as the node's own "
+                                    f"(errno {e.errno})") from None
         out = []
         for name in names:
             try:
                 out.append(self._read(name))
             except (OSError, ValueError, UnicodeDecodeError, RecursionError) as e:
                 what = f"errno {e.errno}" if isinstance(e, OSError) else str(e)
-                raise JournalUnreadable(f"journal entry {name!r}: {what}") from None
+                raise JournalUnreadable(f"journal entry {os.path.join(self.directory, name)!r}: {what} (a commit that "
+                                        f"failed, or damage: once no process of that launch runs, a person removes "
+                                        f"this file)") from None
         return out
 
     def _read(self, name: str) -> Record:

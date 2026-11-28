@@ -125,12 +125,14 @@ def test_an_unreadable_journal_closes_admission_for_the_whole_node_and_says_so_o
     other.mkdir()
     j = journal_of(nenv.node.log_dir)
     j.commit(record_for(nenv.node_dir))
-    (Path(j.directory) / f"{shimjournal.new_launch_id()}.json").write_text("{cut sho")
+    bad = Path(j.directory) / f"{shimjournal.new_launch_id()}.json"
+    bad.write_text("{cut sho")                  # (a partial record: a commit that failed, or damage; never skipped)
     caplog.set_level(logging.WARNING, logger="agent_comms")
     node = fresh_node(nenv)
     hostlog.flush(10)
     said = [rec for rec in caplog.records if rec.name == "agent_comms.node" and "journal" in rec.getMessage()]
     assert len(said) == 1 and said[0].levelno == logging.WARNING, [x.getMessage() for x in caplog.records]
+    assert str(bad) in said[0].getMessage(), "(review round 1, R3) the one WARNING names the offending file's path"
     assert node.groups.closed is not None
     for cwd in (nenv.node_dir, str(other)):
         assert node.groups.blocked(cwd)

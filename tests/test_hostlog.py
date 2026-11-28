@@ -245,9 +245,11 @@ BOUNDARIES = {
     ("shimchild.py", "self._wlock"): "a handle's command-endpoint lock: each write, and the pipe's close (a Lock)",
     ("shimchild.py", "self._rlock"): "a handle's event-endpoint lock: each read, and the pipe's close (a Lock)",
     ("shimchild.py", "self._wait_lock"): "a handle's wait-status lock: the one reap, and the test-only kill (a Lock)",
+    # (Ownership C3-2b-1, review round 1, R4.2) a supervised launch's own release lock (a `Launch` field)
+    ("shimlaunch.py", "release_lock"): "a launch's release lock: serialises its one release (an RLock, a Launch field)",
 }
 HOST_LOCK_ATTRS = {"lock", "ack_lock", "report_lock", "_steer_stop_lock",     # (their names where they are entered)
-                   "_wlock", "_rlock", "_wait_lock"}
+                   "_wlock", "_rlock", "_wait_lock", "release_lock"}
 NOT_BOUNDARIES = {
     ("session_host.py", "self.usage_lock"): "held only to copy or update the usage dict (clean_usage logs nothing)",
     ("node_sessions.py", "self.latch_lock"): "held only for a comparison and an assignment",

@@ -22,8 +22,10 @@ TOUCHED = [r for r in check.ROWS if r[0] in ("G", "N", "GS", "SC") and r not in 
 
 def test_this_prs_rows_exist():
     names = {r[1] for r in MINE}
-    assert len(MINE) == len(names) == 22, sorted(names)     # (19 new, 3 re-anchored)
-    for key in ("SJ", "SL", "GR", "NR", "SH"):
+    # (19 new and 3 re-anchored at first; review round 1: 1 removed, 16 new, 6 re-anchored, one of them a C1 row)
+    assert len(MINE) == len(names) == 38, sorted(names)
+    assert len([r for r in MINE if "C3-2b-1 r1" in r[1]]) == 22, sorted(names)
+    for key in ("SJ", "SL", "GR", "NR", "SH", "SHL"):
         assert key in check.FILES and key in check.ONLY and all((ROOT / t).exists() for t in check.ONLY[key])
 
 

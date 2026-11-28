@@ -83,13 +83,16 @@ def test_a_commit_never_replaces_a_record(journal, tmp_path):
 
 
 @pytest.mark.parametrize("where", ["write", "file-sync", "dir-sync"])
-def test_a_commit_that_fails_leaves_no_record(journal, tmp_path, monkeypatch, where):
-    """A commit that fails at any step raises, and removes what it created: no record is left (the launch then gives
-    up before GO: shimlaunch)."""
+def test_a_commit_that_fails_removes_nothing_and_raises(journal, tmp_path, monkeypatch, where):
+    """(Review round 1, R3) A commit that fails at any step after its create raises and removes NOTHING: exclusive
+    creation established ownership of the open inode only, and a same-user process could have substituted the
+    pathname before an unlink. The failed record is left in place (the launch then never writes GO, and fences it:
+    shimlaunch). A partial one makes the journal unreadable, naming the file's path (a human removes it); a whole one
+    loads (the next start restores it HELD)."""
     journal.commit(a_record(tmp_path))         # (makes the directory; this record is not the one that fails)
     kept = set(os.listdir(journal.directory))
     real_sync, real_write = shimjournal._fullsync, shimjournal._write_all
-    calls = []
+    calls, unlinked = [], []
 
     def sync(fd):
         calls.append(stat.S_IFMT(os.fstat(fd).st_mode))
@@ -101,12 +104,98 @@ def test_a_commit_that_fails_leaves_no_record(journal, tmp_path, monkeypatch, wh
         real_write(fd, data[:7])                # (a part of the record is on disk, then the write fails)
         raise OSError(28, "injected ENOSPC")
     monkeypatch.setattr(shimjournal, "_fullsync", sync)
+    monkeypatch.setattr(shimjournal.os, "unlink", lambda *a, **k: unlinked.append(a))
+    monkeypatch.setattr(shimjournal.os, "remove", lambda *a, **k: unlinked.append(a))
     if where == "write":
         monkeypatch.setattr(shimjournal, "_write_all", write)
+    r = a_record(tmp_path)
+    with pytest.raises(OSError):
+        journal.commit(r)
+    monkeypatch.undo()
+    assert unlinked == [], "a failed commit removes nothing"
+    path = os.path.join(journal.directory, f"{r.launch_id}.json")
+    assert set(os.listdir(journal.directory)) == kept | {f"{r.launch_id}.json"}, "the failed record is left in place"
+    if where == "write":
+        with pytest.raises(JournalUnreadable) as e:
+            journal.load()
+        assert path in e.value.reason, "the reason names the offending file's path"
+    else:
+        assert r in journal.load()
+
+
+def test_the_parent_is_synced_on_every_commit_until_this_process_has_synced_it(journal, tmp_path, monkeypatch):
+    """(Review round 1, R2) The first `mkdir` succeeds and the parent's sync fails: that commit fails (nothing is
+    created). The NEXT commit finds the directory already there and must still sync the parent (before: it skipped
+    it, so a record could be trusted whose directory entry would not survive a crash). Once a parent sync has
+    returned in this process (the journal's flag, set only after it), later commits sync the file and the directory
+    only; a new process (a new Journal) syncs the parent again on its first commit."""
+    (tmp_path / "node-logs").mkdir()
+    parent = os.path.dirname(journal.directory)
+    real = shimjournal._sync_dir
+    synced, fail = [], [True]
+
+    def sync_dir(path):
+        if path == parent and fail:
+            fail.clear()
+            raise OSError(5, "injected EIO")
+        synced.append(path)
+        real(path)
+    monkeypatch.setattr(shimjournal, "_sync_dir", sync_dir)
     with pytest.raises(OSError):
         journal.commit(a_record(tmp_path))
-    assert set(os.listdir(journal.directory)) == kept
-    assert len(journal.load()) == 1
+    assert os.path.isdir(journal.directory) and journal.load() == [], "made, but nothing committed"
+    journal.commit(a_record(tmp_path))
+    assert synced == [parent, journal.directory], "the parent is synced by the next commit"
+    synced.clear()
+    journal.commit(a_record(tmp_path))
+    assert synced == [journal.directory], "once synced in this process, not again"
+    synced.clear()
+    Journal(journal.directory).commit(a_record(tmp_path))
+    assert synced == [parent, journal.directory], "a new process syncs it once"
+    assert len(journal.load()) == 3
+
+
+FORBIDDEN_IN_COMMIT = {"unlink", "remove", "rename", "renames", "replace", "rmdir", "removedirs", "rmtree", "truncate",
+                       "ftruncate"}
+
+
+def test_commit_and_all_it_calls_never_unlink_remove_rename_or_replace():
+    """(Review round 1, R3), static: `Journal.commit`, and every function or method of the module it calls
+    (transitively, by name), names none of unlink, remove, rename, replace, rmdir (nor truncate, shutil); and
+    module-wide `os.unlink` is called only in `Journal.remove` (after proof), with no `os.remove`, `os.rename`,
+    `os.replace` or `os.rmdir` anywhere."""
+    tree = ast.parse(Path(shimjournal.__file__).read_text())
+    defs: dict[str, list] = {}
+    for top in tree.body:
+        if isinstance(top, ast.FunctionDef):
+            defs.setdefault(top.name, []).append((top.name, top))
+        elif isinstance(top, ast.ClassDef):
+            for m in top.body:
+                if isinstance(m, ast.FunctionDef):
+                    defs.setdefault(m.name, []).append((f"{top.name}.{m.name}", m))
+    todo, seen = [("Journal.commit", n) for q, n in defs["commit"] if q == "Journal.commit"], set()
+    assert todo
+    while todo:
+        qual, fn = todo.pop()
+        if qual in seen:
+            continue
+        seen.add(qual)
+        for n in ast.walk(fn):
+            name = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else None
+            assert name not in FORBIDDEN_IN_COMMIT and name != "shutil", (qual, ast.unparse(n))
+            if isinstance(n, ast.Call):
+                called = n.func.id if isinstance(n.func, ast.Name) else n.func.attr \
+                    if isinstance(n.func, ast.Attribute) else None
+                todo += defs.get(called, [])
+    assert {"Journal.commit", "Journal.make", "Journal._path", "Record.check", "Record.to_json", "_from_json",
+            "_sync_dir", "_fullsync", "_write_all", "_check_private"} <= seen, seen
+    owners: dict[str, set] = {}
+    for qual, fn in [x for v in defs.values() for x in v]:
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Attribute) and ast.unparse(n) in ("os.unlink", "os.remove", "os.rename",
+                                                                    "os.replace", "os.rmdir"):
+                owners.setdefault(ast.unparse(n), set()).add(qual)
+    assert owners == {"os.unlink": {"Journal.remove"}}, owners
 
 
 def test_remove_unlinks_and_syncs_the_directory_and_is_idempotent(journal, tmp_path, monkeypatch):
