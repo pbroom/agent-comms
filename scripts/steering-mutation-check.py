@@ -17,7 +17,10 @@ FILES = {"A": "agent_comms/providers/claude.py", "H": "agent_comms/session_host.
          "HS": "agent_comms/hosted.py", "NS": "agent_comms/node_sessions.py", "API": "agent_comms/api.py",
          "G": "agent_comms/node_groups.py", "D": "agent_comms/dispatch.py",
          "L": "agent_comms/hostlog.py", "N": "agent_comms/node.py",
-         "GS": "agent_comms/groupshim.py", "SC": "agent_comms/shimchild.py"}
+         "GS": "agent_comms/groupshim.py", "SC": "agent_comms/shimchild.py",
+         # (Ownership C3-2b-1) the journal, the launch helpers, and rows on existing files that run only the new tests
+         "SJ": "agent_comms/shimjournal.py", "SL": "agent_comms/shimlaunch.py", "GR": "agent_comms/node_groups.py",
+         "NR": "agent_comms/node.py", "SH": "agent_comms/shimchild.py"}
 ROWS = [('A', "F init naming S in N's bracket is a contradiction", '                if names_s:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")', '                if False:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")'),
     ('A', "F S's init: no origin", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and scalar is None'),
     ('A', "F S's init: no scalar", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and quiet'),
@@ -329,7 +332,7 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('GS', 'C3-1 a KILL request waits for the first TERM attempt + the grace', '        if self.clock() >= due:\n            self._kill_now()', '        if True:\n            self._kill_now()'),
     ('GS', 'C3-1 the one KILL sender refuses before the grace', '        if self.first_term_at is None or now < self.first_term_at + self.grace:', '        if self.first_term_at is None:'),
     ('GS', 'C3-1 an early KILL is remembered', '            self.kill_due = due if self.kill_due is None else min(self.kill_due, due)', '            pass'),
-    ('GS', 'C3-1 KILL repeated every grace after EOF', '        if self._signal(signal.SIGKILL) and self.eof:', '        if self._signal(signal.SIGKILL) and False:'),
+    ('GS', 'C3-1 KILL repeated every grace after EOF (re-anchored: C3-2b-1)', '        if self._signal(signal.SIGKILL):\n            self.kill_due = self.clock() + self.grace', '        if self._signal(signal.SIGKILL) and False:\n            self.kill_due = self.clock() + self.grace'),
     ('GS', 'C3-1 absence is required after the reap', '        if after is None or after != ():', '        if False:'),
     ('GS', 'C3-1 a failed post-reap listing is unproved', '        if after is None or after != ():', '        if after is not None and after != ():'),
     ('GS', "C3-1 the marker is bound to this launch (re-anchored: C3-2a, its MAC under the launch secret)", '        record["mac"] = marker_mac(self.key, record)', '        record["mac"] = marker_mac(bytes(KEY_BYTES), record)'),
@@ -343,7 +346,7 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('SC', "C3-1 the events are drained before the shim's exit is said", '        for _ in range(1024):\n            if self._pump():', '        for _ in range(0):\n            if self._pump():'),
     ('SC', 'C3-1 lost only once the shim has exited', '        if self._drained_exit() is None:\n            return False', '        if self._drained_exit() is None and False:\n            return False'),
     ('SC', 'C3-1 a stop before GO is never-start', '            if not self._went:\n                self._close_cmd()', '            if False:\n                self._close_cmd()'),
-    ('SC', 'C3-1 the command write is pinned under the lock', '    def _command(self, word: bytes) -> None:\n        with self._wlock:', '    def _command(self, word: bytes) -> None:\n        if True:'),
+    ('SC', 'C3-1 the command write is pinned under the lock (re-anchored: C3-2b-1)', '    def _command(self, word: bytes) -> None:\n        with hostlog.BOUNDARY, self._wlock:', '    def _command(self, word: bytes) -> None:\n        if True:'),
     ('SC', 'C3-1 GO waits with poll, not select (FD_SETSIZE)', '    p = select.poll()\n    p.register(fd, select.POLLOUT)\n    p.poll(max(0, int(timeout * 1000)))', '    select.select([], [fd], [], timeout)'),
     ('GS', 'C3-1 the grace runs from the TERM attempt, sent or failed (re-anchored twice)', '        at = self.clock()\n        if sig == signal.SIGTERM and self.first_term_at is None:\n            self.first_term_at = at     # the ATTEMPT starts the grace, whatever it answers\n        scope = "group" if group else "pid"\n        call = f"{\'killpg\' if group else \'kill\'}({self.pgid}, {name})"\n        try:\n            if group:\n                self.killpg(self.pgid, sig)\n            else:\n                self.kill(self.pgid, sig)\n', '        at = self.clock()\n        scope = "group" if group else "pid"\n        call = f"{\'killpg\' if group else \'kill\'}({self.pgid}, {name})"\n        try:\n            if group:\n                self.killpg(self.pgid, sig)\n            else:\n                self.kill(self.pgid, sig)\n            if sig == signal.SIGTERM and self.first_term_at is None:\n                self.first_term_at = at\n'),
     ('GS', 'C3-1 EOF stops the group (re-anchored)', '        self._kill_request()            # (the signal first; its diagnostic after)\n        self.diag("EOF on the command pipe', '        self.diag("EOF on the command pipe'),
@@ -373,7 +376,7 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('GS', 'C3-1R5 the kqueue wait is contained', '            except OSError as e:\n                if not self.degraded:', '            except ZeroDivisionError as e:\n                if not self.degraded:'),
     ('GS', 'C3-1R6 the watch is installed before RELEASE is written', '        self.gate("register", str(pid))\n        try:\n            self.kq.control([select.kevent(pid,', '        os.write(rel_w, b"G")\n        self.gate("register", str(pid))\n        try:\n            self.kq.control([select.kevent(pid,'),
     ('GS', 'C3-1 an unobserved exec is unknown, not failed', '        elif self.hs_eof and self.leader_exited and not self.released:\n', '        elif self.hs_eof and self.leader_exited:\n'),
-    ('SC', "C3-2a the secret is not on the shim's argv", '            argv = [python or sys.executable, "-I", "-c", _BOOT, _PACKAGE_ROOT,', '            argv = [python or sys.executable, "-I", "-X", "k=" + key.hex(), "-c", _BOOT, _PACKAGE_ROOT,'),
+    ('SC', "C3-2a the secret is not on the shim's argv (re-anchored: C3-2b-1)", '            argv = [python or sys.executable, "-I", "-S", "-c", _BOOT, _PACKAGE_ROOT,', '            argv = [python or sys.executable, "-I", "-S", "-X", "k=" + key.hex(), "-c", _BOOT, _PACKAGE_ROOT,'),
     ('GS', 'C3-2a the secret is in no diagnostic', '            shim.diag("the launch secret is received")', '            shim.diag(f"the launch secret is received: {shim.key.hex()}")'),
     ('SC', 'C3-2a the HMAC check', '        if not hmac.compare_digest(groupshim.marker_mac(key, rec), mac):\n            return None', '        if False:\n            return None'),
     ('SC', "C3-2a the release needs the shim's own terminal status (the pair's first half; re-anchored: review round 1)", '        if type(status) is not int or rec is None or (status, rec["outcome"]) not in PROOF_PAIRS:\n            return None', '        if rec is None:\n            return None'),
@@ -394,6 +397,26 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('GS', 'C3-2a R5 the shim never unlinks', '        return NOT_PUBLISHED, e.errno or -1     # the file is left as it is, possibly partial: never unlinked', '        os.unlink(path)\n        return NOT_PUBLISHED, e.errno or -1     # the file is left as it is, possibly partial: never unlinked'),
     ('GS', 'C3-2a R5 a file-sync failure is not a proof-bearing exit', '        return NOT_PUBLISHED, e.errno or -1     # the file is left as it is, possibly partial: never unlinked', '        return UNSYNCED, e.errno or -1     # the file is left as it is, possibly partial: never unlinked'),
     ('GS', 'C3-2a R2 nothing runs between a post-fork crash and the degraded stop', '        code = shim.stop_after_crash(e)', '        shim.diag(render_crash("crashed", *crash_frames(e)))\n        code = shim.stop_after_crash(e)'),
+    # (Ownership C3-2b-1) DESIGN_NOTES "Ownership C3-2b-1", its mutation check
+    ('GS', 'C3-2b-1 the shim repeats KILL after a command', '        if self._signal(signal.SIGKILL):\n            self.kill_due = self.clock() + self.grace', '        if self._signal(signal.SIGKILL) and self.eof:\n            self.kill_due = self.clock() + self.grace'),
+    ('SC', 'C3-2b-1 E the package root comes after the standard library', 'sys.path.append(sys.argv.pop(1))', 'sys.path.insert(0, sys.argv.pop(1))'),
+    ('SC', 'C3-2b-1 E the shim runs without site', '"-I", "-S", "-c", _BOOT', '"-I", "-c", _BOOT'),
+    ('SH', "C3-2b-1 D the handle's locks are host locks", '        with hostlog.BOUNDARY, self._wait_lock:\n            if self._status is not None:\n                return self._status', '        with self._wait_lock:\n            if self._status is not None:\n                return self._status'),
+    ('SJ', 'C3-2b-1 a commit never replaces a record', '        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)', '        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)'),
+    ('SJ', 'C3-2b-1 a failed commit leaves no record', '            try:\n                os.unlink(path)\n                _sync_dir(self.directory)\n            except OSError:\n                pass\n            raise', '            raise'),
+    ('SJ', 'C3-2b-1 one bad journal entry is never skipped', '            except (OSError, ValueError, UnicodeDecodeError, RecursionError) as e:\n                what = f"errno {e.errno}" if isinstance(e, OSError) else str(e)\n                raise JournalUnreadable(f"journal entry {name!r}: {what}") from None', '            except (OSError, ValueError, UnicodeDecodeError, RecursionError) as e:\n                continue'),
+    ('SJ', 'C3-2b-1 an unreadable journal closes admission', '        groups.close_admission(e.reason)\n        return e.reason', '        return e.reason'),
+    ('GR', 'C3-2b-1 closed admission refuses every start', '            if self.closed is not None:     # (C3-2b-1: admission closed for the whole node)\n                return False, None', '            if False:     # (C3-2b-1: admission closed for the whole node)\n                return False, None'),
+    ('GR', 'C3-2b-1 closed admission blocks every directory', '            if self.closed is not None:     # (C3-2b-1: admission closed: every directory)\n                return True', '            if False:     # (C3-2b-1: admission closed: every directory)\n                return True'),
+    ('GR', 'C3-2b-1 a restored reservation is HELD', '                self.entries.setdefault(k, {})[token] = [self.HELD, cwd]\n            self.held.add(token)', '                self.entries.setdefault(k, {})[token] = [self.LIVE, cwd]'),
+    ('NR', 'C3-2b-1 restore precedes admission (the restore at node start)', '        closed = shimjournal.restore(self.groups, log_dir)\n', '        closed = None\n'),
+    ('SL', 'C3-2b-1 the record is committed before GO', '        journal.commit(out.record)\n    except BaseException:', '        pass\n    except BaseException:'),
+    ('SL', 'C3-2b-1 no registry entry before the commit', '    if groups.blocked(cwd):\n        out.outcome = NOT_ADMITTED\n        return out', '    if not groups.start(cwd, out.token, lambda: None, k=k)[0]:\n        out.outcome = NOT_ADMITTED\n        return out'),
+    ('SL', 'C3-2b-1 a failure before the commit reaps the shim', '        handle.abandon_before_go(ABANDON_SECONDS)\n        raise', '        raise'),
+    ('SL', 'C3-2b-1 a failed or ambiguous GO keeps the reservation, fenced', '        handle.close_commands()\n        groups.stopping(out.token)', '        handle.close_commands()'),
+    ('SL', 'C3-2b-1 the record is removed before the reservation is lifted', '        journal.remove(launch.launch_id)\n        return True\n\n    def forget() -> None:\n        if pause is not None:\n            pause("record-removed", launch)\n    return groups.release(launch.token, proof, forget, fence=(launch.key, launch.cwd))', '        return True\n\n    def forget() -> None:\n        if pause is not None:\n            pause("record-removed", launch)\n    released = groups.release(launch.token, proof, forget, fence=(launch.key, launch.cwd))\n    if released:\n        journal.remove(launch.launch_id)\n    return released'),
+    ('SL', 'C3-2b-1 release only on evidence: lost() is none', '        if not (handle.empty() or handle.refused()):', '        if not (handle.empty() or handle.refused() or handle.lost()):'),
+    ('SL', 'C3-2b-1 release only on evidence: an exit alone is none', '        if not (handle.empty() or handle.refused()):', '        if handle.shim_poll() is None:'),
     ('N', 'LATCH the first signal latches before it raises', '        self.latched = True\n        raise KeyboardInterrupt', '        raise KeyboardInterrupt\n        self.latched = True'),
     ('N', 'LATCH a later signal only counts: it does not raise', '            self.further += 1\n            return\n', '            self.further += 1\n'),
     ('N', 'LATCH the exception route out of the loop latches', '        except BaseException:\n            latch.latch()', '        except BaseException:\n            pass'),
@@ -404,7 +427,12 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('N', 'an inherited ignored SIGINT stays ignored', '    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:\n', '    if True:\n'),
     ('N', 'LATCH the further signals are said', '            if self.further:\n', '            if False:\n')]
 # (Ownership C3-1) The shim's rows run only its own tests: nothing else imports groupshim or shimchild yet.
-ONLY = {"GS": ["tests/test_groupshim.py"], "SC": ["tests/test_groupshim.py"]}
+ONLY = {"GS": ["tests/test_groupshim.py"], "SC": ["tests/test_groupshim.py"],
+        # (Ownership C3-2b-1) the journal, the restore and the helpers have their own tests; the handle's host locks
+        # are pinned statically by test_hostlog
+        "SJ": ["tests/test_shim_journal.py", "tests/test_shim_restore.py"], "SL": ["tests/test_shim_launch.py"],
+        "GR": ["tests/test_shim_restore.py", "tests/test_shim_launch.py"], "NR": ["tests/test_shim_restore.py"],
+        "SH": ["tests/test_hostlog.py"]}
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
          "tests/test_ownership_c1.py", "tests/test_hostlog.py", "tests/test_shutdown_latch.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",

@@ -197,7 +197,9 @@ class Groups:
         keeps it with the process: session_host `_spawn`, review round 1 of the enabling PR, A3); else computed here."""
         k = key(cwd) if k is None else k
         with hostlog.BOUNDARY, self.lock:
-            if self.closed is not None or any(state in self._FENCE for state, _ in self.entries.get(k, {}).values()):
+            if self.closed is not None:     # (C3-2b-1: admission closed for the whole node)
+                return False, None
+            if any(state in self._FENCE for state, _ in self.entries.get(k, {}).values()):
                 return False, None
             self.entries.setdefault(k, {})[token] = [self.LIVE, cwd]
             try:
@@ -401,17 +403,17 @@ class Groups:
         """A group being stopped, HELD, or FENCED (a release under way) is in this directory, or admission is closed
         (C3-2b-1: then every directory is blocked)."""
         with hostlog.BOUNDARY, self.lock:
-            return self.closed is not None or any(state in self._FENCE
-                                                  for state, _ in self.entries.get(key(cwd), {}).values())
+            if self.closed is not None:     # (C3-2b-1: admission closed: every directory)
+                return True
+            return any(state in self._FENCE for state, _ in self.entries.get(key(cwd), {}).values())
 
     def restore_held(self, token: Hashable, keys: list, cwd: Any) -> None:
         """(Ownership C3-2b-1) Install a reservation restored from the supervised-launch journal (shimjournal.restore,
         at the node's start, before any admission), or one for a committed launch that `start` did not admit or whose
         admission an interrupt cut after its GO may have been written (shimlaunch.launch): HELD under `token`, a
-        SUPERVISED token only, under each of `keys` (its checkout's
-        identities), and in the HELD index. HELD fences admission and is proof-only; it leaves only through `release`
-        with a True proof (nothing releases a restored one in this PR). The keys are computed by the caller: no I/O
-        under the lock."""
+        SUPERVISED token only, under each of `keys` (its checkout's identities), and in the HELD index. HELD fences
+        admission and is proof-only; it leaves only through `release` with a True proof (nothing releases a restored
+        one in this PR). The keys are computed by the caller: no I/O under the lock."""
         if not (isinstance(token, tuple) and len(token) == 2 and token[0] == SUPERVISED and isinstance(token[1], str)):
             raise ValueError("a restored reservation takes a supervised token")
         with hostlog.BOUNDARY, self.lock:
