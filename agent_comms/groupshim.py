@@ -61,7 +61,6 @@ import signal
 import sys
 import threading
 import time
-import traceback
 
 from . import node_groups
 
@@ -102,7 +101,7 @@ EXIT_UNPROVED = 1       # after the reap the group was not proved absent: no mar
 EXIT_USAGE = 2          # bad arguments (or no waitid): nothing started, nothing published
 EXIT_NOGO = 3           # the CLI was never forked: marker `never_started`
 EXIT_MARKER_FAILED = 4  # the marker could not be published: no proof
-EXIT_CRASH = 5          # an unexpected exception (its traceback is in the log): no marker
+EXIT_CRASH = 5          # an unexpected exception (its frames are in the log): no marker
 EXIT_UNSYNCED = 6       # the marker is published and visible, but its directory's sync failed: not known durable
 EXIT_NOSECRET = 7       # (C3-2a) no single valid NONCE frame: nothing started, and no marker (none could be authenticated)
 
@@ -240,12 +239,15 @@ PUBLISHED, UNSYNCED, NOT_PUBLISHED = "published", "unsynced", "not_published"
 
 
 def write_marker(path: str, record: dict, fail_dir_sync: bool = False) -> tuple[str, int]:
-    """Publish `record` at `path` atomically: a temp file in the destination directory (exclusive, no symlink), its
-    sync, the rename, the directory's sync. (outcome, errno):
+    """Publish `record` at `path` atomically and WITHOUT replacing anything (C3-2a review round 1, R1): a temp file in
+    the destination directory (exclusive create, no symlink), its sync, a hard link of it at `path` (`link(2)` fails
+    with EEXIST if anything at all is there, a dangling symlink included, and never replaces it), the temp name's
+    removal, the directory's sync. Only a temp file THIS call created is ever unlinked. (outcome, errno):
     - PUBLISHED, 0: visible and synced (as durable as this machine's F_FULLFSYNC makes it);
-    - NOT_PUBLISHED, errno: a failure up to and including the rename (the temp file's write or sync among them): the
-      temp file is removed and NOTHING is visible at `path`;
-    - UNSYNCED, errno: the rename happened, so the complete marker is VISIBLE (and valid proof of absence for a living
+    - NOT_PUBLISHED, errno: a failure up to and including the link (the temp file's create, write or sync among them;
+      EEXIST when something is already at `path` or at the temp name): our temp file, if we made one, is removed,
+      whatever was already there is left exactly as it was, and NO marker of ours is visible at `path`;
+    - UNSYNCED, errno: the link happened, so the complete marker is VISIBLE (and valid proof of absence for a living
       node), but the directory's sync failed: whether it survives a crash is not known. A marker lost in a crash leaves
       the checkout held at the next start (C3-3), the conservative direction.
     `fail_dir_sync`: TEST-ONLY (`fail-dir-sync` in the test gate dir; the node never asks it): the directory's sync
@@ -253,23 +255,30 @@ def write_marker(path: str, record: dict, fail_dir_sync: bool = False) -> tuple[
     tmp = f"{path}.{os.getpid()}.tmp"
     data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
     fd = -1
+    created = False                 # (the temp name is guessable: only one THIS call created is ever unlinked)
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        created = True
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view):]
         _fullsync(fd)
         os.close(fd)
         fd = -1
-        os.rename(tmp, path)
+        os.link(tmp, path)          # never replaces: EEXIST if anything is at `path`
     except OSError as e:
         if fd >= 0:
             os.close(fd)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if created:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         return NOT_PUBLISHED, e.errno or -1
+    try:
+        os.unlink(tmp)              # (ours; the marker is the link at `path` now)
+    except OSError:
+        pass
     try:
         dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
@@ -288,6 +297,33 @@ def _close(fd: int) -> None:
         os.close(fd)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------- a crash's description, with no source lookup
+
+CRASH_FRAMES = 32               # the innermost frames a crash's description keeps
+
+
+def crash_frames(exc: BaseException) -> tuple[str, tuple]:
+    """(C3-2a review round 1, R2) What a crash's diagnostic says, taken WITHOUT any source lookup or I/O (no
+    `traceback.format_*`, no `linecache`): the exception's type name and the innermost CRASH_FRAMES (file, line,
+    function) triples, read from the traceback objects' code objects."""
+    frames: list = []
+    tb = getattr(exc, "__traceback__", None)
+    walked = 0
+    while tb is not None and walked < 100_000:
+        code = tb.tb_frame.f_code
+        frames.append((code.co_filename, tb.tb_lineno, code.co_name))
+        if len(frames) > CRASH_FRAMES:
+            del frames[0]
+        tb, walked = tb.tb_next, walked + 1
+    return type(exc).__name__, tuple(frames)
+
+
+def render_crash(what: str, name: str, frames: tuple) -> str:
+    """The crash's diagnostic text. Called only by the diagnostics writer thread (`Diag.put_lazy`), never on the
+    escalation path."""
+    return f"{what}: {name}" + "".join(f"\n    at {f}:{line} in {fn}" for f, line, fn in frames)
 
 
 # ---------------------------------------------------------------- diagnostics, off the escalation path
@@ -319,6 +355,28 @@ class Diag:
             self.lines.append(line)
             self.cond.notify()
 
+    def put_lazy(self, render, *args) -> None:
+        """(C3-2a review round 1, R2) A line whose TEXT is made by the writer thread, `render(*args)`, never by the
+        caller: whatever rendering costs (or stalls on) is the writer's alone. Queued like `put`, stamped now."""
+        item = (f"{self.clock():.6f} shim {os.getpid()} ", render, args)
+        with self.cond:
+            if self.failed or len(self.lines) >= DIAG_CAPACITY:
+                self.dropped += 1
+                return
+            self.lines.append(item)
+            self.cond.notify()
+
+    @staticmethod
+    def _text(item) -> str:
+        if isinstance(item, str):
+            return item
+        prefix, render, args = item
+        try:
+            body = str(render(*args))
+        except Exception:
+            body = "(a line that could not be rendered)"
+        return prefix + body + "\n"
+
     def start(self) -> None:
         if self.thread is not None or self.failed or self.path is None:
             return
@@ -347,7 +405,7 @@ class Diag:
                 batch, self.lines, self.busy = self.lines, [], True
             if fd is None:
                 continue
-            data = "".join(batch).encode("utf-8", "replace")
+            data = "".join(self._text(item) for item in batch).encode("utf-8", "replace")
             try:
                 while data:
                     data = data[os.write(fd, data):]
@@ -476,6 +534,7 @@ class Shim:
         self.kq: select.kqueue | None = None
         self.watching = False           # the child's exit (and exec) are registered with the kqueue
         self.rel_w: int | None = None   # RELEASE's write end, from the fork until it is written (or not) and closed
+        self.crash: BaseException | None = None     # (the degraded stop's exception, described once, after its TERM)
 
     # -------- diagnostics and events
 
@@ -485,6 +544,16 @@ class Shim:
             return
         try:
             self.sink.put(msg)
+        except Exception:
+            pass
+
+    def diag_crash(self, what: str, exc: BaseException) -> None:
+        """A crash's diagnostic (R2): its frames taken now from the code objects (memory only), its text rendered by the
+        diagnostics thread. Contained: it cannot raise into, wait in or reorder the caller."""
+        if self.sink is None:
+            return
+        try:
+            self.sink.put_lazy(render_crash, what, *crash_frames(exc))
         except Exception:
             pass
 
@@ -809,7 +878,7 @@ class Shim:
 
     # -------- (C3-2a, F2) after an unexpected exception past the fork: the degraded stop
 
-    def stop_after_crash(self) -> int:
+    def stop_after_crash(self, exc: BaseException | None = None) -> int:
         """An unexpected exception after the fork (a bug) must not leave the group running unsupervised. A minimal
         loop, with as little of the normal machinery as it can: no kqueue, no commands. By the existing anchor and
         target rules (`_signal`): a TERM now (the grace still counted from the FIRST TERM attempt, kept if one was
@@ -817,13 +886,22 @@ class Shim:
         exit polled by `waitid`; then the SAME verified release (`_check_empty`: listing, latch, reap, second listing,
         authenticated marker). Before every signal and before the proof, the kernel must confirm the anchor (our own
         unreaped child, `child_state`); if it cannot, nothing more is signalled and nothing is published: exit 5, no
-        marker (the node keeps the checkout held). A crash inside this loop ends it the same way."""
+        marker (the node keeps the checkout held). A crash inside this loop ends it the same way.
+
+        (Review round 1, R2) It is the FIRST thing that runs after the exception: the crash is described only after
+        the first TERM (or the refusal), from its code objects alone, and rendered by the diagnostics thread."""
+        self.crash = exc
         try:
             return self._stop_after_crash()
         except BaseException:
             self.latched = True
             self.diag("the degraded stop itself failed: no more signals, no marker")
             return EXIT_CRASH
+
+    def _describe_crash(self) -> None:
+        if self.crash is not None:
+            exc, self.crash = self.crash, None
+            self.diag_crash("crashed after the fork; the degraded stop took over", exc)
 
     def _anchor_confirmed(self) -> bool:
         return self.anchored() and child_state(self.pgid) is not None
@@ -832,6 +910,7 @@ class Shim:
         self.latched = True             # (no signal from here, for good)
         self.emit("UNPROVED")
         self.diag("after the crash the anchor cannot be established: no signal, no marker")
+        self._describe_crash()
         return EXIT_CRASH
 
     def _take_establishment(self) -> None:
@@ -860,6 +939,7 @@ class Shim:
         if self.first_term_at is None:
             return self._unanchored()
         self.kill_due = self.first_term_at + self.grace     # the ORIGINAL first TERM attempt's grace
+        self._describe_crash()          # (after the first TERM: queued, rendered by the diagnostics thread)
         while True:
             if self.kill_due is not None and self.clock() >= self.kill_due:
                 if not self._anchor_confirmed():
@@ -1316,17 +1396,13 @@ def _main(args: dict, sink: Diag) -> int:
         if done is not None:
             return done
         code = shim.run()
-    except BaseException:
-        try:
-            trace = traceback.format_exc()
-        except BaseException:
-            trace = "(no traceback)"
+    except BaseException as e:
         if shim.pgid is None:
-            shim.diag("crashed before the fork, no marker:\n" + trace)
+            shim.diag_crash("crashed before the fork, no marker", e)
             return EXIT_CRASH
-        # (C3-2a, F2) After the fork a crash must still stop the group: the degraded stop, the same proof.
-        shim.diag("crashed after the fork: the degraded stop takes over:\n" + trace)
-        code = shim.stop_after_crash()
+        # (C3-2a, F2; review round 1, R2) After the fork a crash must still stop the group, and NOTHING runs before the
+        # degraded stop: no traceback formatting, no source lookup. It describes the crash itself, after its TERM.
+        code = shim.stop_after_crash(e)
     if shim.dropped:
         shim.diag(f"events dropped: {shim.dropped} (after EOF: {shim.dropped_after_eof})")
     if sink.dropped:

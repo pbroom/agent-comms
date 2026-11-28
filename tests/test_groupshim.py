@@ -282,9 +282,8 @@ class Kit:
             if c.shim_poll() is None:
                 c.close_commands()              # (EOF: the shim stops its own group, then exits)
                 if not wait_for(lambda: c.shim_poll() is not None, 15):
-                    c.proc.kill()               # (its own handle; not yet reaped)
-            if c.proc.returncode is None:
-                c.proc.wait(timeout=10)
+                    c._kill_shim()              # (its own handle; only while it has not reaped it)
+            wait_for(lambda: c.shim_poll() is not None, 10)
             c.close()
         for p in self.procs:
             if p.poll() is None:
@@ -892,7 +891,7 @@ def test_c6_signal_dispositions_are_what_a_direct_spawn_gives_and_an_ignored_sig
     assert out["leader_exit"] == 4
     assert out["zombie"][0] == SZOMB and out["zombie"][1] == out["shim_pid"], out
     assert out["m1"] and out["m2"]
-    assert None not in out["shim_status"] and out["empty"] == [False, False], out
+    assert out["shim_status"] == ["unknown", "unknown"] and out["empty"] == [False, False], out
 
 
 # ---------------------------------------------------------------- C7: the handle's unit matrix
@@ -977,7 +976,7 @@ def test_c7_a_shim_that_exits_without_a_marker_is_lost(kit):
     c = kit.run(kit.argv(wait_abort=True))
     assert wait_event(c, "STARTED")
     assert not c.lost() and not c.empty()
-    c.proc.kill()
+    c._kill_shim()
     assert shim_exit(c) == -signal.SIGKILL
     assert c.lost() and not c.empty() and c.poll() is None
     Path(kit.abort).write_text("1")         # (the orphaned CLI stops by itself)
@@ -1019,6 +1018,7 @@ def test_c7_a_marker_of_another_launch_or_boot_is_no_proof(kit, tmp_path):
     for other in (record(b"o" * groupshim.KEY_BYTES, c.boot), record(c._key, other_boot)):
         Path(c.marker).write_text(json.dumps(other) + "\n")
         assert not c.empty()
+    os.unlink(c.marker)                     # (the test's own file: the shim never replaces one, review round 1 R1)
     c.close_commands()
     assert shim_exit(c) == groupshim.EXIT_NOGO
     assert c.empty()
@@ -1026,8 +1026,8 @@ def test_c7_a_marker_of_another_launch_or_boot_is_no_proof(kit, tmp_path):
 
 def test_c7_the_empty_event_alone_is_no_proof(kit):
     c = kit.run(["/bin/sh", "-c", "exit 0"])
-    assert wait_for(lambda: c.proc.poll() is not None) and c.proc.returncode == 0   # (reaped; nothing pumped yet)
-    Path(c.marker).write_text(json.dumps(record(b"x" * groupshim.KEY_BYTES, c.boot)) + "\n")
+    assert wait_for(lambda: groupshim.waitid_nowait(c.pid) == 0)    # (exited, not reaped; nothing pumped yet)
+    put_marker(c, json.dumps(record(b"x" * groupshim.KEY_BYTES, c.boot)).encode() + b"\n")
     assert c.shim_poll() == 0 and kinds(c) == ["STARTED", "LEADER_EXIT", "EMPTY"], "drained before the exit is said"
     assert not c.empty(), "EMPTY was said, but the marker is not this launch's"
 
@@ -1040,7 +1040,7 @@ def test_c7_a_stale_handle_against_its_successor(kit):
     assert wait_event(first, "STARTED")
     second = kit.start()
     assert second.marker != first.marker
-    first.proc.kill()                       # (the first shim: lost, no marker; its CLI stops at `abort`)
+    first._kill_shim()                      # (the first shim: lost, no marker; its CLI stops at `abort`)
     assert shim_exit(first) == -signal.SIGKILL
     second.go(["/bin/sh", "-c", "exit 0"], cwd=str(kit.work), env=ENV, kill_grace=1.0)
     assert shim_exit(second) == groupshim.EXIT_EMPTY
@@ -1611,7 +1611,7 @@ def test_r5_a_child_whose_shim_dies_before_release_never_enters_the_checkout(kit
     pid = int(pid)
     time.sleep(0.5)                         # (time for the child to reach its read of RELEASE)
     assert cwd_of(pid) == "/", f"waiting for RELEASE, the child is not in the checkout ({cwd_of(pid)!r})"
-    c.proc.kill()                           # (its own handle; the shim never wrote RELEASE)
+    c._kill_shim()                          # (its own handle; the shim never wrote RELEASE)
     assert shim_exit(c) == -signal.SIGKILL
     assert wait_for(lambda: kinfo(pid) is None), "the child exited by itself (and launchd reaped it)"
     assert not (c.gate_dir / "after-chdir.at").exists(), "it never entered the checkout"
@@ -1784,7 +1784,8 @@ for c in cands[:100]:
     forged.append({"v": 1, "nonce": c, "boot": boot, "outcome": "empty", "cli_pid": pid, "leader_exit": 0})
 lines = [json.dumps(r).encode() + b"\n" for r in forged]
 best = lines[0]
-put(marker, best)
+if not spec.get("escape"):
+    put(marker, best)
 if spec.get("escape"):
     # A descendant that leaves the group (as Claude Code's own tool commands do) and outlives the CLI: once the shim
     # has published its own marker, it puts the forgery back in its place.
@@ -1829,8 +1830,9 @@ def test_f1_the_supervised_cli_cannot_forge_the_proof(kit):
     under the directory that holds its marker and the shim's logs, and writes the best marker it can (06866a5: the
     nonce from the argv; now: an HMAC keyed by every token it saw). While it runs, `empty()` is False and `poll()` None;
     every forgery it made is refused by the authenticator ALONE; the secret is in none of what it read, in no event and
-    in no diagnostic line. Once it exits, the shim proves the group gone and publishes its own marker: `empty()`.
-    (On 06866a5 `empty()` is True while the forger still runs.)"""
+    in no diagnostic line. Once it exits, the shim proves the group gone but (review round 1, R1) does not replace the
+    forgery left at the marker path: nothing published, exit 4, `lost()` (held), the file untouched. (On 06866a5
+    `empty()` is True while the forger still runs.)"""
     c = kit.start()
     rep, go = kit.path("forger-report"), kit.path("forger-go")
     c.go(forger_argv(kit, look=str(c.dir), report=rep, until=go), cwd=str(kit.work), env=ENV, kill_grace=1.0)
@@ -1851,12 +1853,14 @@ def test_f1_the_supervised_cli_cannot_forge_the_proof(kit):
         put_marker(c, line.encode())
         assert shimchild.read_marker(c.marker, cred(c), c.boot) is None, line
         assert not c.empty()
+    last = Path(c.marker).read_bytes()
     Path(go).write_text("")
-    assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
-    assert c.empty() and not c.lost() and c.poll() == 0
-    assert Path(c.marker).read_text() not in seen["forged"], "the proof is the shim's own marker"
+    # (review round 1, R1) A forgery left AT the marker path is never replaced: the shim publishes nothing, `lost()`.
+    assert shim_exit(c) == groupshim.EXIT_MARKER_FAILED, c.events
+    assert Path(c.marker).read_bytes() == last and ("MARKER_FAILED", "17") in c.events
+    assert not c.empty() and c.lost() and c.poll() == 0
     log = c.dir / "shim.log"
-    assert wait_for(lambda: "exit 0" in log.read_text())
+    assert wait_for(lambda: "exit 4" in log.read_text())
     assert key not in log.read_text() and key not in " ".join(" ".join(e) for e in c.events)
 
 
@@ -1880,7 +1884,7 @@ def test_f1_a_marker_replayed_with_one_field_changed_is_no_proof(kit):
     one digit of the MAC), is refused; put back unchanged, it is proof again. (On 06866a5 a changed exit code is
     accepted.)"""
     c = kit.run(["/bin/sh", "-c", "exit 5"])
-    assert c.proc.wait(timeout=WAIT) == groupshim.EXIT_EMPTY     # (its own Popen; the proof not asked for yet)
+    assert shim_exit(c) == groupshim.EXIT_EMPTY     # (its status observed; the proof not asked for yet)
     good = Path(c.marker).read_bytes()
     rec = json.loads(good)
     assert shimchild.read_marker(c.marker, cred(c), c.boot) == rec and rec["leader_exit"] == 5
@@ -1901,7 +1905,7 @@ def test_f1_a_marker_copied_from_another_launch_is_no_proof(kit):
     """F1: two launches on the same boot, both proved; A's marker copied over B's is no proof for B. (This already
     held on 06866a5, by the nonce: a regression pin.)"""
     a, b = kit.run(["/bin/sh", "-c", "exit 0"]), kit.run(["/bin/sh", "-c", "exit 0"])
-    assert a.proc.wait(timeout=WAIT) == b.proc.wait(timeout=WAIT) == groupshim.EXIT_EMPTY
+    assert shim_exit(a) == shim_exit(b) == groupshim.EXIT_EMPTY
     put_marker(b, Path(a.marker).read_bytes())
     assert not b.empty() and b.lost() and a.empty()
     assert shimchild.read_marker(b.marker, cred(b), b.boot) is None
@@ -1950,7 +1954,7 @@ def test_f1_every_other_pair_is_refused(kit, case):
     elif case == "killed":
         c = kit.run(kit.argv(wait_abort=True))
         assert wait_event(c, "STARTED")
-        c.proc.kill()                       # (its own handle)
+        c._kill_shim()                      # (its own handle)
         assert shim_exit(c) == -signal.SIGKILL
         Path(kit.abort).write_text("1")     # (the orphaned CLI stops by itself)
         put_marker(c, valid_record(c, "empty", c.cli_pid, 7))
@@ -2205,3 +2209,125 @@ def test_f5_every_statement_of_the_forked_child_is_inside_its_failure_boundary()
     inner = spawn.body[0]
     assert len(inner.body) == 1 and ast.unparse(inner.body[0]).startswith("_child(")
     assert _is_os_exit(inner.finalbody)
+
+
+# ---------------------------------------------------------------- C3-2a review round 1 (Sol on 7047f3a)
+
+@pytest.mark.parametrize("outcome", ["empty", "never_started"])
+def test_rr1_publishing_never_replaces_a_file_at_the_marker_path(kit, outcome):
+    """R1: a same-user process learns the marker path (it is on the shim's argv) and puts a file there while the CLI
+    runs (or before GO). The shim's publish does not replace it: the file is there byte for byte afterwards, no marker
+    of ours exists, `MARKER_FAILED 17` (EEXIST) and exit 4, in no release pair: `empty()` False, `lost()` (held). No
+    temp file of ours is left. (On 7047f3a the shim's rename replaces the file and exits 0: proof.)"""
+    squat = b"someone else's file\n"
+    if outcome == "never_started":
+        c = kit.start()
+        Path(c.marker).write_bytes(squat)
+        c.close_commands()
+    else:
+        go = kit.path("cli-go")
+        c = kit.run(kit.argv(until=go))
+        assert wait_event(c, "STARTED")
+        Path(c.marker).write_bytes(squat)
+        Path(go).write_text("")
+    assert shim_exit(c) == groupshim.EXIT_MARKER_FAILED, c.events
+    assert Path(c.marker).read_bytes() == squat, "not replaced"
+    assert ("MARKER_FAILED", "17") in c.events and ("EMPTY",) not in c.events, c.events
+    assert not c.empty() and c.lost() and not c.refused()
+    assert not [n for n in os.listdir(c.dir) if n.endswith(".tmp")], "no temp file of ours left behind"
+
+
+def test_rr1_a_temp_name_the_shim_did_not_create_is_never_unlinked(kit):
+    """R1: a file sits at the shim's own temp name (`<marker>.<shim pid>.tmp`, guessable) when it publishes. The
+    exclusive create fails, and the shim leaves that file alone: it is there byte for byte, nothing is published,
+    exit 4, `lost()`. (On 7047f3a the shim unlinks it after its failed create.)"""
+    go = kit.path("cli-go")
+    c = kit.run(kit.argv(until=go))
+    assert wait_event(c, "STARTED")
+    tmp = Path(f"{c.marker}.{c.pid}.tmp")
+    tmp.write_bytes(b"not the shim's\n")
+    Path(go).write_text("")
+    assert shim_exit(c) == groupshim.EXIT_MARKER_FAILED, c.events
+    assert tmp.read_bytes() == b"not the shim's\n", "not unlinked"
+    assert not os.path.exists(c.marker) and not c.empty() and c.lost()
+
+
+STALLING_PYTHON = r'''#!/bin/sh
+# TEST-ONLY: the real interpreter for the shim, with every way of describing a crash made to stall (until `abort`):
+# the traceback module's formatters, linecache, and the shim's own rendering function.
+shift 2
+exec PY -I -c '
+import os, sys, time
+sys.path.insert(0, sys.argv[2])
+def stall(*a, **k):
+    end = time.monotonic() + 60
+    while time.monotonic() < end and not os.path.exists(ABORT):
+        time.sleep(0.05)
+    return ""
+import traceback, linecache
+for name in ("format_exc", "format_exception", "format_exception_only", "format_tb", "format_stack", "extract_tb",
+             "extract_stack", "print_exc", "print_exception", "print_tb"):
+    setattr(traceback, name, stall)
+linecache.getline = linecache.getlines = linecache.updatecache = linecache.checkcache = stall
+from agent_comms import groupshim
+groupshim.render_crash = stall
+exec(compile(sys.argv.pop(1), "<boot>", "exec"))
+' "$@"
+'''
+
+
+def test_rr2_a_stalled_crash_description_never_holds_up_the_degraded_stop(kit):
+    """R2: the shim runs under an interpreter whose every crash formatter stalls (the traceback module, linecache, and
+    the shim's own `render_crash`). After an injected crash past the fork, with the CLI and its member ignoring TERM,
+    the degraded stop's TERM comes at once, the KILL at the grace, then the proof and the marker: exit 0 within
+    seconds. (On 7047f3a `traceback.format_exc()` runs first and stalls: no TERM for a minute.)"""
+    wrapper = kit.tmp / "stalling-python"
+    wrapper.write_text(STALLING_PYTHON.replace("PY", PY, 1).replace("ABORT", json.dumps(kit.abort)))
+    os.chmod(wrapper, 0o755)
+    up, cli_term, member_term, mrep = (kit.path(n) for n in ("up", "cli-term", "member-term", "member-report"))
+    c = kit.start(gate_files=("armed",), python=str(wrapper))
+    c.go(kit.argv(ignore_term=True, term_file=cli_term, started=up, wait_abort=True,
+                  member={"term_file": member_term, "report": mrep, "close_stdio": True}),
+         cwd=str(kit.work), env=ENV, kill_grace=1.0)
+    assert wait_event(c, "STARTED") and wait_for(lambda: os.path.exists(up) and read_json(mrep))
+    (c.gate_dir / "crash-in-loop").write_text("")
+    t0 = time.monotonic()
+    raw_write(c, b"NOP\n")                  # (wakes the loop: it crashes at its next turn)
+    assert wait_for(lambda: os.path.exists(cli_term), 5), "the degraded stop's TERM came at once"
+    assert shim_exit(c, 10) == groupshim.EXIT_EMPTY, c.events
+    assert time.monotonic() - t0 < 8.0
+    assert ("CRASHED",) in c.events and ("SENT", "KILL", "group") in c.events and c.empty()
+    assert os.path.exists(member_term)
+
+
+@pytest.mark.parametrize("case", ["proved", "refused"])
+def test_rr3_a_shim_reaped_by_another_waiter_has_an_unknown_status_and_proves_nothing(kit, case):
+    """R3: the shim exits (0 with its marker, or 7 refused) and ANOTHER waiter in this process reaps it before the
+    handle looks. The handle never saw a status: UNKNOWN, which is no release pair and no refusal: `empty()` False,
+    `refused()` False, `lost()` True (held). (On 7047f3a `Popen.poll()` turns ECHILD into exit 0: `empty()` True.)"""
+    if case == "proved":
+        c = kit.run(["/bin/sh", "-c", "exit 0"])
+    else:
+        c = kit.start(send_secret=False)
+        c.close_commands()
+    assert wait_for(lambda: groupshim.waitid_nowait(c.pid) is not None), "the shim exited (unreaped)"
+    if case == "proved":
+        assert wait_for(lambda: os.path.exists(c.marker))
+    assert os.waitpid(c.pid, os.WNOHANG)[0] == c.pid        # (another waiter takes the status)
+    assert not c.empty() and not c.refused() and c.lost()
+    assert c.shim_poll() == shimchild.STATUS_UNKNOWN
+    assert shimchild.read_marker(c.marker, c._key, c.boot) is not None or case == "refused"
+
+
+def test_rr3_popen_cannot_reap_the_shim_behind_the_handle(kit):
+    """R3: the shim has exited, unreaped. Its `Popen`'s own `poll()` and `wait()` do not reap it (the handle owns the
+    wait status): it is still this process's unreaped child afterwards, and the handle then observes its real status.
+    (On 7047f3a `Popen.poll()` reaps it.)"""
+    c = kit.run(["/bin/sh", "-c", "exit 0"])
+    assert wait_for(lambda: groupshim.waitid_nowait(c.pid) is not None), "the shim exited (unreaped)"
+    p = c._popen
+    p.poll()
+    p.wait(timeout=1)
+    p.kill()                                # (a no-op too: Popen signals nothing it thinks is over)
+    assert groupshim.waitid_nowait(c.pid) == 0, "still unreaped: Popen did not take its status"
+    assert c.shim_poll() == groupshim.EXIT_EMPTY and c.empty()

@@ -10,7 +10,9 @@ hold in place of the CLI's `Popen` once the wiring PRs wire it in. NOT used by a
 - It has no thread. Events are pumped, non-blocking, in `poll()`, `empty()` and `lost()`; before a shim exit is
   classified, the event pipe is drained to EOF.
 - Three facts, never conflated: the CLI's exit (`poll()`: the `LEADER_EXIT` code, or the exit code the release pair's
-  marker carries, or None), the shim's exit (`shim_poll()`: the node's own child, `Popen.poll()`), and the group's
+  marker carries, or None), the shim's exit (`shim_poll()`: the node's own child, reaped in ONE place, the handle's
+  own `waitpid` (`_observe`); STATUS_UNKNOWN if anyone else reaped it; its `Popen` is neutralised and never reaps or
+  signals it, review round 1 R3), and the group's
   absence (`empty()`: the RELEASE PAIR, C3-2a: the shim's own terminal exit status, observed by this handle, AND an
   authentic marker (HMAC under the launch secret) whose outcome belongs with that status; never a marker alone, never
   the `EMPTY` event). `empty()` is proof of absence for the living node that reads it; proof after a node restart is
@@ -18,7 +20,7 @@ hold in place of the CLI's `Popen` once the wiring PRs wire it in. NOT used by a
   is said by `UNSYNCED`): a marker lost in a crash leaves the checkout held at the next start, the conservative
   direction. A LOST shim (`lost()`) leaves `poll()` at None forever: callers must ask `lost()` on their own, before
   they read None as "still running" (every reap and shutdown path). `refused()`: the shim exited before any fork
-  (exit 2 or 7), so nothing was ever started.
+  (an OBSERVED exit 2 or 7), so nothing was ever started. An UNKNOWN status is never proof and never a refusal: LOST.
 - `terminate()`/`kill()` write `TERM`/`KILL`: one non-blocking write each, under the handle's own lock, which also
   guards closing the pipe, so a concurrent retirement cannot close the fd and have its number reused for another
   shim's pipe mid-write. A closed or broken pipe raises `BrokenPipeError`; a full one `BlockingIOError` (both
@@ -41,7 +43,6 @@ import json
 import os
 import secrets
 import select
-import signal
 import stat
 import subprocess
 import sys
@@ -174,10 +175,29 @@ def marker_proves(path: str, key: bytes, boot: str) -> bool:
     return read_marker(path, key, boot) is not None
 
 
+# (C3-2a review round 1, R3) The shim's wait status is the HANDLE's: `ShimChild._observe` is the one place it is reaped.
+STATUS_UNKNOWN = "unknown"          # the shim was reaped by someone else (or the kernel): no status was observed
+
+
+class _HandleOwnsStatus:
+    """Put in the shim's `Popen.returncode` at once: `Popen.poll()`, `wait()`, `send_signal()` and `__del__` (and
+    subprocess's `_cleanup` of collected Popens) all act only while `returncode` is None, so none of them ever calls
+    `waitpid` on the shim, or signals it. Only `ShimChild._observe` reaps it."""
+
+    def __repr__(self) -> str:
+        return "<the shim's status is owned by its ShimChild>"
+
+
+_OWNED = _HandleOwnsStatus()
+
+
 class ShimChild:
     def __init__(self, proc: subprocess.Popen, cmd_w: int, evt_r: int, *, key: bytes, boot: str, marker: str):
-        self.proc = proc
+        proc.returncode = _OWNED        # (R3: before anything else can poll it; see `_HandleOwnsStatus`)
+        self._popen = proc              # (for its stdio pipes only; never polled, waited on or signalled)
         self.pid = proc.pid             # the shim's (see the module text)
+        self._wait_lock = threading.Lock()
+        self._status: int | str | None = None   # None while running; then the observed status, or STATUS_UNKNOWN
         # The launch secret (C3-2a): sent once, in the NONCE frame; never in an argv, an environment, an event or a log.
         self._key = key
         self.boot, self.marker = boot, marker
@@ -387,10 +407,36 @@ class ShimChild:
             elif kind == "NOSECRET" and args:
                 self.nosecret = args[0]
 
-    def _drained_exit(self) -> int | None:
-        """The shim's exit status, with every event it wrote taken first (its write end is closed once it exited, and
-        no other process holds it, so the drain ends at EOF)."""
-        code = self.proc.poll()
+    def _observe(self) -> int | str | None:
+        """(C3-2a review round 1, R3) THE one place the shim is reaped: `waitpid(pid, WNOHANG)` called here, the real
+        status recorded exactly once (as `Popen.returncode` reads: negative for a signal). ECHILD (someone else reaped
+        it, or the kernel did, for a process that ignores SIGCHLD or sets SA_NOCLDWAIT) is STATUS_UNKNOWN: no status was
+        observed, and none is ever made up. None while it runs."""
+        with self._wait_lock:
+            if self._status is not None:
+                return self._status
+            try:
+                pid, raw = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self._status = STATUS_UNKNOWN
+                return self._status
+            except OSError:
+                return None
+            if pid != self.pid:
+                return None
+            self._status = os.waitstatus_to_exitcode(raw)
+            return self._status
+
+    def _kill_shim(self, sig: int = 9) -> None:     # (9: SIGKILL)
+        """TEST-ONLY: signal the shim itself, only while this handle has not reaped it (its pid is pinned until then)."""
+        with self._wait_lock:
+            if self._status is None:
+                os.kill(self.pid, sig)
+
+    def _drained_exit(self) -> int | str | None:
+        """The shim's exit status (`_observe`), with every event it wrote taken first once it is over (its write end
+        is closed once it exited, and no other process holds it, so the drain ends at EOF)."""
+        code = self._observe()
         if code is None:
             self._pump()
             return None
@@ -402,19 +448,16 @@ class ShimChild:
     # -------- the three facts
 
     def _release_pair(self) -> dict | None:
-        """(C3-2a, F1.4) The proof, while the node lives: BOTH the shim's own terminal exit status, observed by this
-        handle (the shim is the node's own unreaped child: the CLI cannot forge it), AND an authentic marker
-        (`read_marker`) whose outcome belongs with that status (`PROOF_PAIRS`). A marker alone, with the shim running
-        or exited otherwise, proves nothing. Once both held, the pair is kept (the reaped status cannot change)."""
+        """(C3-2a, F1.4) The proof, while the node lives: BOTH the shim's own terminal exit status, OBSERVED by this
+        handle's own `waitpid` (`_observe`; the shim is the node's own unreaped child: the CLI cannot forge it; an
+        UNKNOWN status is no status), AND an authentic marker (`read_marker`) whose outcome belongs with that status
+        (`PROOF_PAIRS`). A marker alone, with the shim running or exited otherwise, proves nothing. Once both held, the
+        pair is kept (the reaped status cannot change)."""
         if self._proof is not None:
             return self._proof
         status = self._drained_exit()
         rec = read_marker(self.marker, self._key, self.boot)
-        if status is None or rec is None or (status, rec["outcome"]) not in PROOF_PAIRS:
-            return None
-        if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
-            # This process ignores SIGCHLD: the kernel reaps its children itself, and Popen then reports exit 0 for
-            # a status nobody observed. The status half does not hold (a requirement on the wiring: DESIGN_NOTES C3-2a).
+        if type(status) is not int or rec is None or (status, rec["outcome"]) not in PROOF_PAIRS:
             return None
         self._proof = rec
         return rec
@@ -432,8 +475,9 @@ class ShimChild:
                 self.leader_code = rec["leader_exit"]
         return self.leader_code
 
-    def shim_poll(self) -> int | None:
-        """The shim's own exit status (the node's own child: `Popen.poll()`, which reaps it), events drained first."""
+    def shim_poll(self) -> int | str | None:
+        """The shim's own exit status, as this handle observed it (`_observe`, which reaps it), events drained first:
+        None while it runs, then its status, or STATUS_UNKNOWN if someone else reaped it."""
         return self._drained_exit()
 
     def empty(self) -> bool:
@@ -446,12 +490,14 @@ class ShimChild:
     def refused(self) -> bool:
         """(C3-2a) The shim exited before any fork, publishing nothing: no single valid NONCE frame (exit 7) or bad
         arguments, an unreadable or foreign boot identity (exit 2). Its own exit status (the node's unreaped child)
-        says nothing was ever started; no file is trusted for it. Neither `empty()` nor `lost()`."""
-        return self._drained_exit() in REFUSED_EXITS
+        says nothing was ever started; no file is trusted for it. Only an OBSERVED status: a signal exit or
+        STATUS_UNKNOWN is never a refusal. Neither `empty()` nor `lost()`."""
+        status = self._drained_exit()
+        return type(status) is int and status in REFUSED_EXITS
 
     def lost(self) -> bool:
-        """The shim has exited, every event drained, it did not refuse the launch, and there is no release pair: the
-        anchor is gone without a proof (held, for a human). False while the shim runs."""
+        """The shim is over (exited, or its status UNKNOWN), every event drained, it did not refuse the launch, and
+        there is no release pair: the anchor is gone without a proof (held, for a human). False while the shim runs."""
         if self._drained_exit() is None:
             return False
         return not self.refused() and not self.empty()
