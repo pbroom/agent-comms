@@ -64,14 +64,30 @@ def _node_child(tmp_path, script, *args, ready, first, wait, sessions):
     send it `first` (a real signal, through its handle). Every wait is bounded and the child is killed and reaped
     through its handle on every path. Returns (status, or None if it did not end within `wait`; its stdout lines;
     the tail of its stderr)."""
+    status, out, err, _ = _drive(tmp_path, script, *args, steps=[(lambda out, mark: ready in out, first)], wait=wait,
+                                 sessions=sessions)
+    return status, out, err
+
+
+def _ticks_since(n):
+    """A step's condition: at least `n` loop ticks printed since the previous signal was sent."""
+    return lambda out, mark: sum(1 for x in out[mark:] if x == "tick") >= n
+
+
+def _drive(tmp_path, script, *args, steps, wait, sessions, root=ROOT):
+    """`_node_child` with several steps: for each (until, sig), read the child's lines until `until(out, mark)` holds
+    (`mark`: how many lines had been read when the previous signal was sent; at most 60 s per step), then send it
+    `sig` (a real signal, through its handle). After the last step, wait at most `wait` for it to end. `root` is the
+    checkout the child imports `agent_comms` from. Returns (status or None, its stdout lines, the tail of its stderr,
+    how many steps' conditions were met)."""
     home = tmp_path / "home"
     home.mkdir()
     if sessions:
         (home / "board.toml").write_text("[dispatch.sessions]\nenabled = true\n")
     path = tmp_path / "node_child.py"
     path.write_text(script)
-    env = {**os.environ, "PYTHONPATH": str(ROOT), "AGENT_COMMS_HOME": str(home)}
-    status, out = None, []
+    env = {**os.environ, "PYTHONPATH": str(root), "AGENT_COMMS_HOME": str(home)}
+    status, out, reached, mark = None, [], 0, 0
     with _stub_hub() as url:
         child = subprocess.Popen([sys.executable, str(path), url, *args], stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, env=env, cwd=str(tmp_path))
@@ -84,17 +100,24 @@ def _node_child(tmp_path, script, *args, ready, first, wait, sessions):
         reader = threading.Thread(target=read, daemon=True)
         reader.start()
         try:
-            deadline = time.monotonic() + 60
-            while ready not in out:
-                try:
-                    line = lines.get(timeout=max(0.0, deadline - time.monotonic()))
-                except queue.Empty:
+            ended = False
+            for until, sig in steps:
+                deadline = time.monotonic() + 60
+                while not until(out, mark):
+                    try:
+                        line = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+                    except queue.Empty:
+                        break
+                    if line is None:
+                        ended = True
+                        break
+                    out.append(line)
+                if not until(out, mark):
                     break
-                if line is None:
-                    break
-                out.append(line)
-            if ready in out:
-                child.send_signal(first)        # (the test's own child, and only it)
+                reached += 1
+                mark = len(out)
+                child.send_signal(sig)          # (the test's own child, and only it)
+            if reached == len(steps) or ended:
                 try:
                     status = child.wait(wait)
                 except subprocess.TimeoutExpired:
@@ -111,7 +134,7 @@ def _node_child(tmp_path, script, *args, ready, first, wait, sessions):
         x = lines.get_nowait()
         if x is not None:
             out.append(x)
-    return status, out, err
+    return status, out, err, reached
 
 
 # ---------------------------------------------------------------- (a), (b): a second signal in `unproved`'s window
@@ -283,6 +306,129 @@ def test_a_second_signal_before_the_final_wait_takes_the_bounded_exit(tmp_path, 
     assert "Traceback" not in err, err
 
 
+# ---------------------------------------------------------------- review round 1, R1: the inherited SIGINT
+
+_SIGINT_SCRIPT = r"""
+import logging, os, signal, sys, threading, time
+from agent_comms import node, node_sessions
+
+mode, second = sys.argv[2], sys.argv[3]
+# The SIGINT disposition this process hands the node, set before `node.run` (as a launcher would leave it):
+if mode == "ignored":           # a background shell job, a nohup-style launcher, some supervisors
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+elif mode == "default":         # Python's own interrupt handler, as in a terminal (what main has)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+elif mode == "own":             # another handler, installed by whatever embeds the node
+    signal.signal(signal.SIGINT, lambda signum, frame: print("own handler", flush=True))
+elif mode == "dfl":             # the default action: the process ends
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+R = node_sessions.SessionRunner
+
+
+def say(*words):
+    print(*words, flush=True)
+
+
+class Lines(logging.Handler):
+    def emit(self, record):
+        if "further signal" in record.getMessage():
+            say("line:", record.getMessage())
+logging.getLogger("agent_comms").addHandler(Lines())
+logging.getLogger("agent_comms").setLevel(logging.INFO)
+
+real_tick = node.Node.tick
+
+
+def tick(self):
+    say("tick")
+    return real_tick(self)
+node.Node.tick = tick
+
+if second != "none":
+    real_kill = R.kill
+
+    def kill(self):
+        # (as in _UNPROVED_SCRIPT) a SECOND signal lands in `unproved`'s timed acquire window during the shutdown
+        real_kill(self)
+        held = threading.Event()
+
+        def other():
+            self.lock.acquire()
+            held.set()
+            time.sleep(0.3)
+            self.lock.release()
+            os.kill(os.getpid(), getattr(signal, second))
+            say("second signal sent")
+        threading.Thread(target=other, daemon=True).start()
+        held.wait(10)
+    R.kill = kill
+
+real_shutdown = R.shutdown
+
+
+def shutdown(self, *a, **k):
+    real_shutdown(self, *a, **k)
+    say("sessions shutdown returned; runner lock", "held" if self.lock.locked() else "free")
+R.shutdown = shutdown
+
+node.run(sys.argv[1], "a-test-token", poll_seconds=0.1)
+say("run returned")
+"""
+
+# The exit status main (9388477) gives a node whose FIRST signal is a SIGINT with Python's default interrupt handler:
+# KeyboardInterrupt in the loop, `shut_down`, `run` returns, the process exits 0 (measured: DESIGN_NOTES "Shutdown: a
+# repeated signal is recorded, not raised", review round 1).
+MAIN_SIGINT_STATUS = 0
+
+
+def test_an_inherited_ignored_sigint_stays_ignored(tmp_path):
+    """R1 (a): the test's own child hands the node SIGINT IGNORED (as a background job or a nohup-style launcher
+    does). A real SIGINT changes nothing: the loop goes on ticking. Then a real SIGTERM shuts it down cleanly, and a
+    SECOND SIGTERM, landing in `unproved`'s acquire window during that shutdown, is only counted: exit 0, the runner
+    lock free, the further signal said once. On 564aaae the node replaced the ignored disposition, so the SIGINT shut
+    it down (no more ticks)."""
+    status, out, err, reached = _drive(tmp_path, _SIGINT_SCRIPT, "ignored", "SIGTERM", sessions=True, wait=90, steps=[
+        (_ticks_since(1), signal.SIGINT), (_ticks_since(5), signal.SIGTERM)])
+    assert reached == 2, ("the node did not keep running after its SIGINT", out, err)
+    assert status == 0, (status, out, err)
+    assert "second signal sent" in out and "sessions shutdown returned; runner lock free" in out, (out, err)
+    assert [x for x in out if x.startswith("line:")] == [
+        "line: 1 further signal(s) arrived during shutdown and were not acted on"], (out, err)
+    assert out[-1] == "run returned", (out, err)
+
+
+def test_the_default_sigint_shuts_down_as_on_main(tmp_path):
+    """R1 (b): with Python's default interrupt handler (what main has, as in a terminal) the FIRST real SIGINT shuts
+    the node down as on main: the sessions are shut down, `run` returns, and the exit status is main's for it
+    (MAIN_SIGINT_STATUS, measured on 9388477); no further signal is said. (Unchanged from 564aaae: this pins it.)"""
+    status, out, err, reached = _drive(tmp_path, _SIGINT_SCRIPT, "default", "none", sessions=True, wait=90,
+                                       steps=[(_ticks_since(1), signal.SIGINT)])
+    assert reached == 1 and status == MAIN_SIGINT_STATUS, (status, out, err)
+    assert "sessions shutdown returned; runner lock free" in out and out[-1] == "run returned", (out, err)
+    assert not [x for x in out if x.startswith("line:")], out
+
+
+def test_another_inherited_sigint_handler_is_left_as_it_was(tmp_path):
+    """R1, the other dispositions: a SIGINT handler installed by whatever embeds the node is left in place, as on
+    main. A real SIGINT runs THAT handler ("own handler") and the node goes on ticking; a real SIGTERM then shuts it
+    down, exit 0. On 564aaae the node replaced it, so the SIGINT shut the node down instead."""
+    status, out, err, reached = _drive(tmp_path, _SIGINT_SCRIPT, "own", "none", sessions=True, wait=90, steps=[
+        (_ticks_since(1), signal.SIGINT), (_ticks_since(5), signal.SIGTERM)])
+    assert reached == 2, ("the node did not keep running after its SIGINT", out, err)
+    assert "own handler" in out, (out, err)
+    assert status == 0 and out[-1] == "run returned", (status, out, err)
+
+
+def test_an_inherited_default_action_sigint_still_ends_the_process(tmp_path):
+    """R1, the other dispositions: SIGINT left at the default ACTION (`SIG_DFL`) is left so, as on main: a real
+    SIGINT ends the process by that signal (status -SIGINT), with no shutdown run. On 564aaae the node replaced it,
+    so the SIGINT ran the shutdown and the process exited 0."""
+    status, out, err, reached = _drive(tmp_path, _SIGINT_SCRIPT, "dfl", "none", sessions=True, wait=90,
+                                       steps=[(_ticks_since(1), signal.SIGINT)])
+    assert reached == 1 and status == -signal.SIGINT, (status, out, err)
+    assert "run returned" not in out, out
+
+
 # ---------------------------------------------------------------- (d): the latch, at unit level
 
 FURTHER = "{} further signal(s) arrived during shutdown and were not acted on"
@@ -451,8 +597,11 @@ def _handler_problems(tree):
       `__getattribute__`: so reading and setting those two attributes runs no Python code;
     - nothing in node.py sets `.latched` to anything but True, outside `ShutdownLatch.__init__` (the latch is never
       cleared);
-    - node.py installs exactly two handlers, `signal.signal(signal.SIGTERM, latch.on_signal)` and
-      `signal.signal(signal.SIGINT, latch.on_signal)`, both in `_run`."""
+    - node.py installs the handler exactly twice, both in `_run`: `signal.signal(signal.SIGTERM, latch.on_signal)`
+      unconditionally, and `signal.signal(signal.SIGINT, latch.on_signal)` as the ONLY statement of an
+      `if signal.getsignal(signal.SIGINT) is signal.default_int_handler:` with no `else` (review round 1, R1: any
+      other inherited SIGINT disposition, ignored included, is left as it was). No other `signal.signal` call: no
+      other signal, no unconditional or otherwise-guarded SIGINT replacement."""
     problems = []
     cls = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ShutdownLatch"), None)
     if cls is None:
@@ -516,11 +665,18 @@ def _handler_problems(tree):
     installs = []
     for fn_ in ast.walk(tree):
         if isinstance(fn_, ast.FunctionDef):
+            up = {c: p for p in ast.walk(fn_) for c in ast.iter_child_nodes(p)}
             for n in ast.walk(fn_):
                 if isinstance(n, ast.Call) and ast.unparse(n.func) == "signal.signal":
-                    installs.append((fn_.name, ast.unparse(n)))
-    if sorted(installs) != [("_run", "signal.signal(signal.SIGINT, latch.on_signal)"),
-                            ("_run", "signal.signal(signal.SIGTERM, latch.on_signal)")]:
+                    stmt = up.get(n)            # (the call's own statement, then what holds it)
+                    holder = up.get(stmt)
+                    guard = (ast.unparse(holder.test) if isinstance(holder, ast.If) and stmt in holder.body
+                             and len(holder.body) == 1 and not holder.orelse else None)
+                    installs.append((fn_.name, ast.unparse(n), guard if holder is not fn_ else "-"))
+    if sorted(installs) != sorted([
+            ("_run", "signal.signal(signal.SIGTERM, latch.on_signal)", "-"),
+            ("_run", "signal.signal(signal.SIGINT, latch.on_signal)",
+             "signal.getsignal(signal.SIGINT) is signal.default_int_handler")]):
         problems.append(f"the handlers installed: {installs}")
     return problems
 
@@ -531,7 +687,8 @@ def _node_tree():
 
 def test_the_handler_does_nothing_but_latch_count_and_raise_once():
     """(e) Statically, over node.py: the handler's body makes no call at all (no log line, no lock, no I/O), touches
-    only its own two slots, is installed for SIGTERM and SIGINT and nothing else, and nothing clears the latch."""
+    only its own two slots, is installed for SIGTERM, and for SIGINT only over Python's default interrupt handler,
+    and for nothing else, and nothing clears the latch."""
     problems = _handler_problems(_node_tree())
     assert not problems, problems
 
@@ -554,8 +711,12 @@ class ShutdownLatch:
 
 def _run(latch):
     signal.signal(signal.SIGTERM, latch.on_signal)
-    signal.signal(signal.SIGINT, latch.on_signal)
+    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+        signal.signal(signal.SIGINT, latch.on_signal)
 '''
+
+_SIGINT_GUARD = ("    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:\n"
+                 "        signal.signal(signal.SIGINT, latch.on_signal)\n")
 
 
 @pytest.mark.parametrize("old,new", [
@@ -571,11 +732,18 @@ def _run(latch):
     ("class ShutdownLatch:", "class ShutdownLatch(Base):"),
     ("    def __init__(self):", "    def __setattr__(self, k, v):\n        pass\n\n    def __init__(self):"),
     ("def _run(latch):", "def clear(latch):\n    latch.latched = False\n\ndef _run(latch):"),
-    ("    signal.signal(signal.SIGINT, latch.on_signal)\n", ""),
-    ("    signal.signal(signal.SIGINT, latch.on_signal)\n",
-     "    signal.signal(signal.SIGINT, latch.on_signal)\n    signal.signal(signal.SIGHUP, latch.on_signal)\n"),
+    (_SIGINT_GUARD, ""),
+    (_SIGINT_GUARD, _SIGINT_GUARD + "    signal.signal(signal.SIGHUP, latch.on_signal)\n"),
+    (_SIGINT_GUARD, "    signal.signal(signal.SIGINT, latch.on_signal)\n"),
+    (_SIGINT_GUARD, _SIGINT_GUARD.replace("is signal.default_int_handler", "is not signal.SIG_IGN")),
+    (_SIGINT_GUARD, _SIGINT_GUARD.replace("is signal.default_int_handler", "is signal.default_int_handler or True")),
+    (_SIGINT_GUARD, _SIGINT_GUARD + "    else:\n        signal.signal(signal.SIGINT, signal.SIG_IGN)\n"),
+    ("    signal.signal(signal.SIGTERM, latch.on_signal)\n",
+     "    if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:\n"
+     "        signal.signal(signal.SIGTERM, latch.on_signal)\n"),
 ], ids=["logs", "locks", "prints", "raises-a-call", "subscript", "counts-other", "tests-a-call", "returns-a-value",
-        "no-slots", "a-base", "setattr", "cleared", "no-sigint", "another-signal"])
+        "no-slots", "a-base", "setattr", "cleared", "no-sigint", "another-signal", "unconditional-sigint",
+        "sigint-unless-ignored", "sigint-guard-widened", "sigint-replaced-otherwise", "sigterm-conditional"])
 def test_the_handler_pin_refuses_each_unsafe_form(old, new):
     """(e) The SAME pin accepts the reviewed form and refuses each departure, as source text."""
     assert _handler_problems(ast.parse(_GOOD)) == []

@@ -327,7 +327,8 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('N', 'LATCH an interrupt raised directly latches', '        except KeyboardInterrupt:\n            latch.latch()', '        except KeyboardInterrupt:\n            pass'),
     ('N', "LATCH run's exception exit latches", '        except BaseException as e:\n            latch.latch()', '        except BaseException as e:\n            pass'),
     ('N', 'LATCH the latch is not cleared before the final wait', '        latch.latch()\n        latch.say()\n        _exit_if_stalled(0)', '        latch.latched = False\n        latch.say()\n        _exit_if_stalled(0)'),
-    ('N', 'LATCH SIGINT is covered', '    signal.signal(signal.SIGINT, latch.on_signal)', '    pass'),
+    ('N', 'LATCH SIGINT is covered (re-anchored: R1)', '        signal.signal(signal.SIGINT, latch.on_signal)', '        pass'),
+    ('N', 'an inherited ignored SIGINT stays ignored', '    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:\n', '    if True:\n'),
     ('N', 'LATCH the further signals are said', '            if self.further:\n', '            if False:\n')]
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
          "tests/test_ownership_c1.py", "tests/test_hostlog.py", "tests/test_shutdown_latch.py"]

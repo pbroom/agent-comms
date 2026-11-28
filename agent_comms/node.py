@@ -661,16 +661,28 @@ EXIT_FLUSH_SECONDS = 2.0     # the node's ONE final wait for its log writer, `at
 
 
 class ShutdownLatch:
-    """(DESIGN_NOTES "Shutdown: a repeated signal is recorded, not raised") The node's ONE handler for SIGTERM and
-    SIGINT (`on_signal`, installed by `_run`; only the main thread runs it). The FIRST signal latches "shutting down"
-    and then raises KeyboardInterrupt, which starts the shutdown. Every LATER signal only counts and returns: it never
-    raises, so no signal interrupts the cleanup (an interrupt between a lock's successful `acquire()` and its `try`
-    would leave the lock held by its own thread: `SessionRunner.unproved`'s, and then `shutdown()` blocked on it).
-    Every other route into cleanup sets the same latch first (`latch()`: `_run`'s two exits from its loop, `run`'s
-    exits), and nothing clears it: it holds through `shut_down`, the `finally` paths, the final wait and the CLI's
-    exit. The further signals are said once, outside the handler (`say()`). This deliberately removes the old way to
-    cut cleanup short with a second Ctrl-C or SIGTERM (`kill -9` is that way now; launchd's SIGKILL stays the
-    backstop). It promises no bound on the shutdown."""
+    """(DESIGN_NOTES "Shutdown: a repeated signal is recorded, not raised") The node's ONE handler for SIGTERM, and
+    for SIGINT when the node inherits Python's own interrupt handler for it (any other inherited SIGINT disposition,
+    ignored included, is left as it was, as on main: `_run`). `on_signal` is installed by `_run`; only the main thread
+    runs it. The FIRST signal latches "shutting down" and then raises KeyboardInterrupt, which starts the shutdown.
+    Every LATER signal only counts and returns: it never raises, so no signal interrupts the cleanup (an interrupt
+    between a lock's successful `acquire()` and its `try` would leave the lock held by its own thread:
+    `SessionRunner.unproved`'s, and then `shutdown()` blocked on it). Every other route into cleanup sets the same
+    latch first (`latch()`: `_run`'s two exits from its loop, `run`'s exits), and nothing clears it: it holds through
+    `shut_down`, the `finally` paths, the final wait and the CLI's exit. The further signals are said once, outside the
+    handler (`say()`). This deliberately removes the old way to cut cleanup short with a second Ctrl-C or SIGTERM
+    (`kill -9` is that way now; launchd's SIGKILL stays the backstop). It promises no bound on the shutdown.
+
+    The limit before `latch()` (review round 1, R2): on the exits that do not come through the handler (a
+    KeyboardInterrupt raised directly, or an ordinary exception, out of the loop; an exception out of `_run`), a FIRST
+    signal in the few bytecodes before `latch()` takes effect raises (the handler latches first) and replaces the
+    exception in flight. That KeyboardInterrupt leaves the `except` clause it landed in. In `_run`'s clauses, the
+    cleanup that clause would have started (`shut_down`, or the sessions' shutdown) is not run; `run`'s exit takes the
+    interrupt (the further signals said, the final wait, status 130), and what was not stopped is left to the next node
+    process's recovery. In `run`'s own clause, it leaves `run` before the final wait, into the interpreter's exit, as
+    on main. It cannot recreate the acquire-window deadlock: the main thread's two explicit acquisitions
+    (`unproved`'s, the report lock's) run only inside cleanup, which such a signal either skips or finds already
+    latched, so no later signal raises there (`try_stopping` runs on threads that take no signals)."""
 
     __slots__ = ("latched", "further", "said")
 
@@ -764,7 +776,13 @@ def _run(hub: str, token: str, *, poll_seconds: float | None = None, latch: Shut
 
     # ONE handler for both (ShutdownLatch): the first signal starts the shutdown, every later one is only counted
     signal.signal(signal.SIGTERM, latch.on_signal)      # launchd and `kill` stop the node cleanly, runs included
-    signal.signal(signal.SIGINT, latch.on_signal)       # Ctrl-C, the same way
+    # Ctrl-C, the same way, but only where main would have shut down on it: Python's own interrupt handler, whose
+    # KeyboardInterrupt the latch's first signal is. Any other inherited disposition is left exactly as it was, as
+    # main leaves it (review round 1, R1): IGNORED (a background job, a nohup-style launcher, a supervisor: SIGINT
+    # stays ignored), the default ACTION (the process ends by the signal), another handler (an embedding's own, which
+    # keeps its own behaviour), or None (one not installed from Python, which could not be put back).
+    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+        signal.signal(signal.SIGINT, latch.on_signal)
     with httpx.Client(base_url=hub.rstrip("/"), headers={"Authorization": "Bearer " + token},
                       timeout=CALL_TIMEOUT, trust_env=False) as client:
         node = Node(client, config, log_dir)
