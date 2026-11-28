@@ -660,18 +660,69 @@ def log_to_stderr() -> None:
 EXIT_FLUSH_SECONDS = 2.0     # the node's ONE final wait for its log writer, `atexit`'s included (hostlog.final_flush)
 
 
+class ShutdownLatch:
+    """(DESIGN_NOTES "Shutdown: a repeated signal is recorded, not raised") The node's ONE handler for SIGTERM and
+    SIGINT (`on_signal`, installed by `_run`; only the main thread runs it). The FIRST signal latches "shutting down"
+    and then raises KeyboardInterrupt, which starts the shutdown. Every LATER signal only counts and returns: it never
+    raises, so no signal interrupts the cleanup (an interrupt between a lock's successful `acquire()` and its `try`
+    would leave the lock held by its own thread: `SessionRunner.unproved`'s, and then `shutdown()` blocked on it).
+    Every other route into cleanup sets the same latch first (`latch()`: `_run`'s two exits from its loop, `run`'s
+    exits), and nothing clears it: it holds through `shut_down`, the `finally` paths, the final wait and the CLI's
+    exit. The further signals are said once, outside the handler (`say()`). This deliberately removes the old way to
+    cut cleanup short with a second Ctrl-C or SIGTERM (`kill -9` is that way now; launchd's SIGKILL stays the
+    backstop). It promises no bound on the shutdown."""
+
+    __slots__ = ("latched", "further", "said")
+
+    def __init__(self) -> None:
+        self.latched = False        # shutting down: set once, never cleared
+        self.further = 0            # signals that arrived once latched: counted, not acted on
+        self.said = False
+
+    def on_signal(self, signum, frame) -> None:
+        # THE handler. Nothing but the flag and the count: no log line, no lock, no I/O, no call (pinned:
+        # tests/test_shutdown_latch.py `_handler_problems`). The latch is set BEFORE the raise.
+        if self.latched:
+            self.further += 1
+            return
+        self.latched = True
+        raise KeyboardInterrupt
+
+    def latch(self) -> None:
+        """A route into cleanup that did not come through the handler: from here on no signal raises."""
+        self.latched = True
+
+    def say(self) -> None:
+        """Once, outside the handler, best effort: how many further signals arrived and were not acted on (numbers
+        only; nothing when there were none)."""
+        if self.said:
+            return
+        self.said = True
+        try:
+            if self.further:
+                log.warning("%d further signal(s) arrived during shutdown and were not acted on", self.further)
+        except Exception:       # (never into the node's exit)
+            pass
+
+
 def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
     """`board node`. (Host-side logging: one writer) This thread is a lifecycle thread for the whole run, registered
     before anything is built or recovered: it never waits for the log writer, so no handler can hold up a signal, a
     report or a save of the node's. After the last signal and report: ONE bounded wait for the writer
-    (`_exit_if_stalled`)."""
+    (`_exit_if_stalled`). (Shutdown latch) Whichever way `_run` ends, the latch is set before the final wait, so from
+    here to the process's end no signal raises (`ShutdownLatch`)."""
     with hostlog.enqueue_only():
         hostlog.start_writer()      # (eagerly, here, once: nothing restarts it in this process)
+        latch = ShutdownLatch()     # (installed by `_run`, before it builds anything)
         try:
-            _run(hub, token, poll_seconds=poll_seconds)
+            _run(hub, token, poll_seconds=poll_seconds, latch=latch)
         except BaseException as e:
+            latch.latch()           # (an exception from before the loop reaches cleanup here first)
+            latch.say()
             _exit_if_stalled(_status(e))
             raise
+        latch.latch()
+        latch.say()
         _exit_if_stalled(0)
 
 
@@ -691,10 +742,11 @@ def _exit_if_stalled(status: int) -> None:
     lock would hold `logging.shutdown()` for good). That skips the interpreter's exit work (atexit hooks,
     `logging.shutdown()`, a traceback for an escaping exception, buffered output): every child was signalled and
     every report and save made by then, and the lines still queued behind the stuck handler are lost.
-    (Review round 3, R21) An interrupt during the final wait (a second SIGTERM, or Ctrl-C) counts as stalled: the
-    process ends now with the status already selected, rather than escaping into the interpreter's
-    `logging.shutdown()`, which could block on a stuck handler. On the main thread the wait is a poll outside the
-    queue's lock (hostlog `_wait_for`), so the interrupt leaves the queue's lock free."""
+    (Review round 3, R21) An interrupt during the final wait counts as stalled: the process ends now with the status
+    already selected, rather than escaping into the interpreter's `logging.shutdown()`, which could block on a stuck
+    handler. On the main thread the wait is a poll outside the queue's lock (hostlog `_wait_for`), so the interrupt
+    leaves the queue's lock free. Since the shutdown latch (`ShutdownLatch`, set by `run` before this is called) a
+    signal no longer raises here; this is kept as defence, for a KeyboardInterrupt raised some other way."""
     try:
         idle = hostlog.final_flush(EXIT_FLUSH_SECONDS)
     except KeyboardInterrupt:
@@ -703,16 +755,16 @@ def _exit_if_stalled(status: int) -> None:
         os._exit(status)
 
 
-def _run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
+def _run(hub: str, token: str, *, poll_seconds: float | None = None, latch: ShutdownLatch) -> None:
     from .config import Settings, home
     log_to_stderr()
     settings = Settings.load()
     config = DispatchConfig.from_dict(settings.dispatch, settings=settings)
     log_dir = home() / "data" / "node-logs"
 
-    def on_term(signum, frame):
-        raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, on_term)      # launchd and `kill` stop the node cleanly, runs included
+    # ONE handler for both (ShutdownLatch): the first signal starts the shutdown, every later one is only counted
+    signal.signal(signal.SIGTERM, latch.on_signal)      # launchd and `kill` stop the node cleanly, runs included
+    signal.signal(signal.SIGINT, latch.on_signal)       # Ctrl-C, the same way
     with httpx.Client(base_url=hub.rstrip("/"), headers={"Authorization": "Bearer " + token},
                       timeout=CALL_TIMEOUT, trust_env=False) as client:
         node = Node(client, config, log_dir)
@@ -734,8 +786,10 @@ def _run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
                     log.warning("hub unreachable: %s", hostlog.facts(e))
                 time.sleep(poll_seconds or config.poll_seconds)
         except KeyboardInterrupt:
+            latch.latch()       # (already set when it came through the handler; one raised directly sets it here)
             shut_down(node)
         except BaseException:
+            latch.latch()       # (an ordinary exception out of the loop: no signal raises in its cleanup either)
             if node.sessions is not None:
                 node.sessions.shutdown()    # whatever ends this loop, no session process is left running behind it
             raise
