@@ -1,5 +1,6 @@
 """(Ownership C3-1, C3-2a) The per-group supervisor ("the shim"): ONE small process per process group the node starts, run
-as `python -I -m agent_comms.groupshim <args>` (agent_comms/shimchild.py starts it). NOT wired into any spawn site yet;
+as `python -I -S -c <boot> <package root> <args>` (agent_comms/shimchild.py starts it; C3-2b-1: no site, the package
+root after the standard library). NOT wired into any spawn site yet;
 DESIGN_NOTES "Ownership C3-1: the group supervisor (unwired)", its review rounds, and "Ownership C3-2a: the proof is
 authenticated (still unwired)" have the protocol as tables.
 
@@ -33,6 +34,8 @@ The life of one shim:
 7. `TERM` / `KILL`, from the fork on, only while the anchor holds (the child unreaped, signalling not latched off): to
    the child's pid until its group is observed established, to its group after (and then any pid-only TERM or KILL is
    replayed to the group once). A KILL is sent no earlier than `kill_grace` after the shim's first TERM attempt.
+   (C3-2b-1) The shim alone repeats KILL: after its first KILL, asked by a command or by EOF, it sends KILL again
+   every `kill_grace` while the anchor holds. The node never resends a KILL command that was queued.
 8. EOF on the command pipe (the node died or let go): TERM at once, KILL at first TERM + `kill_grace`, KILL again every
    `kill_grace` while the anchor holds. Neither event writes nor diagnostics can block or abort this.
 9. Empty: a complete listing (`node_groups.group_members`) holding nothing but the exited, unreaped leader; then latch
@@ -1135,7 +1138,8 @@ class Shim:
         return True
 
     def _kill_request(self) -> None:
-        """A KILL command, or EOF: TERM now if none was attempted yet; KILL at the first TERM attempt + the grace."""
+        """A KILL command, or EOF: TERM now if none was attempted yet; KILL at the first TERM attempt + the grace, then
+        every grace while the anchor holds (`_kill_now`)."""
         if self.first_term_at is None:
             self._signal(signal.SIGTERM)
             if self.first_term_at is None:
@@ -1148,14 +1152,16 @@ class Shim:
             self.emit(f"DEFERRED KILL {max(0, int((due - self.clock()) * 1000))}")
 
     def _kill_now(self) -> None:
-        """THE only KILL sender (but for the replay). Never before the first TERM attempt + the grace; after EOF,
-        repeated every grace."""
+        """THE only KILL sender (but for the replay). Never before the first TERM attempt + the grace. (C3-2b-1) KILL
+        repetition has ONE owner, the shim: once it has sent a KILL, asked by a `KILL` command or by EOF, it repeats
+        KILL every grace for as long as the anchor holds (`_signal` refuses, and the timer ends, once it does not). The
+        node never retries a KILL command that was queued."""
         now = self.clock()
         if self.first_term_at is None or now < self.first_term_at + self.grace:
             self.kill_due = None if self.first_term_at is None else self.first_term_at + self.grace
             return
         self.kill_due = None
-        if self._signal(signal.SIGKILL) and self.eof:
+        if self._signal(signal.SIGKILL):
             self.kill_due = self.clock() + self.grace
 
     # -------- the leader's exit, and the proof

@@ -115,6 +115,27 @@ if m is not None:
                 until(m.get("until"))
         finally:
             os._exit(0)
+zm = spec.get("zombie_member")
+if zm is not None:
+    # (C3-2b-1) P leaves the CLI's group (its own group, the CLI's session); its child M joins the CLI's group again.
+    # A KILL to the group ends M, whose zombie P does not reap until `reap`: the group keeps a member after a KILL.
+    cli_pgid = os.getpgid(0)
+    p = os.fork()
+    if p == 0:
+        try:
+            os.setpgid(0, 0)
+            m_pid = os.fork()
+            if m_pid == 0:
+                try:
+                    os.setpgid(0, cli_pgid)
+                    put(zm["joined"], os.getpid())
+                    until(None)
+                finally:
+                    os._exit(0)
+            until(zm["reap"])
+            os.waitpid(m_pid, 0)
+        finally:
+            os._exit(0)
 if spec.get("report"):
     report(spec["report"], member=member)
 if spec.get("echo"):
@@ -1196,7 +1217,8 @@ def test_unit_kill_never_before_the_grace_and_repeated_after_eof(shim):
     assert [c for c in f.calls if c[1] == signal.SIGKILL] == [] and shim.kill_due == 101.0
     f.now = 101.0
     shim._kill_now()
-    assert [c[:2] for c in f.calls].count(("killpg", signal.SIGKILL)) == 1 and shim.kill_due is None
+    # (C3-2b-1) the shim owns KILL repetition: after its first KILL it repeats every grace, a command's KILL too
+    assert [c[:2] for c in f.calls].count(("killpg", signal.SIGKILL)) == 1 and shim.kill_due == 102.0
     shim.eof = True                         # after EOF: repeated every grace
     f.now = 101.5
     shim._kill_request()
@@ -1205,6 +1227,73 @@ def test_unit_kill_never_before_the_grace_and_repeated_after_eof(shim):
     shim._kill_now()
     assert [c[:2] for c in f.calls].count(("killpg", signal.SIGKILL)) == 3 and shim.kill_due == 103.5
     assert [c[:2] for c in f.calls].count(("killpg", signal.SIGTERM)) == 1, "one TERM: the first attempt only"
+
+
+def test_unit_c3_2b1_a_kill_command_is_repeated_by_the_shim_every_grace_while_the_anchor_holds(shim):
+    """(C3-2b-1) KILL repetition has ONE owner, the shim: after a KILL COMMAND (no EOF) its first KILL is repeated every
+    grace by the shim itself, never earlier, and stops for good once the anchor is gone (latched: REFUSED, no timer)."""
+    f = Fakes(shim, [])
+    shim._take_commands()
+    shim.buf = b"KILL\n"
+    shim._take_commands()
+    assert [c[:2] for c in f.calls] == [("killpg", signal.SIGTERM)] and shim.kill_due == 101.0 and not shim.eof
+    for at, count in ((101.0, 1), (101.5, 1), (102.0, 2), (103.0, 3)):
+        f.now = at
+        if shim.kill_due is not None and f.now >= shim.kill_due:
+            shim._kill_now()
+        assert [c[:2] for c in f.calls].count(("killpg", signal.SIGKILL)) == count, at
+    assert shim.kill_due == 104.0
+    shim.latched = True                     # (the proof's latch: the anchor is gone)
+    f.now = 104.0
+    shim._kill_now()
+    assert [c[:2] for c in f.calls].count(("killpg", signal.SIGKILL)) == 3 and shim.kill_due is None
+    assert "REFUSED" in events_of(shim)
+
+
+def test_c3_2b1_after_one_kill_command_the_shim_itself_repeats_kill_while_a_member_keeps_the_group(kit):
+    """(C3-2b-1) Real: ONE `KILL` command, the command pipe left open (no EOF). A member of the CLI's group is a zombie
+    of a process outside the group, so the group is not empty after the first KILL: the shim sends KILL again every
+    grace on its own, with no second command. Once the zombie is reaped the shim proves the group empty. (Measured: a
+    `killpg` of a group whose only members are zombies answers EPERM on macOS, so the repeats are KILL ATTEMPTS, said
+    `FAILED KILL 1 group`; each still counts: the shim attempted it.)"""
+    joined, reap = kit.path("joined"), kit.path("reap")
+    c = kit.run(kit.argv(ignore_term=True, wait_abort=True, zombie_member={"joined": joined, "reap": reap}), grace=0.5)
+    assert wait_event(c, "STARTED") and wait_for(lambda: read_json(joined))
+    assert read_json(joined) in (node_groups.group_members(c.cli_pid) or ()), "the member is in the CLI's group"
+    c.kill()
+
+    def kills():
+        c.poll()
+        return sum(1 for e in c.events if e[0] in ("SENT", "FAILED") and e[1:2] == ("KILL",))
+    assert wait_for(lambda: kills() >= 3, 10), c.events
+    assert c.shim_poll() is None and c._cmd is not None, "still anchored, and no EOF was ever given"
+    Path(reap).write_text("")
+    assert shim_exit(c) == groupshim.EXIT_EMPTY and c.empty(), c.events
+
+
+def test_e_the_shim_runs_isolated_without_site_and_its_package_root_after_the_standard_library(kit, tmp_path,
+                                                                                               monkeypatch):
+    """(C3-2b-1, E) A same-user process could plant modules where the next shim imports from. The shim's interpreter
+    runs `-I -S` (no `PYTHON*` variables, no user site, no site-packages and no `.pth` processing) and its package
+    root comes AFTER the standard library: modules named like the standard library's, planted at a package root, are
+    never imported (they would note it and fail the import), and the shim's own command line carries `-I -S`."""
+    import shutil
+    root = tmp_path / "root"
+    shutil.copytree(Path(ROOT) / "agent_comms", root / "agent_comms", ignore=shutil.ignore_patterns("__pycache__"))
+    noted = tmp_path / "shadowed"
+    for name in ("json", "hmac", "hashlib", "select", "threading"):     # (each imported by the shim's code)
+        (root / f"{name}.py").write_text(f"open({str(noted)!r}, 'a').write({name!r} + ' ')\n"
+                                         f"raise ImportError('a planted {name}')\n")
+    monkeypatch.setattr(shimchild, "_PACKAGE_ROOT", str(root))
+    c = kit.run(["/bin/sh", "-c", "exit 0"])
+    assert shim_exit(c) == groupshim.EXIT_EMPTY and c.empty(), (c.events, noted.exists() and noted.read_text())
+    assert not noted.exists(), noted.read_text()
+    waiting = kit.start()
+    args = subprocess.run(["/bin/ps", "-o", "args=", "-p", str(waiting.pid)], capture_output=True, text=True,
+                          timeout=WAIT).stdout
+    assert " -I -S -c " in args, args
+    waiting.close_commands()
+    assert shim_exit(waiting) == groupshim.EXIT_NOGO and waiting.empty()
 
 
 def test_unit_the_go_frame_parser():
@@ -2241,8 +2330,8 @@ def test_rr1_publishing_never_replaces_a_file_at_the_marker_path(kit, outcome):
 STALLING_PYTHON = r'''#!/bin/sh
 # TEST-ONLY: the real interpreter for the shim, with every way of describing a crash made to stall (until `abort`):
 # the traceback module's formatters, linecache, and the shim's own rendering function.
-shift 2
-exec PY -I -c '
+shift 3
+exec PY -I -S -c '
 import os, sys, time
 sys.path.insert(0, sys.argv[2])
 def stall(*a, **k):

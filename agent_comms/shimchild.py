@@ -56,9 +56,13 @@ boot_id = groupshim.boot_id
 MARKER_MAX = groupshim.MARKER_MAX   # bytes a marker may have (4096; the shim's are about 250): larger is no proof
 # The shim runs THIS process's own agent_comms (the directory that holds the package imported here), never whatever
 # `-m agent_comms.groupshim` would find on the interpreter's path: `-I` (isolated: no PYTHON* variables, no user site,
-# no current directory on the path), then the package's own root first. Equivalent to `python -m agent_comms.groupshim`.
+# no current directory on the path) and (C3-2b-1, E) `-S` (no `site`: no site-packages and no `.pth` file is
+# processed), then the package's own root APPENDED, after the standard library, so a file named like a standard
+# library module at the package root is never what the shim imports (the shim imports nothing outside the standard
+# library and `agent_comms`). What remains is the owner's (DESIGN_NOTES C3-2b-1): the node's code, virtualenv and
+# interpreter are writable by the same user as the supervised CLI.
 _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(groupshim.__file__)))
-_BOOT = ("import sys; sys.path.insert(0, sys.argv.pop(1)); from agent_comms.groupshim import entry; "
+_BOOT = ("import sys; sys.path.append(sys.argv.pop(1)); from agent_comms.groupshim import entry; "
          "entry(sys.argv[1:])")
 EVENTS_PER_PUMP = 256 * 1024        # bytes one pump takes at most (non-blocking: never waits)
 
@@ -283,8 +287,8 @@ class ShimChild:
             err_fd = os.open(stderr_log, os.O_WRONLY | os.O_CREAT | flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
             os.fchmod(err_fd, 0o600)
             # (C3-2a) No secret on the argv, nor in the environment below: the CLI, the shim's child, can read both.
-            argv = [python or sys.executable, "-I", "-c", _BOOT, _PACKAGE_ROOT, "--version", str(groupshim.PROTOCOL),
-                    "--boot", boot, "--marker", marker, "--cmd-fd", str(cmd_r),
+            argv = [python or sys.executable, "-I", "-S", "-c", _BOOT, _PACKAGE_ROOT,
+                    "--version", str(groupshim.PROTOCOL), "--boot", boot, "--marker", marker, "--cmd-fd", str(cmd_r),
                     "--event-fd", str(evt_w), "--log", log]
             if test_gate is not None:
                 argv += ["--test-gate", test_gate]
