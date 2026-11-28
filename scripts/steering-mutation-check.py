@@ -287,7 +287,8 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('SC', "C3-1 the events are drained before the shim's exit is said", '        for _ in range(1024):\n            if self._pump():', '        for _ in range(0):\n            if self._pump():'),
     ('SC', 'C3-1 lost only once the shim has exited', '        if self._drained_exit() is None:\n            return False', '        if self._drained_exit() is None and False:\n            return False'),
     ('SC', 'C3-1 a stop before GO is never-start', '            if not self._went:\n                self._close_cmd()', '            if False:\n                self._close_cmd()'),
-    ('SC', 'C3-1 the command write is pinned under the lock', '    def _command(self, word: bytes) -> None:\n        with self._wlock:', '    def _command(self, word: bytes) -> None:\n        if True:')]
+    ('SC', 'C3-1 the command write is pinned under the lock', '    def _command(self, word: bytes) -> None:\n        with self._wlock:', '    def _command(self, word: bytes) -> None:\n        if True:'),
+    ('SC', 'C3-1 GO waits with poll, not select (FD_SETSIZE)', '    p = select.poll()\n    p.register(fd, select.POLLOUT)\n    p.poll(max(0, int(timeout * 1000)))', '    select.select([], [fd], [], timeout)')]
 # (Ownership C3-1) The shim's rows run only its own tests: nothing else imports groupshim or shimchild yet.
 ONLY = {"GS": ["tests/test_groupshim.py"], "SC": ["tests/test_groupshim.py"]}
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py", "tests/test_ownership_c1.py"]

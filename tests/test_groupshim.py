@@ -195,7 +195,7 @@ def raw_write(c: ShimChild, data: bytes, timeout: float = WAIT) -> None:
         try:
             view = view[os.write(c._cmd, view):]
         except BlockingIOError:
-            select.select([], [c._cmd], [], 0.05)
+            shimchild.wait_writable(c._cmd, 0.05)
         except BrokenPipeError:
             return
 
@@ -859,6 +859,35 @@ def test_c7_command_writes_raise_when_the_pipe_is_full_closed_or_broken(kit):
     assert shim_exit(c2) == groupshim.EXIT_EMPTY
     with pytest.raises(BrokenPipeError):
         c2.kill()
+
+
+def test_c7_go_waits_for_a_command_fd_above_fd_setsize(kit):
+    """Found by the serial suite: a node can hold more than FD_SETSIZE (1024) descriptors, and `select` refuses such
+    an fd. With this test's own descriptors pushing the pipes past 1024, a GO larger than the pipe holds (it must wait
+    for the shim to read) is written, and the CLI gets that environment."""
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = 1400
+    if soft < want:
+        if hard != resource.RLIM_INFINITY and hard < want:
+            pytest.skip(f"the descriptor limit is {hard}")
+        resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    filler = []
+    try:
+        null = os.open(os.devnull, os.O_RDONLY)
+        filler.append(null)
+        while len(filler) < 1100:
+            filler.append(os.dup(null))
+        c = kit.start()
+        assert c._cmd > 1024 and c._evt > 1024, (c._cmd, c._evt)
+        env = dict(ENV, BIG="v" * 300_000)          # (far more than the 16-64 KiB a pipe holds)
+        c.go(["/bin/sh", "-c", 'test "${#BIG}" -eq 300000'], cwd=str(kit.work), env=env, kill_grace=1.0)
+        assert shim_exit(c) == groupshim.EXIT_EMPTY and c.poll() == 0, c.events
+    finally:
+        for fd in filler:
+            os.close(fd)
+        if soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
 def test_c7_a_concurrent_retirement_cannot_close_the_pipe_under_a_write(kit, monkeypatch):

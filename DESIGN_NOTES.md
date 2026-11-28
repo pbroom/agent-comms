@@ -17650,6 +17650,9 @@ A failure removes the temp file and publishes nothing.
     log (`O_EXCL`). It has no I/O methods.
 - **`go(argv, cwd, env, kill_grace, timeout=5)`** writes `GO` non-blocking, within the timeout. On a timeout or a
   failure it closes the command pipe (the shim then sees a partial frame and EOF, and never starts) and raises.
+  - It waits for the pipe with `poll`, not `select`. A node can hold more than FD_SETSIZE (1024) descriptors, and
+    `select` raises `ValueError` for any fd at or above that. The serial suite found this: its pytest process had more
+    than 1024 open.
 - **No thread of its own.** Events are pumped, non-blocking and bounded, in `poll()`, `empty()`, `lost()` and
   `shim_poll()`. Before a shim exit is classified, the event pipe is drained to EOF.
 - **Three facts, never conflated:**
@@ -17744,6 +17747,8 @@ file the cleanup writes, or after 60 s. Every wait is bounded (20 s each).
     still anchors (the zombie, with the shim as its parent), and both markers are published.
 - **C7, the unit matrix (real shims):**
   - command writes: full (BlockingIOError, with the shim held at a gate), closed, and broken (BrokenPipeError);
+  - `test_c7_go_waits_for_a_command_fd_above_fd_setsize`: the test's own descriptors push the pipes past 1024, and a
+    300 KB environment makes `go` wait. It fails on 7efd2ac (`select`'s `ValueError`) and passes with `poll`;
   - a concurrent `close_commands()` waits for an in-flight write;
   - a killed shim is `lost()` (False while it ran), with no `empty()` and `poll()` None;
   - markers of another nonce, boot, outcome or version, a symlink and garbage are all no proof;

@@ -49,6 +49,14 @@ _BOOT = ("import sys; sys.path.insert(0, sys.argv.pop(1)); from agent_comms.grou
 EVENTS_PER_PUMP = 256 * 1024        # bytes one pump takes at most (non-blocking: never waits)
 
 
+def wait_writable(fd: int, timeout: float) -> None:
+    """Wait, at most `timeout` seconds, for `fd` to take a write. `poll`, not `select`: a node can hold more than
+    FD_SETSIZE (1024) descriptors, and `select` refuses any fd at or above it (found by the serial suite)."""
+    p = select.poll()
+    p.register(fd, select.POLLOUT)
+    p.poll(max(0, int(timeout * 1000)))
+
+
 def marker_proves(path: str, nonce: str, boot: str) -> bool:
     """Whether the marker at `path` proves the group of launch `nonce`, on boot `boot`, absent (or never made): a
     regular file (no symlink), small, a JSON object of this protocol whose nonce and boot are exactly these and whose
@@ -160,7 +168,7 @@ class ShimChild:
                     try:
                         view = view[os.write(self._cmd, view):]
                     except BlockingIOError:
-                        select.select([], [self._cmd], [], min(left, 0.05))
+                        wait_writable(self._cmd, min(left, 0.05))
             except BaseException:
                 self._close_cmd()
                 raise
