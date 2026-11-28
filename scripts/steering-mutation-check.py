@@ -230,7 +230,7 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('D', 'R19 with_managed_env logs through the logger it is given', '        (logger if logger is not None else log).warning(', '        log.warning('),
     ('L', 'R20 the chain follows the cause', '        cause = _CAUSE.__get__(e)\n        if cause is not None:', '        cause = None\n        if cause is not None:'),
     ('L', "R20 the chain is read through BaseException's own descriptors", '        cause = _CAUSE.__get__(e)\n        if cause is not None:', '        cause = e.__cause__\n        if cause is not None:'),
-    ('L', 'R20 a cycle is cut by identity', '        if id(e) in seen:\n            cut = "a cycle"', '        if False:\n            cut = "a cycle"'),
+    ('L', 'R20 a cycle is cut by identity', '        if id(e) in seen:\n            cut.append(CUT_CYCLE)', '        if False:\n            cut.append(CUT_CYCLE)'),
     ('L', "R20 the chain's depth is capped", '        if len(chain) == CHAIN_MAX:', '        if False:'),
     ('L', "R20 the chain's frames are capped", '    while tb is not None and len(frames) < room:', '    while tb is not None:'),
     ('N', 'R21 an interrupt during the final wait counts as stalled', '    except KeyboardInterrupt:\n        idle = False', '    except ZeroDivisionError:\n        idle = False'),
@@ -318,7 +318,9 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('G', 'C1R6 a refused proof makes it HELD (re-anchored)', '                    if begun:\n                        self._fence(token, fence)', '                    if begun:\n                        pass'),
     ('G', 'C1R6 the rule releases only on proof (re-anchored)', '                proved = proof() is True', '                proved = True'),
     ('N', 'C1R6 the deadline ends the watch (re-anchored)', '            left = deadline - self.clock()\n            if left <= 0:\n                break\n            self.sleep(min(POST_KILL_STEP, left))', '            left = deadline - self.clock()\n            self.sleep(min(POST_KILL_STEP, max(left, POST_KILL_STEP)))'),
-    ('N', "C1R6 the node's watch covers the sessions (re-anchored)", '            if not waiting and not (others is not None and others(max(left, 0.0))):', '            if not waiting:')]
+    ('N', "C1R6 the node's watch covers the sessions (re-anchored)", '            if not waiting and not (others is not None and others(max(left, 0.0))):', '            if not waiting:'),
+    ('L', 'R20 the cut is said only when something was left out', '    return frames, tb is not None', '    return frames, len(frames) >= room'),
+    ('L', "R20 the cut's label is rendered by the writer, not at the call", '            cut.append(CUT_FRAMES)', '            cut.append(f"more than {FRAMES_MAX} frames")')]
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
          "tests/test_ownership_c1.py", "tests/test_hostlog.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",

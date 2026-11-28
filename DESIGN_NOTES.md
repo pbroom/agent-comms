@@ -18173,7 +18173,8 @@ alive or re-open a wait:
 ### A5. The scope of "no raise"
 
 The containment is scoped to `Exception`. A `KeyboardInterrupt` or `SystemExit` arriving during an enqueue or a
-start propagates, as it must for SIGTERM (`on_term` raises `KeyboardInterrupt`). It leaves no lock held. (Corrected
+start propagates, as it must for SIGTERM (`on_term` raises `KeyboardInterrupt`). It leaves no converted lock held:
+the inherited exceptions are named in review round 3's R18. (Corrected
 in review round 3, R18: "every lock is a `with`" was not enough, because `HostLock`'s and `Condition`'s `__exit__`
 were Python code, which an interrupt can enter before the release. Every host lock is now a native lock entered as
 `with hostlog.BOUNDARY, lock:`, and hostlog's own lock is a raw lock entered as `with _LOCK:`, so the acquire and
@@ -18440,7 +18441,14 @@ type (the runner and report locks are plain Locks, the others RLocks, as on main
 
 R17 is "After the PR's automated review" in "Host-side logging: one writer".
 
-### R18. No lock is left held by an interrupt
+### R18. No converted lock is left held by an interrupt
+
+The converted locks (every host lock, and hostlog's own `_LOCK`) cannot be left held by an interrupt. Two locks are
+NOT converted. They are inherited from main and still entered through Python code, where an interrupt could strand
+their own lock, as on main:
+- the stdlib's `Event` internals, which `_Stopping.set()` enters on the main thread at shutdown;
+- `checkpoint_cond`, a `threading.Condition` entered through stdlib Python code on the session loop and checkpoint
+  sender threads.
 
 **The finding.** `HostLock`'s `__enter__`/`__exit__`/`acquire`/`release` and `threading.Condition.__exit__` are
 Python functions. CPython handles a pending signal at the next check in the main thread's bytecode, and a Python
@@ -18616,7 +18624,7 @@ The merge commit takes both changes:
 
 `_exit_if_stalled` catches `KeyboardInterrupt` around `final_flush` and treats it as stalled: `os._exit(status)`
 with the status already selected. Every signal, report and save is done by then. Because the main thread's final
-wait polls outside the queue's lock (A3), the interrupt leaves no lock held.
+wait polls outside the queue's lock (A3), the interrupt leaves the queue's lock free.
 
 Pinned by `test_r21_an_interrupt_during_the_final_wait_takes_the_stalled_exit`. A real SIGTERM, sent by the test
 to its own child during the final wait with the writer stuck, ends the child with status 3 at once. On fbec9fa it

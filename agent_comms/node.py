@@ -694,7 +694,7 @@ def _exit_if_stalled(status: int) -> None:
     (Review round 3, R21) An interrupt during the final wait (a second SIGTERM, or Ctrl-C) counts as stalled: the
     process ends now with the status already selected, rather than escaping into the interpreter's
     `logging.shutdown()`, which could block on a stuck handler. On the main thread the wait is a poll outside the
-    queue's lock (hostlog `_wait_for`), so the interrupt leaves no lock held."""
+    queue's lock (hostlog `_wait_for`), so the interrupt leaves the queue's lock free."""
     try:
         idle = hostlog.final_flush(EXIT_FLUSH_SECONDS)
     except KeyboardInterrupt:

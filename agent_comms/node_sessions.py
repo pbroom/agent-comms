@@ -194,7 +194,8 @@ class _Stopping(threading.Event):
 
     def set(self) -> None:
         self._host.steer_stopping()
-        super().set()
+        super().set()       # (R18: the stdlib Event's own Python code, on the main thread at shutdown, as on main:
+        #                     an inherited exception to "no converted lock is left held by an interrupt")
 
 
 class Checkpoint(NamedTuple):
@@ -276,7 +277,7 @@ class SessionRunner:
         # (Review round 2, ruling K) The checkpoint sender's own queue: at most one per session, posted by its own
         # thread (`_send_checkpoints`), never by the loop that drives ordinary reports. Dropped at shutdown.
         self.checkpoint_queue: dict[str, dict] = {}
-        self.checkpoint_cond = threading.Condition()
+        self.checkpoint_cond = threading.Condition()     # (R18: entered through stdlib Python code, as on main)
         self.checkpoint_thread: threading.Thread | None = None
         self.queue: dict[str, list[dict]] = {}        # session id -> the hub's queued messages not yet handed over
         self.handed: dict[str, int] = self._load_handed()

@@ -35,9 +35,9 @@ patched: `logging` is used as it is, through its loggers' own level checks and h
   recovered), the session loop, the deadline watchdog, the checkpoint sender, and the writer itself (a handler that
   logs, or calls back into the host, enqueues and returns). A STANDALONE caller (a test, a command calling the host
   directly) waits, when it leaves its outermost boundary at depth 0 (never while it holds a lock of the host-side
-  modules: every such lock is entered as `with hostlog.BOUNDARY, lock:`), for the writer to have attempted ITS OWN
-  last record, for at
-  most ACK_SECONDS (`_acknowledge`): a public call returns with its lines with the handlers (caplog) in the
+  modules: every such lock is entered as `with hostlog.BOUNDARY, lock:`, so an interrupt cannot leave it held; the
+  two inherited exceptions are named in the R18 comment above `_Record`), for the writer to have attempted
+  ITS OWN last record, for at most ACK_SECONDS (`_acknowledge`): a public call returns with its lines with the handlers (caplog) in the
   uncontended case. Best effort by statement: a stall latch (a wait that times out marks the writer stalled at the
   completion sequence it saw; nobody waits again until a LATER completion), and a record the bound evicted is
   resolved as dropped at once.
@@ -180,6 +180,11 @@ def may_wait() -> bool:
 # inside the boundary, so the release always comes before the boundary's exit, and no acknowledgement is ever made
 # while the lock is held). The few explicit `acquire()`/`release()` pairs are the native methods, inside a
 # `with hostlog.BOUNDARY:`, in main's own shape. No Python wrapper and no generator holds one of these locks.
+# So these converted locks, and hostlog's own `_LOCK`, cannot be left held by an interrupt. NOT converted, inherited
+# from main and still entered through Python code (an interrupt there could strand their own lock, as on main):
+# the stdlib's `Event` internals, which `_Stopping.set()` enters on the main thread at shutdown, and
+# `checkpoint_cond`, a `threading.Condition` entered through stdlib Python code on the session loop and checkpoint
+# sender threads.
 
 
 # ---------------------------------------------------------------- the record, made at the call
@@ -301,22 +306,30 @@ _CAUSE, _CONTEXT, _SUPPRESS, _TRACEBACK = (BaseException.__dict__[k] for k in (
     "__cause__", "__context__", "__suppress_context__", "__traceback__"))     # (A6: BaseException's own descriptors)
 
 
-def _frames(tb: Any, room: int) -> list:
+# (R20, Sol's should) Why a chain was cut, as the snapshot keeps it: a REASON only (never a formatted label, which the
+# writer renders, `_exc_text`), and only when something was actually left out.
+CUT_CYCLE, CUT_CHAIN, CUT_FRAMES = "cycle", "chain", "frames"
+_CUTS = (CUT_CYCLE, CUT_CHAIN, CUT_FRAMES)
+
+
+def _frames(tb: Any, room: int) -> tuple[list, bool]:
+    """(the frames kept, at most `room`; whether any frame was left out)."""
     frames = []
     while tb is not None and len(frames) < room:
         code = tb.tb_frame.f_code
         frames.append((code.co_filename, tb.tb_lineno, code.co_name))
         tb = tb.tb_next
-    return frames
+    return frames, tb is not None
 
 
 def _exception(exc_info: Any) -> tuple | None:
     """(type name, frames, chain, cut) of the exception, or None: nothing formatted, no text, no source. `frames` are
     the logged exception's own (file, line, function) triples; `chain` is every exception kept, the logged one first,
-    as (type name, frames, how the NEXT one is linked to it: "cause", "context" or None); `cut` says why the chain was
-    cut, or None. R20 (A6): walked through BaseException's own descriptors (`__cause__`, `__context__`,
-    `__suppress_context__`, `__traceback__`), so no code of the exception's own runs; a cycle is found by identity;
-    at most CHAIN_MAX exceptions and FRAMES_MAX frames in all."""
+    as (type name, frames, how the NEXT one is linked to it: "cause", "context" or None); `cut` is the tuple of the
+    reasons it was cut (`_CUTS`: a cycle; an exception left out past CHAIN_MAX; a frame left out past FRAMES_MAX),
+    empty when nothing was: reasons only, the label is the writer's. R20 (A6): walked through BaseException's own
+    descriptors (`__cause__`, `__context__`, `__suppress_context__`, `__traceback__`), so no code of the exception's
+    own runs; a cycle is found by identity; at most CHAIN_MAX exceptions and FRAMES_MAX frames in all."""
     if exc_info is True or (exc_info and not isinstance(exc_info, (BaseException, tuple))):
         exc_info = sys.exc_info()
     if isinstance(exc_info, BaseException):
@@ -327,17 +340,19 @@ def _exception(exc_info: Any) -> tuple | None:
         return None
     if not isinstance(value, BaseException):
         return None
-    chain, seen, room, cut, e = [], set(), FRAMES_MAX, None, value
+    chain, seen, room, cut, e = [], set(), FRAMES_MAX, [], value
     while e is not None:
         if id(e) in seen:
-            cut = "a cycle"
+            cut.append(CUT_CYCLE)
             break
         if len(chain) == CHAIN_MAX:
-            cut = f"more than {CHAIN_MAX} exceptions"
+            cut.append(CUT_CHAIN)       # (an exception is left out: `e` is a further one)
             break
         seen.add(id(e))
-        frames = _frames(tb if e is value else _TRACEBACK.__get__(e), room)
+        frames, left_out = _frames(tb if e is value else _TRACEBACK.__get__(e), room)
         room -= len(frames)
+        if left_out and CUT_FRAMES not in cut:
+            cut.append(CUT_FRAMES)
         cause = _CAUSE.__get__(e)
         if cause is not None:
             nxt, link = cause, "cause"
@@ -347,9 +362,7 @@ def _exception(exc_info: Any) -> tuple | None:
             nxt, link = None, None
         chain.append((_type_name(e), tuple(frames), link if nxt is not None else None))
         e = nxt
-    if room <= 0 and cut is None:
-        cut = f"more than {FRAMES_MAX} frames"
-    return chain[0][0], chain[0][1], tuple(chain), cut
+    return chain[0][0], chain[0][1], tuple(chain), tuple(cut)
 
 
 def _caller(stacklevel: int) -> tuple[str, int, str]:
@@ -461,7 +474,9 @@ def _exc_text(exc: tuple) -> str:
     """The chain in the order stock `logging` prints it (the innermost first, each followed by how the next one
     relates to it), each as its frames and its type's name only: no exception text, no source lines."""
     chain, cut = exc[2], exc[3]
-    parts = [f"(the chain is cut here: {cut})\n"] if cut else []
+    labels = {CUT_CYCLE: "a cycle", CUT_CHAIN: f"more than {CHAIN_MAX} exceptions",
+              CUT_FRAMES: f"more than {FRAMES_MAX} frames"}       # (rendered here, by the writer: R20)
+    parts = [f"(the chain is cut here: {'; '.join(labels[c] for c in cut)})\n"] if cut else []
     for i in range(len(chain) - 1, -1, -1):
         name, frames, _ = chain[i]
         parts += ["Traceback (frames only: no exception text, no source lines):\n",

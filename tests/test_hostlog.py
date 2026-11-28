@@ -2693,6 +2693,59 @@ def test_r20_the_frames_of_a_chain_are_capped_and_the_cut_is_said(monkeypatch):
     assert len(kept[1]) == 2 and "more than 2 frames" in hostlog._exc_text(kept), kept
 
 
+def _deep_error(n):
+    def deep(k):
+        if k == 0:
+            raise KeyError("k")
+        deep(k - 1)
+    try:
+        deep(n)
+    except KeyError as e:
+        return e
+
+
+def test_r20_the_cut_is_said_only_when_frames_or_exceptions_were_left_out(monkeypatch):
+    """Sol's should on R20: exactly FRAMES_MAX frames, and exactly CHAIN_MAX exceptions, say nothing; one more of
+    either says the cut."""
+    from agent_comms import hostlog
+    e = _deep_error(4)
+    n = len(hostlog._exception(e)[1])
+    monkeypatch.setattr(hostlog, "FRAMES_MAX", n)
+    exact = hostlog._exception(e)
+    assert len(exact[1]) == n and "cut" not in hostlog._exc_text(exact), hostlog._exc_text(exact)
+    monkeypatch.setattr(hostlog, "FRAMES_MAX", n - 1)
+    over = hostlog._exception(e)
+    assert len(over[1]) == n - 1 and f"more than {n - 1} frames" in hostlog._exc_text(over)
+    monkeypatch.undo()
+
+    def chain(length):
+        e = ValueError("0")
+        for i in range(length - 1):
+            nxt = KeyError(str(i))
+            nxt.__cause__ = e
+            e = nxt
+        return e
+    exact = hostlog._exception(chain(hostlog.CHAIN_MAX))
+    assert len(exact[2]) == hostlog.CHAIN_MAX and "cut" not in hostlog._exc_text(exact)
+    over = hostlog._exception(chain(hostlog.CHAIN_MAX + 1))
+    assert len(over[2]) == hostlog.CHAIN_MAX
+    assert f"more than {hostlog.CHAIN_MAX} exceptions" in hostlog._exc_text(over)
+
+
+def test_r20_nothing_of_the_cut_is_formatted_at_the_call(monkeypatch):
+    """Sol's should on R20: the snapshot made at the call (possibly under a host lock) holds only the cut's REASONS,
+    constants of `_CUTS`, never a formatted label; the label is rendered by the writer (`_exc_text`)."""
+    from agent_comms import hostlog
+    monkeypatch.setattr(hostlog, "FRAMES_MAX", 1)
+    a, b = ValueError("a"), KeyError("b")
+    a.__context__, b.__context__ = b, a
+    for kept in (hostlog._exception(_deep_error(3)), hostlog._exception(a)):
+        cut = kept[3]
+        assert type(cut) is tuple and cut and all(c in hostlog._CUTS for c in cut), cut
+        assert all(type(c) is str and c.isidentifier() for c in cut), cut
+        assert "more than" not in repr(kept) and "cycle" not in repr(kept[:3]), kept
+
+
 def test_a4_stale_bookkeeping_fails_closed_and_only_the_reset_clears_it():
     """A4: a depth left one too high, or an `enqueue_only()` registration left behind (as an interrupt in their Python
     exits can leave them, on the main thread), means "never waits": a line is enqueued and the call returns without
