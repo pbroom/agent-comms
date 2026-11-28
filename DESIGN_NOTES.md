@@ -19556,7 +19556,9 @@ SIGTERM. That probe is the seed of the tests below.
 
 The handler is made safe, instead of closing each window one by one.
 
-- **One handler** for SIGTERM and SIGINT: `ShutdownLatch.on_signal` (node.py), installed by `_run` for both.
+- **One handler** for SIGTERM and SIGINT: `ShutdownLatch.on_signal` (node.py), installed by `_run`. SIGTERM always;
+  SIGINT only over Python's own interrupt handler, the disposition on which main shuts down (review round 1, R1,
+  below: any other inherited SIGINT disposition, ignored included, is left as it was).
 - **The FIRST signal** latches "shutting down" (`latched = True`) BEFORE it raises KeyboardInterrupt. That
   interrupt starts the shutdown, as before.
 - **Every LATER signal** only adds one to a counter (`further`) and returns. It never raises.
@@ -19583,8 +19585,9 @@ The handler is made safe, instead of closing each window one by one.
 
 A route that does not come through the handler has an unavoidable window of a few bytecodes between its exception
 and the statement that sets the latch. A signal there is a FIRST signal, so it raises, as every first signal does.
-Production raises KeyboardInterrupt only from this handler (the node replaces Python's own SIGINT handler), so the
-"raised directly" route is a defence.
+What follows from that is stated exactly in review round 1, R2, below. With Python's default SIGINT disposition,
+production raises KeyboardInterrupt only from this handler, so the "raised directly" route is a defence. (An
+embedding's own SIGINT handler, which the node leaves in place since review round 1's R1, may raise one too.)
 
 **Where the three acquire/`try` windows run.** Only the main thread takes signals.
 - `SessionRunner.unproved`: on the main thread only inside `shut_down` (the post-KILL watch), after the latch is
@@ -19663,3 +19666,64 @@ Mutation rows (scripts/steering-mutation-check.py, `LATCH ...`; tests/test_shutd
 selection): the latch set before the raise; a later signal not raising; the exception route out of the loop; an
 interrupt raised directly; `run`'s exception exit; the latch not cleared before the final wait; SIGINT covered; the
 further signals said.
+
+### Review round 1 (Sol: one blocker, one should)
+
+**R1 [blocker]. The first SIGINT behaves exactly as on main, whatever SIGINT disposition the node inherits.** The
+first build replaced SIGINT unconditionally, so a node started with SIGINT ignored (a background shell job, a
+nohup-style launcher, some supervisors) shut down on a SIGINT that main ignores. Now `_run` reads the inherited
+disposition (`signal.getsignal(signal.SIGINT)`) and installs `latch.on_signal` for SIGINT only when it is Python's
+own interrupt handler (`signal.default_int_handler`). That is the one disposition on which main shuts down, and the
+latch's first signal raises the same KeyboardInterrupt on the main thread. Every other disposition is left exactly as
+it was:
+- `SIG_IGN`: SIGINT stays ignored;
+- `SIG_DFL`: the default action, so the process ends by the signal with no shutdown, as on main;
+- another Python callable (an embedding's own handler): it keeps its own behaviour. If that handler raises on every
+  SIGINT, a repeated SIGINT can still interrupt cleanup, as on main. That is the embedding's choice; the node does not
+  override it;
+- `None` (a handler not installed from Python): left alone, because it could not be put back.
+
+SIGTERM is unchanged: main already installed its own handler for it.
+
+Main's behaviour, measured on a 9388477 checkout with the same child script and real signals (the first SIGINT once
+the loop ticks, then a SIGTERM if the node is still running):
+
+| Inherited SIGINT disposition | Main (9388477) |
+| --- | --- |
+| Python's default interrupt handler | the SIGINT shuts it down; `run` returns; exit 0 |
+| `SIG_IGN` | keeps ticking; the SIGTERM shuts it down, exit 0 |
+| another handler | that handler runs; keeps ticking; the SIGTERM shuts it down, exit 0 |
+| `SIG_DFL` | ended by the signal, status -2 |
+
+Tests (tests/test_shutdown_latch.py, real signals in the test's own child, hosted sessions on):
+- `test_an_inherited_ignored_sigint_stays_ignored`: SIGINT ignored. A real SIGINT changes nothing (five more loop
+  ticks follow it). Then a real SIGTERM shuts the node down, and a SECOND SIGTERM in `unproved`'s acquire window is
+  only counted: exit 0, runner lock free, the further signal said once. FAILED on 564aaae: the SIGINT shut it down.
+- `test_the_default_sigint_shuts_down_as_on_main`: Python's default handler. The first real SIGINT shuts the node
+  down: sessions shut down, `run` returns, exit `MAIN_SIGINT_STATUS` = 0 (main's, measured above), and no further
+  signal is said. It passes on 564aaae too: this behaviour did not change, and the test pins it.
+- `test_another_inherited_sigint_handler_is_left_as_it_was`: the embedding's handler runs and the node keeps
+  ticking; SIGTERM then gives exit 0. FAILED on 564aaae.
+- `test_an_inherited_default_action_sigint_still_ends_the_process`: status -SIGINT and no shutdown. FAILED on
+  564aaae (exit 0 after a shutdown).
+- The static pin now requires the SIGINT install to be the only statement of
+  `if signal.getsignal(signal.SIGINT) is signal.default_int_handler:` with no `else`, and the SIGTERM install to be
+  unconditional. It refuses any other signal and any unconditional or otherwise-guarded SIGINT replacement. New
+  refusal fixtures: unconditional SIGINT, SIGINT unless ignored, a widened guard, SIGINT replaced in an `else`, and
+  a conditional SIGTERM.
+- Mutation row "an inherited ignored SIGINT stays ignored" (the guard made `if True:`). "LATCH SIGINT is covered" is
+  re-anchored to the guarded line.
+
+**R2 [should]. The limit before `latch()`, exactly.** On the exits that do not come through the handler (a
+KeyboardInterrupt raised directly, or an ordinary exception, out of the loop; an exception out of `_run`), a FIRST
+signal in the few bytecodes before `latch()` takes effect raises (the handler latches first) and replaces the
+exception in flight. That KeyboardInterrupt leaves the `except` clause it landed in:
+- **In `_run`'s two clauses:** the cleanup that clause would have started (`shut_down`, or the sessions' shutdown)
+  is not run. `run`'s exit takes the interrupt: the further signals are said, the final wait runs, and the status is
+  130. What was not stopped is left to the next node process's recovery.
+- **In `run`'s own clause:** it leaves `run` before the final wait, into the interpreter's exit, as on main.
+
+It cannot recreate the acquire-window deadlock. The main thread's two explicit acquisitions (`unproved`'s and the
+report lock's) run only inside cleanup, which such a signal either skips or finds already latched, so no later
+signal raises there. `try_stopping` runs on threads that take no signals. The same text is in `ShutdownLatch`'s
+docstring.

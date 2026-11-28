@@ -381,7 +381,8 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('N', 'LATCH an interrupt raised directly latches', '        except KeyboardInterrupt:\n            latch.latch()', '        except KeyboardInterrupt:\n            pass'),
     ('N', "LATCH run's exception exit latches", '        except BaseException as e:\n            latch.latch()', '        except BaseException as e:\n            pass'),
     ('N', 'LATCH the latch is not cleared before the final wait', '        latch.latch()\n        latch.say()\n        _exit_if_stalled(0)', '        latch.latched = False\n        latch.say()\n        _exit_if_stalled(0)'),
-    ('N', 'LATCH SIGINT is covered', '    signal.signal(signal.SIGINT, latch.on_signal)', '    pass'),
+    ('N', 'LATCH SIGINT is covered (re-anchored: R1)', '        signal.signal(signal.SIGINT, latch.on_signal)', '        pass'),
+    ('N', 'an inherited ignored SIGINT stays ignored', '    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:\n', '    if True:\n'),
     ('N', 'LATCH the further signals are said', '            if self.further:\n', '            if False:\n')]
 # (Ownership C3-1) The shim's rows run only its own tests: nothing else imports groupshim or shimchild yet.
 ONLY = {"GS": ["tests/test_groupshim.py"], "SC": ["tests/test_groupshim.py"]}
