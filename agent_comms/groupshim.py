@@ -357,7 +357,8 @@ class Shim:
         self.pgid: int | None = None    # the child's pid: its pgid once established (child-side setsid); set at fork
         self.established = False       # GROUP ESTABLISHED: the child said it has done setsid() (the `S` byte read)
         self.exec_confirmed = False     # EXEC CONFIRMED: kqueue NOTE_EXEC (registered before the release byte)
-        self.start_said = False         # STARTED or START_FAILED sent
+        self.start_said = False         # STARTED, START_FAILED or START_UNKNOWN sent
+        self.released = False           # RELEASE was written: the child may exec from then on
         self.pid_only: list[int] = []   # signals sent to the pid before establishment was observed (replayed once)
         self.hs_fd: int | None = None   # the handshake's read end, non-blocking, read in the loop
         self.hs_said = b""
@@ -573,6 +574,7 @@ class Shim:
             # checkout stays retained.
             try:
                 os.write(rel_w, b"G")
+                self.released = True    # (from here an exec may happen: only NOTE_EXEC or a failure report settles it)
             except OSError:
                 pass
         _close(rel_w)                   # (not written: EOF, and the child never enters the checkout)
@@ -745,8 +747,14 @@ class Shim:
             self._settle_start()
 
     def _settle_start(self) -> None:
-        """STARTED at EXEC CONFIRMED (what today's callers have once Popen returns: the CLI runs); START_FAILED with the
-        child's errno when it gave up (exec, chdir...), or 0 when it died before exec without saying why."""
+        """The launch's outcome, said once:
+        - STARTED at EXEC CONFIRMED (NOTE_EXEC; what today's callers have once Popen returns: the CLI runs);
+        - START_FAILED only on POSITIVE evidence that the exec did not happen: the child's own `F<stage> <errno>`
+          report (`START_FAILED <errno>`), or its death while RELEASE was never written (`START_FAILED 0`: it could not
+          exec);
+        - START_UNKNOWN when the child, RELEASED, ended with neither a NOTE_EXEC seen nor a failure report (the kqueue
+          failed and the loop polled, for instance): it may have exec'd, run, and touched its checkout. Never read as
+          "never ran". Cleanup and the marker proof do not depend on which of the three it is."""
         if self.start_said:
             return
         failed = self.hs_said[1:] if self.hs_said.startswith(b"S") else self.hs_said
@@ -759,10 +767,14 @@ class Shim:
             self.emit(f"START_FAILED {int(err) if err.isdigit() else 0}")
             self.diag(f"the CLI did not start: {stage.decode('ascii', 'replace')} failed (errno "
                       f"{err.decode('ascii', 'replace')})")
-        elif self.hs_eof and self.leader_exited:
+        elif self.hs_eof and self.leader_exited and not self.released:
             self.start_said = True
             self.emit("START_FAILED 0")
-            self.diag("the child died before its exec")
+            self.diag("the child died before RELEASE was written: it never exec'd")
+        elif self.hs_eof and self.leader_exited:
+            self.start_said = True
+            self.emit("START_UNKNOWN")
+            self.diag("the child ended, released, with no exec seen and no failure said: its start is unknown")
 
     # -------- signals: only while the anchor holds
 

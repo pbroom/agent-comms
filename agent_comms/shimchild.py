@@ -135,7 +135,10 @@ class ShimChild:
         self._proved = False
         self.events: list[tuple[str, ...]] = []     # every event seen, in order (diagnostics and tests)
         self.cli_pid: int | None = None
-        self.start_errno: int | None = None
+        self.start_errno: int | None = None     # START_FAILED: positive evidence the CLI never exec'd
+        # START_UNKNOWN: the child was released and ended with no exec seen and no failure said: it MAY have run (and
+        # touched its checkout); never read it as "never ran". The proof (`empty()`) is unaffected.
+        self.start_unknown = False
         self.leader_code: int | None = None
         self.nogo: str | None = None
 
@@ -280,6 +283,8 @@ class ShimChild:
                 self.cli_pid = int(args[0])
             elif kind == "START_FAILED" and args and args[0].isdigit():
                 self.start_errno = int(args[0])
+            elif kind == "START_UNKNOWN":
+                self.start_unknown = True
             elif kind == "LEADER_EXIT" and args and args[0].lstrip("-").isdigit():
                 if self.leader_code is None:
                     self.leader_code = int(args[0])

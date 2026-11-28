@@ -18873,7 +18873,8 @@ newline are kept as commands. In each of these cases the CLI is NEVER forked, th
 
 | Event (shim to node) | Meaning |
 | --- | --- |
-| `STARTED <pid>` / `START_FAILED <errno>` | EXEC CONFIRMED / the child could not become the CLI (stage in the log; 0: it died before its exec) |
+| `STARTED <pid>` / `START_FAILED <errno>` | EXEC CONFIRMED / positive evidence that the exec did not happen: the child's own failure report (stage in the log), or `0` for its death while RELEASE was never written |
+| `START_UNKNOWN` | the child, RELEASED, ended with no NOTE_EXEC seen and no failure report (a degraded loop, or a death after RELEASE): it may have exec'd and run; never "never ran" (after Sol's approval of 05fbde5) |
 | `LEADER_EXIT <code>` | the CLI exited: `Popen.returncode`'s value (negative for a signal) |
 | `SENT <sig> pid` / `SENT <sig> group` | the signal was ATTEMPTED successfully, to the child's pid or to its group: never a claim that anything exited |
 | `FAILED <sig> <errno> pid\|group` | the call raised (the attempt still counts for the grace) |
@@ -19002,6 +19003,10 @@ A failure removes the temp file and publishes nothing.
 - **What C3-2 must do when it wires the handle in:** those locks become host locks. Each must be entered as
   `with hostlog.BOUNDARY, lock:` and be covered by the static pin in tests/hostlog_guard.py.
 - **The shim** is a separate program, with its own diagnostics thread and log; it does not use `hostlog`.
+
+**START_UNKNOWN (after Sol's approval of 05fbde5).** `child.start_unknown` (with `start_errno` None) means the launch's
+outcome was not observed. C3-2 must never read it as "never ran": the CLI may have exec'd and touched its checkout,
+so it is reported and handled as a run that ended. Its release still waits for the proof, exactly as for any other.
 
 **LOST (review round 1, A2).** Every reap and shutdown path must ask `child.lost()` on its own, BEFORE it reads
 `poll() is None` as "still running". A lost shim's `poll()` stays None for ever (the CLI's exit is unknown, and is
@@ -19220,7 +19225,8 @@ The tables above have been brought up to date with this round.
   - `test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it[after-setsid|before-setsid]`:
     the node stand-in is SIGKILLed while the child is paused. The shim sends TERM, then KILL at least 0.5 s later,
     then proves the group gone and publishes the marker. The calls are `killpg` after `setsid` and `kill` before it.
-    The log shows `START_FAILED 0` and no `STARTED`.
+    The log shows no `STARTED`. Since the should after 05fbde5 it shows `START_UNKNOWN`, not `START_FAILED 0`: the
+    child was killed after RELEASE was written, saying nothing.
   - `test_r1_a_term_sent_to_the_pid_is_replayed_to_the_group_once_established_and_the_grace_is_unchanged`:
     - the TERM to the pid does not reach the member, and the replay does;
     - the KILL asked for after the replay fires at the first TERM + 2 s, more than 0.3 s before a restarted grace
@@ -19280,6 +19286,7 @@ The tables above have been brought up to date with this round.
 | no | running | none yet | None (running, or its event not read yet) | False | False |
 | no | running or exited | `empty` | the marker's code | True | False |
 | no | running or exited | `never_started` | None (it never ran) | True | False |
+| no, and `START_UNKNOWN` | exited | `empty` | the marker's code | True | False: it MAY have run (its checkout may have been touched), and its group is proved gone |
 | no | exited | none | **None for ever: LOST** | False | **True** |
 
 A valid marker includes one published `UNSYNCED`. **A caller that only ever calls `poll()` sees None for a LOST
@@ -19483,3 +19490,29 @@ scripts/steering-mutation-results.txt.
   - Measured again (20 shims, load average 6.1): `start()` to "ready", median 56.2 ms; to `STARTED`, median 76.6 ms;
     the publish, median 9.5 ms; RSS 18.9 MiB waiting and 19.0 MiB running; 79 modules.
 - **The handle.** It does not log, and its locks are plain `with` locks (see "What C3-2 must replace").
+
+### Ownership C3-1: after Sol's approval of 05fbde5 (one should, fixed)
+
+- **The should.** If the kqueue failed after RELEASE, the shim could not see a successful exec, but `waitid` still
+  proved the exit. `_settle_start()` then said `START_FAILED 0` for a CLI that had in fact run.
+- **The ruling, implemented.**
+  - **`START_FAILED`** only on positive evidence that the exec did not happen: the child's own `F<stage> <errno>`
+    report (`START_FAILED <errno>`, also after RELEASE), or its death while RELEASE was never written
+    (`START_FAILED 0`: it could not exec).
+  - **`START_UNKNOWN`,** a distinct event, otherwise: the child was RELEASED and ended with neither a NOTE_EXEC seen nor
+    a failure report. It is never `STARTED` and never `START_FAILED`.
+  - Cleanup and the marker proof are unchanged.
+  - The handle sets `start_unknown`, with `start_errno` None. It must never be read as "never ran": the checkout may
+    have been touched (see the `poll()` table and "What C3-2 must replace").
+- **The scope, taken literally.** A child killed after RELEASE was written, while still paused before reading it, also
+  says `START_UNKNOWN`, although a healthy watch saw its exit without NOTE_EXEC. That is the R1 node-death tests' case,
+  and their assertion is updated.
+- **Tests (in-process, the kqueue failing on every wait):**
+  - `test_unit_an_exec_whose_outcome_was_not_observed_is_unknown_not_failed`: it failed on 05fbde5, where it gave
+    `START_FAILED 0`;
+  - `test_unit_start_failed_needs_positive_evidence[the child said exec failed|the child said chdir failed|RELEASE
+    never written]`: `START_FAILED 2`, `13` and `0`.
+
+  The real positive cases also still say `START_FAILED <errno>`: the exec failure gives 2, and the child that exits
+  before its registration (RELEASE never written) gives 0.
+- **One row:** "C3-1 an unobserved exec is unknown, not failed" (the branch removed).

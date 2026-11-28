@@ -373,7 +373,8 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('GS', 'C3-1R5 RELEASE is read before chdir', '        stage = "release"\n        # RELEASE, before any checkout work', '        os.chdir(spec["cwd"])\n        stage = "release"\n        # RELEASE, before any checkout work'),
     ('GS', "C3-1R5 the child closes the shim's ends first", '    for fd in shims_ends:\n        _close(fd)', '    for fd in ():\n        _close(fd)'),
     ('GS', 'C3-1R5 the kqueue wait is contained', '            except OSError as e:\n                if not self.degraded:', '            except ZeroDivisionError as e:\n                if not self.degraded:'),
-    ('GS', 'C3-1R6 the watch is installed before RELEASE is written', '        self.gate("register", str(pid))\n        try:\n            self.kq.control([select.kevent(pid,', '        os.write(rel_w, b"G")\n        self.gate("register", str(pid))\n        try:\n            self.kq.control([select.kevent(pid,')]
+    ('GS', 'C3-1R6 the watch is installed before RELEASE is written', '        self.gate("register", str(pid))\n        try:\n            self.kq.control([select.kevent(pid,', '        os.write(rel_w, b"G")\n        self.gate("register", str(pid))\n        try:\n            self.kq.control([select.kevent(pid,'),
+    ('GS', 'C3-1 an unobserved exec is unknown, not failed', '        elif self.hs_eof and self.leader_exited and not self.released:\n', '        elif self.hs_eof and self.leader_exited:\n')]
 # (Ownership C3-1) The shim's rows run only its own tests: nothing else imports groupshim or shimchild yet.
 ONLY = {"GS": ["tests/test_groupshim.py"], "SC": ["tests/test_groupshim.py"]}
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",

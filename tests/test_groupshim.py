@@ -1243,7 +1243,8 @@ def test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_s
         t_kill = diag_times(log_path, f"{call}({pid}, KILL) sent")
         assert t_term and t_kill and t_kill[0] - t_term[0] >= 0.5, (t_term, t_kill)
         log = log_path.read_text()
-        assert "EOF on the command pipe" in log and "event STARTED" not in log and "event START_FAILED 0" in log
+        assert "EOF on the command pipe" in log and "event STARTED" not in log and "event START_UNKNOWN" in log
+        assert "event START_FAILED" not in log, "killed after RELEASE was written, saying nothing: unknown, not failed"
         assert wait_for(lambda: gone(p["shim"]))
     finally:
         for name in ("abort", f"{where}.go"):
@@ -1303,6 +1304,7 @@ def test_r1_a_kill_sent_to_the_pid_is_replayed_to_the_group_once_established(kit
     (c.gate_dir / "defer-handshake.go").write_text("")
     assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
     assert ("SENT", "TERM", "group") in c.events and ("SENT", "KILL", "group") in c.events
+    assert c.start_unknown and c.start_errno is None, "killed after RELEASE, saying nothing: the handle says unknown"
     assert wait_for(lambda: (kinfo(member) or (SZOMB, 0, 0))[2] != pid or kinfo(member) is None)
 
 
@@ -1576,3 +1578,47 @@ def test_unit_r5_the_loop_survives_every_non_essential_failure(shim):
     sigs = [c[1] for c in f.calls if c[0] == "killpg"]
     assert sigs[:2] == [signal.SIGTERM, signal.SIGKILL] and marker_proves(shim.marker, shim.nonce, shim.boot)
     assert shim.degraded and shim.leader_code == -signal.SIGKILL
+
+
+# ---------------------------------------------------------------- Sol's should on 05fbde5: an unobserved exec is UNKNOWN
+
+def _degraded_launch(shim, said: bytes, released: bool):
+    """In process: a child whose handshake said `said` and then closed (its exec, or its death), RELEASE written or
+    not, and a kqueue whose every wait fails (so NOTE_EXEC can never be seen); the child's exit is polled by waitid
+    (exit 0), and the group listing then proves it empty."""
+    Fakes(shim, [(shim.pgid,), ()])
+    r, w = os.pipe()
+    os.write(w, said)
+    os.close(w)                         # (the child's end closed: at its exec, or at its death)
+    os.set_blocking(r, False)
+
+    class BrokenKq:
+        def control(self, *a, **k):
+            raise OSError(9, "injected EBADF")
+    shim.kq, shim.hs_fd, shim.established = BrokenKq(), r, False
+    shim.watching, shim.released, shim.eof = True, released, True   # (no command pipe here: nothing is read from it)
+    shim.waitid = lambda pid: 0
+    ticks = iter(range(1000))
+    shim.clock = lambda: 100.0 + next(ticks) * 0.05
+    assert shim.run() == groupshim.EXIT_EMPTY
+    return events_of(shim)
+
+
+def test_unit_an_exec_whose_outcome_was_not_observed_is_unknown_not_failed(shim):
+    """With the kqueue failing after RELEASE, a child that said `S`, then closed its handshake (it exec'd) and exited is
+    reported START_UNKNOWN: not STARTED (NOTE_EXEC was never seen), and never START_FAILED (nothing shows it did not
+    run: its checkout may have been touched). Cleanup and the proof are unaffected. (On 05fbde5: START_FAILED 0.)"""
+    said = _degraded_launch(shim, b"S", released=True)
+    assert "START_UNKNOWN" in said and "START_FAILED" not in said and "STARTED" not in said, said
+    assert said.index("START_UNKNOWN") < said.index("LEADER_EXIT") < said.index("EMPTY")
+    assert marker_proves(shim.marker, shim.nonce, shim.boot)
+
+
+@pytest.mark.parametrize("said,released,errno", [(b"Sexec 2\n", True, "2"), (b"Schdir 13\n", True, "13"),
+                                                 (b"S", False, "0")],
+                         ids=["the child said exec failed", "the child said chdir failed", "RELEASE never written"])
+def test_unit_start_failed_needs_positive_evidence(shim, said, released, errno):
+    """START_FAILED only on positive evidence that the exec did not happen: the child's own `F<stage> <errno>` report
+    (after RELEASE too), or a death while RELEASE was never written (it could not exec)."""
+    said = _degraded_launch(shim, said.replace(b"Sexec", b"SFexec").replace(b"Schdir", b"SFchdir"), released)
+    assert said[said.index("START_FAILED") + 1] == errno and "START_UNKNOWN" not in said, said
