@@ -18038,3 +18038,20 @@ failed listing), with the real listing proved elsewhere (C1's R4).
 - A direct `spawn_piped`: median 3.8 ms.
 - RSS: 18.0 MiB waiting for `GO`, and 18.1 MiB while its CLI runs.
 - 67 modules are imported. The diagnostics thread adds no measurable start-up time.
+
+#### Mutation check (review round 1)
+
+47 C3-1 rows: every earlier one (the 7 whose lines this round rewrote re-anchored) and the round's 15 new ones:
+- R1 (6): the command pipe watched during the launch, no group signal before establishment, the group once
+  established, the replay, the remembering of a pid-only signal, and the release before exec.
+- R2 (3): the non-blocking open (and the `lstat` before it), the regular-file check, the strict version.
+- R3 (1): `poll()` reads the marker by itself.
+- R4 (4): a temp-file sync failure publishes nothing, a directory-sync failure is said and exits non-zero, no
+  diagnostic write in the loop, and a failing sink cannot raise into it.
+
+**On 655a75d** (load averages about 8): 46 of 47 are caught.
+- **Missed, and equivalent as before:** "the shim keeps SIGCHLD at its default".
+- "No diagnostic write in the loop" is caught first, under `-x`, by a c5 test (its log lines doubled). Run alone
+  against the stalled-sink tests, it is caught by both of them.
+
+The results are in scripts/steering-mutation-results.txt.
