@@ -230,7 +230,8 @@ class Kit:
         if gate:
             g = d / "gate"
             g.mkdir()
-        c = ShimChild.start(marker=str(d / "marker.json"), log=str(d / "shim.log"), stderr_log=str(d / "stderr.log"),
+        kw.setdefault("stderr_log", str(d / "stderr.log"))
+        c = ShimChild.start(marker=str(d / "marker.json"), log=str(d / "shim.log"),
                             test_gate=None if g is None else str(g), **kw)
         c.dir, c.gate_dir = d, g
         self.children.append(c)
@@ -711,6 +712,26 @@ def test_c6_stdio_env_and_session_are_what_a_direct_spawn_gives(kit):
         got[how] = b"\n".join(lines)
     assert got["shim"] == got["direct"]
     assert sorted(got["shim"].rstrip(b"\0").split(b"\0")) == sorted(f"{k}={v}".encode() for k, v in ENV.items())
+
+
+def test_c6_a_dispatched_runs_stdio_is_what_spawn_process_gives(kit):
+    """`piped=False`: a dispatched run's shape. The same stand-in through dispatch.spawn_process (today) and through
+    the shim: stdin is /dev/null (it reads EOF at once), stdout and stderr land in one new log, byte for byte."""
+    from agent_comms.dispatch import spawn_process
+    argv = kit.argv(echo=True, stderr="err line\n", exit=6)
+    direct = spawn_process(argv, cwd=str(kit.work), env=ENV, log_path=kit.tmp / "run-direct.log")
+    kit.procs.append(direct.proc)
+    c = kit.start(piped=False)
+    c.go(argv, cwd=str(kit.work), env=ENV, kill_grace=1.0)
+    assert shim_exit(c) == groupshim.EXIT_EMPTY and c.poll() == 6
+    assert wait_for(lambda: direct.poll() is not None) and direct.poll() == 6
+    got = (c.dir / "stderr.log").read_bytes()
+    assert got == (kit.tmp / "run-direct.log").read_bytes() == b"got 0\n\nend\nerr line\n"
+    assert c.eof and c.bytes_read == 0
+    with pytest.raises(BrokenPipeError):
+        c.write(b"x")
+    with pytest.raises(FileExistsError):
+        kit.start(piped=False, stderr_log=str(c.dir / "stderr.log"))      # (a run's log is always a new file)
 
 
 def test_c6_the_shim_keeps_no_copy_of_the_clis_stdio(kit):

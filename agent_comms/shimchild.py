@@ -15,7 +15,9 @@ place of the CLI's `Popen` once C3-2 wires it in. NOT used by any spawn site yet
   shim's pipe mid-write. A closed or broken pipe raises `BrokenPipeError`; a full one `BlockingIOError` (both
   `OSError`, the shape today's callers handle for a failed signal).
 - The I/O contract (`write`, `read_lines`, `close_stdin`, `close`, `eof`, `bytes_read`) is dispatch.PipedChild's own
-  code, over the shim's stdin and stdout pipes, which the CLI inherits as its stdio.
+  code, over the shim's stdin and stdout pipes, which the CLI inherits as its stdio (a hosted session's shape,
+  `spawn_piped`). `piped=False` gives a dispatched run's shape instead (`spawn_process`: stdin /dev/null, stdout and
+  stderr to one new log), with no I/O methods.
 - `pid` is the SHIM's pid (the node's own unreaped child, so pinned until `shim_poll()` reaps it); `cli_pid` is the
   CLI's, for diagnostics only: nothing signals or probes it by number.
 
@@ -77,7 +79,8 @@ class ShimChild:
         self.proc = proc
         self.pid = proc.pid             # the shim's (see the module text)
         self.nonce, self.boot, self.marker = nonce, boot, marker
-        self._io = PipedChild(proc)     # (its stdin/stdout pipes, non-blocking: today's I/O contract)
+        # (piped: its stdin/stdout pipes, non-blocking: today's I/O contract; else no I/O, as spawn_process's child)
+        self._io = PipedChild(proc) if proc.stdin is not None else None
         self._wlock = threading.Lock()  # pins the command endpoint through each write, and its close
         self._rlock = threading.Lock()  # the same for the event endpoint: each read, and its close
         self._cmd: int | None = cmd_w
@@ -95,9 +98,13 @@ class ShimChild:
 
     @classmethod
     def start(cls, *, marker: str, log: str, stderr_log: str, nonce: str | None = None, boot: str | None = None,
-              cwd: str = "/", python: str | None = None, test_gate: str | None = None) -> "ShimChild":
+              cwd: str = "/", python: str | None = None, test_gate: str | None = None,
+              piped: bool = True) -> "ShimChild":
         """Spawn the shim; return before GO. `marker`: where it publishes its proof (its directory must exist);
-        `log`: its own diagnostics; `stderr_log`: the CLI's stderr, appended, mode 600 (as `spawn_piped`)."""
+        `log`: its own diagnostics. The CLI's stdio, exactly today's: `piped` (a hosted session, as `spawn_piped`):
+        stdin and stdout are pipes to the node and stderr is appended to `stderr_log`, mode 600; not `piped` (a
+        dispatched run, as `spawn_process`): stdin is /dev/null and stdout and stderr go to `stderr_log`, a NEW file
+        (O_EXCL), mode 600."""
         nonce = nonce if nonce is not None else secrets.token_hex(16)
         boot = boot if boot is not None else boot_id()
         if boot is None:
@@ -106,7 +113,8 @@ class ShimChild:
         evt_r = evt_w = err_fd = -1
         try:
             evt_r, evt_w = os.pipe()
-            err_fd = os.open(stderr_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            flags = os.O_APPEND if piped else os.O_EXCL
+            err_fd = os.open(stderr_log, os.O_WRONLY | os.O_CREAT | flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
             os.fchmod(err_fd, 0o600)
             argv = [python or sys.executable, "-I", "-c", _BOOT, _PACKAGE_ROOT, "--version", str(groupshim.PROTOCOL),
                     "--nonce", nonce, "--boot", boot, "--marker", marker, "--cmd-fd", str(cmd_r),
@@ -114,7 +122,9 @@ class ShimChild:
             if test_gate is not None:
                 argv += ["--test-gate", test_gate]
             proc = subprocess.Popen(argv, shell=False, cwd=cwd, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err_fd, close_fds=True,
+                                    stdin=subprocess.PIPE if piped else subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE if piped else err_fd,
+                                    stderr=err_fd if piped else subprocess.STDOUT, close_fds=True,
                                     pass_fds=(cmd_r, evt_w), start_new_session=True, bufsize=0)
         except BaseException:
             for fd in (cmd_w, evt_r):
@@ -279,29 +289,36 @@ class ShimChild:
             return False
         return not self.empty()
 
-    # -------- today's I/O contract (dispatch.PipedChild's code, over the shim's stdio pipes)
+    # -------- today's I/O contract (dispatch.PipedChild's code, over the shim's stdio pipes; `piped` only)
+
+    def _piped(self) -> PipedChild:
+        if self._io is None:
+            raise BrokenPipeError(errno.EPIPE, "this CLI's stdio is not piped to the node")
+        return self._io
 
     def write(self, data: bytes) -> int:
-        return self._io.write(data)
+        return self._piped().write(data)
 
     def read_lines(self) -> list[bytes]:
-        return self._io.read_lines()
+        return self._piped().read_lines()
 
     def close_stdin(self) -> None:
-        self._io.close_stdin()
+        if self._io is not None:
+            self._io.close_stdin()
 
     @property
     def eof(self) -> bool:
-        return self._io.eof
+        return self._io is None or self._io.eof
 
     @property
     def bytes_read(self) -> int:
-        return self._io.bytes_read
+        return 0 if self._io is None else self._io.bytes_read
 
     def close(self) -> None:
         """Release every pipe: stdin, stdout, the event pipe and the command pipe. Meant for after the shim's exit; a
         shim still running takes the command pipe's close as the node letting go, and stops its group."""
-        self._io.close()
+        if self._io is not None:
+            self._io.close()
         with self._wlock:
             self._close_cmd()
         with self._rlock:
