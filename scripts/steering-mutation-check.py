@@ -2,7 +2,7 @@
 (never a working tree), the steering tests run first and, only if they did not catch it, the wider tests; the file
 restored after each. The rows are review rounds 2 to 10's (DESIGN_NOTES "Mid-turn steering, step 3", each round's
 "Mutation check") and the enabling PR's ("Enabling Claude steering"): each is (file, name, the exact text, what replaces it); a row whose text is no longer there once
-is reported STALE.
+is reported STALE. (Ownership C3-1) Rows on the shim (GS, SC) run only tests/test_groupshim.py (`ONLY`).
 
     git archive HEAD | tar -x -C /tmp/export
     python scripts/steering-mutation-check.py /tmp/export [ROW|ROW...] > results.txt
@@ -16,7 +16,8 @@ from pathlib import Path
 FILES = {"A": "agent_comms/providers/claude.py", "H": "agent_comms/session_host.py", "ST": "agent_comms/hosted_steer.py",
          "HS": "agent_comms/hosted.py", "NS": "agent_comms/node_sessions.py", "API": "agent_comms/api.py",
          "G": "agent_comms/node_groups.py", "D": "agent_comms/dispatch.py",
-         "L": "agent_comms/hostlog.py", "N": "agent_comms/node.py"}
+         "L": "agent_comms/hostlog.py", "N": "agent_comms/node.py",
+         "GS": "agent_comms/groupshim.py", "SC": "agent_comms/shimchild.py"}
 ROWS = [('A', "F init naming S in N's bracket is a contradiction", '                if names_s:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")', '                if False:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")'),
     ('A', "F S's init: no origin", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and scalar is None'),
     ('A', "F S's init: no scalar", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and quiet'),
@@ -321,6 +322,59 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('N', "C1R6 the node's watch covers the sessions (re-anchored)", '            if not waiting and not (others is not None and others(max(left, 0.0))):', '            if not waiting:'),
     ('L', 'R20 the cut is said only when something was left out', '    return frames, tb is not None', '    return frames, len(frames) >= room'),
     ('L', "R20 the cut's label is rendered by the writer, not at the call", '            cut.append(CUT_FRAMES)', '            cut.append(f"more than {FRAMES_MAX} frames")'),
+    ('GS', 'C3-1 the latch comes before the reap', '        self.latched = True             # signalling OFF, for good, BEFORE the anchor goes\n        self._reap()', '        self._reap()\n        self.latched = True'),
+    ('GS', 'C3-1 every signal asks the anchor first', '        if not self.anchored():\n            self.emit(f"REFUSED {name}")\n            return False', '        if False:\n            self.emit(f"REFUSED {name}")\n            return False'),
+    ('GS', 'C3-1 the anchor needs the CLI unreaped', '        return self.pgid is not None and not self.reaped and not self.latched', '        return self.pgid is not None and not self.latched'),
+    ('GS', 'C3-1 the anchor needs signalling not latched off', '        return self.pgid is not None and not self.reaped and not self.latched', '        return self.pgid is not None and not self.reaped'),
+    ('GS', 'C3-1 a KILL request waits for the first TERM attempt + the grace', '        if self.clock() >= due:\n            self._kill_now()', '        if True:\n            self._kill_now()'),
+    ('GS', 'C3-1 the one KILL sender refuses before the grace', '        if self.first_term_at is None or now < self.first_term_at + self.grace:', '        if self.first_term_at is None:'),
+    ('GS', 'C3-1 an early KILL is remembered', '            self.kill_due = due if self.kill_due is None else min(self.kill_due, due)', '            pass'),
+    ('GS', 'C3-1 KILL repeated every grace after EOF', '        if self._signal(signal.SIGKILL) and self.eof:', '        if self._signal(signal.SIGKILL) and False:'),
+    ('GS', 'C3-1 absence is required after the reap', '        if after is None or after != ():', '        if False:'),
+    ('GS', 'C3-1 a failed post-reap listing is unproved', '        if after is None or after != ():', '        if after is not None and after != ():'),
+    ('GS', "C3-1 the marker carries this launch's nonce", '        record = {"v": PROTOCOL, "nonce": self.nonce, "boot": self.boot,', '        record = {"v": PROTOCOL, "nonce": "0" * 32, "boot": self.boot,'),
+    ('GS', 'C3-1 the marker carries this boot', '        record = {"v": PROTOCOL, "nonce": self.nonce, "boot": self.boot,', '        record = {"v": PROTOCOL, "nonce": self.nonce, "boot": "1.000000",'),
+    ('GS', 'C3-1 a partial GO never starts', '                    raise NoGo("partial" if self.buf else "eof")', '                    if self.buf:\n                        return parse_go(self.buf)\n                    raise NoGo("eof")'),
+    ('GS', 'C3-1 the event pipe is non-blocking', '        for fd in (shim.cmd_fd, shim.event_fd):\n            os.fstat(fd)\n            os.set_inheritable(fd, False)\n            os.set_blocking(fd, False)', '        for fd in (shim.cmd_fd, shim.event_fd):\n            os.fstat(fd)\n            os.set_inheritable(fd, False)\n            os.set_blocking(fd, fd == shim.event_fd)'),
+    ('GS', 'C3-1 the CLI leads its own session', '        os.setsid()\n        os.write(hs_w, b"S")', '        os.write(hs_w, b"S")'),
+    ('GS', "C3-1 a direct child's SIGPIPE and SIGXFSZ", '        for s in (signal.SIGPIPE, signal.SIGXFSZ):      # what', '        for s in ():      # what'),
+    ('GS', "C3-1 the node's ignored signals, ignored for the CLI", '        for s in ignored:                               # ignored', '        for s in ():                               # ignored'),
+    ('GS', 'C3-1 the shim keeps SIGCHLD at its default', '    if signal.SIGCHLD in ignored:\n        signal.signal(signal.SIGCHLD, signal.SIG_DFL)', '    if False:\n        signal.signal(signal.SIGCHLD, signal.SIG_DFL)'),
+    ('SC', "C3-1 the events are drained before the shim's exit is said", '        for _ in range(1024):\n            if self._pump():', '        for _ in range(0):\n            if self._pump():'),
+    ('SC', 'C3-1 lost only once the shim has exited', '        if self._drained_exit() is None:\n            return False', '        if self._drained_exit() is None and False:\n            return False'),
+    ('SC', 'C3-1 a stop before GO is never-start', '            if not self._went:\n                self._close_cmd()', '            if False:\n                self._close_cmd()'),
+    ('SC', 'C3-1 the command write is pinned under the lock', '    def _command(self, word: bytes) -> None:\n        with self._wlock:', '    def _command(self, word: bytes) -> None:\n        if True:'),
+    ('SC', 'C3-1 GO waits with poll, not select (FD_SETSIZE)', '    p = select.poll()\n    p.register(fd, select.POLLOUT)\n    p.poll(max(0, int(timeout * 1000)))', '    select.select([], [fd], [], timeout)'),
+    ('GS', 'C3-1 the grace runs from the TERM attempt, sent or failed (re-anchored twice)', '        at = self.clock()\n        if sig == signal.SIGTERM and self.first_term_at is None:\n            self.first_term_at = at     # the ATTEMPT starts the grace, whatever it answers\n        scope = "group" if group else "pid"\n        call = f"{\'killpg\' if group else \'kill\'}({self.pgid}, {name})"\n        try:\n            if group:\n                self.killpg(self.pgid, sig)\n            else:\n                self.kill(self.pgid, sig)\n', '        at = self.clock()\n        scope = "group" if group else "pid"\n        call = f"{\'killpg\' if group else \'kill\'}({self.pgid}, {name})"\n        try:\n            if group:\n                self.killpg(self.pgid, sig)\n            else:\n                self.kill(self.pgid, sig)\n            if sig == signal.SIGTERM and self.first_term_at is None:\n                self.first_term_at = at\n'),
+    ('GS', 'C3-1 EOF stops the group (re-anchored)', '        self._kill_request()            # (the signal first; its diagnostic after)\n        self.diag("EOF on the command pipe', '        self.diag("EOF on the command pipe'),
+    ('GS', 'C3-1 never started publishes the bound marker (re-anchored)', '        failed = self.publish("never_started")\n        if failed == EXIT_MARKER_FAILED:\n            return failed\n        self.emit("EMPTY")\n        return EXIT_NOGO if failed is None else failed', '        self.emit("EMPTY")\n        return EXIT_NOGO'),
+    ('SC', 'C3-1 the proof checks the nonce (re-anchored)', 'if type(rec["nonce"]) is not str or rec["nonce"] != nonce or type(rec["boot"])', 'if type(rec["nonce"]) is not str or type(rec["boot"])'),
+    ('SC', 'C3-1 the proof checks the boot (re-anchored)', ' or rec["boot"] != boot:\n', ':\n'),
+    ('SC', 'C3-1 the EMPTY event is no proof (re-anchored)', '            self._proved = read_marker(self.marker, self.nonce, self.boot) is not None', '            self._proved = ("EMPTY",) in self.events or read_marker(self.marker, self.nonce, self.boot) is not None'),
+    ('GS', 'C3-1R1 the command pipe is watched during the launch', '                elif ev.filter == select.KQ_FILTER_READ and ev.ident == self.cmd_fd:\n', '                elif ev.filter == select.KQ_FILTER_READ and ev.ident == self.cmd_fd and self.start_said:\n'),
+    ('GS', 'C3-1R1 no group signal before establishment is observed', '        group = self.established\n', '        group = True\n'),
+    ('GS', 'C3-1R1 the group, not the pid, once established', '        group = self.established\n', '        group = False\n'),
+    ('GS', 'C3-1R1 a pid-only signal is replayed to the group', '        for sig in list(self.pid_only):\n            self._signal(sig)', '        for sig in []:\n            self._signal(sig)'),
+    ('GS', 'C3-1R1 a pid-only signal is remembered', '        if not group and sig not in self.pid_only:\n            self.pid_only.append(sig)', '        if False:\n            self.pid_only.append(sig)'),
+    ('SC', 'C3-1R2 the reader opens without waiting (and looks before it opens)', '        if not stat.S_ISREG(st.st_mode) or st.st_size > MARKER_MAX:\n            return None\n        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)', '        if st.st_size > MARKER_MAX:\n            return None\n        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)'),
+    ('SC', 'C3-1R2 the reader takes a regular file only', '        if not stat.S_ISREG(st.st_mode) or st.st_size > MARKER_MAX:\n            return None\n        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)\n        try:\n            got = os.fstat(fd)\n            if not stat.S_ISREG(got.st_mode) or (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):', '        if st.st_size > MARKER_MAX:\n            return None\n        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)\n        try:\n            got = os.fstat(fd)\n            if False:'),
+    ('SC', 'C3-1R2 the strict version', '        if type(rec["v"]) is not int or rec["v"] != groupshim.PROTOCOL:', '        if rec["v"] != groupshim.PROTOCOL:'),
+    ('SC', 'C3-1R3 poll() reads the marker by itself', '        if self.leader_code is None:\n            rec = read_marker(', '        if self.leader_code is None and self.proc.returncode is not None:\n            rec = read_marker('),
+    ('GS', 'C3-1R4 a temp-file sync failure publishes nothing', '        _fullsync(fd)\n        os.close(fd)\n        fd = -1\n        os.rename(tmp, path)', '        try:\n            _fullsync(fd)\n        except OSError:\n            pass\n        os.close(fd)\n        fd = -1\n        os.rename(tmp, path)'),
+    ('GS', 'C3-1R4 a directory-sync failure is said, and exits non-zero', '        if result == UNSYNCED:\n            self.emit(f"UNSYNCED {err}")', '        if False:\n            self.emit(f"UNSYNCED {err}")'),
+    ('GS', 'C3-1R4 the diagnostics never write in the loop', '            self.lines.append(line)\n            self.cond.notify()\n', '            self.lines.append(line)\n            self.cond.notify()\n        if self.path is not None:\n            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)\n            os.write(fd, line.encode())\n            os.close(fd)\n'),
+    ('GS', 'C3-1R4 a failing sink cannot raise into the loop', '        try:\n            self.sink.put(msg)\n        except Exception:\n            pass', '        self.sink.put(msg)'),
+    ('GS', 'C3-1 a failed listing is never empty (re-anchored)', '        if members is None or not set(members) <= {self.pgid} or self._exited() is None:', '        if members is not None and (not set(members) <= {self.pgid} or self._exited() is None):'),
+    ('GS', 'C3-1 a listed member is never empty (re-anchored)', '        if members is None or not set(members) <= {self.pgid} or self._exited() is None:', '        if members is None or self._exited() is None:'),
+    ('GS', 'C3-1 the leader is a confirmed zombie (re-anchored)', '        if members is None or not set(members) <= {self.pgid} or self._exited() is None:', '        if members is None or not set(members) <= {self.pgid}:'),
+    ('GS', "C3-1 the shim drops its copies of the CLI's stdio (re-anchored twice)", '        for fd in (hs_w, rel_r, *stdio):\n            _close(fd)                # the CLI', '        for fd in (hs_w, rel_r):\n            _close(fd)                # the CLI'),
+    ('GS', 'C3-1R1 the child execs only once released (re-anchored)', '        if os.read(rel_r, 1) != b"G":\n            raise OSError(0, "not released")\n', ''),
+    ('GS', 'C3-1R5 the diagnostics start is best-effort', '        except Exception:\n            self.failed = True', '        except ZeroDivisionError:\n            self.failed = True'),
+    ('GS', 'C3-1R5 RELEASE is read before chdir', '        stage = "release"\n        # RELEASE, before any checkout work', '        os.chdir(spec["cwd"])\n        stage = "release"\n        # RELEASE, before any checkout work'),
+    ('GS', "C3-1R5 the child closes the shim's ends first", '    for fd in shims_ends:\n        _close(fd)', '    for fd in ():\n        _close(fd)'),
+    ('GS', 'C3-1R5 the kqueue wait is contained', '            except OSError as e:\n                if not self.degraded:', '            except ZeroDivisionError as e:\n                if not self.degraded:'),
+    ('GS', 'C3-1R6 the watch is installed before RELEASE is written', '        self.gate("register", str(pid))\n        try:\n            self.kq.control([select.kevent(pid,', '        os.write(rel_w, b"G")\n        self.gate("register", str(pid))\n        try:\n            self.kq.control([select.kevent(pid,'),
+    ('GS', 'C3-1 an unobserved exec is unknown, not failed', '        elif self.hs_eof and self.leader_exited and not self.released:\n', '        elif self.hs_eof and self.leader_exited:\n'),
     ('N', 'LATCH the first signal latches before it raises', '        self.latched = True\n        raise KeyboardInterrupt', '        raise KeyboardInterrupt\n        self.latched = True'),
     ('N', 'LATCH a later signal only counts: it does not raise', '            self.further += 1\n            return\n', '            self.further += 1\n'),
     ('N', 'LATCH the exception route out of the loop latches', '        except BaseException:\n            latch.latch()', '        except BaseException:\n            pass'),
@@ -329,6 +383,8 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('N', 'LATCH the latch is not cleared before the final wait', '        latch.latch()\n        latch.say()\n        _exit_if_stalled(0)', '        latch.latched = False\n        latch.say()\n        _exit_if_stalled(0)'),
     ('N', 'LATCH SIGINT is covered', '    signal.signal(signal.SIGINT, latch.on_signal)', '    pass'),
     ('N', 'LATCH the further signals are said', '            if self.further:\n', '            if False:\n')]
+# (Ownership C3-1) The shim's rows run only its own tests: nothing else imports groupshim or shimchild yet.
+ONLY = {"GS": ["tests/test_groupshim.py"], "SC": ["tests/test_groupshim.py"]}
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
          "tests/test_ownership_c1.py", "tests/test_hostlog.py", "tests/test_shutdown_latch.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",
@@ -352,7 +408,7 @@ def main() -> int:
         path.write_text(text.replace(old, new, 1))
         try:
             failed = []
-            for sel in (FIRST, REST):
+            for sel in ((ONLY[key],) if key in ONLY else (FIRST, REST)):
                 r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-x", *sel],
                                    cwd=root, capture_output=True, text=True, timeout=1800)
                 failed = sorted(set(re.findall(r"^FAILED (\S+)", r.stdout, re.M)))

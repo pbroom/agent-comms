@@ -613,4 +613,237 @@ CAUGHT  R20 the cut's label is rendered by the writer, not at the call  test_r20
 rows: 8
 stale or broken: []
 missed: []
+
+# Ownership C3-1 (DESIGN_NOTES "Ownership C3-1: the group supervisor (unwired)"): the shim's rows (GS, SC). They run
+# tests/test_groupshim.py only (`ONLY`). On 5f402fe (its code is 3ecb22c's), load averages 24 to 36: 32 of 33 caught.
+# - MISSED, and equivalent: "the shim keeps SIGCHLD at its default". On macOS an ignore inherited across exec still
+#   leaves zombies (measured), and the shim never sets one itself, so no test can see the reset.
+# - "the event pipe is non-blocking" was first written backwards (it made the COMMAND fd blocking, and was caught by
+#   another test); corrected to make the event fd blocking, it was re-run alone and is caught by the full-event-pipe
+#   test, as intended.
+
+commit 5f402fe
+CAUGHT  C3-1 the latch comes before the reap  test_unit_the_latch_comes_before_the_reap_and_absence_is_required_after_it
+CAUGHT  C3-1 every signal asks the anchor first  test_unit_the_latch_comes_before_the_reap_and_absence_is_required_after_it
+CAUGHT  C3-1 the anchor needs the CLI unreaped  test_unit_no_signal_without_the_anchor[reaped]
+CAUGHT  C3-1 the anchor needs signalling not latched off  test_unit_no_signal_without_the_anchor[latched]
+CAUGHT  C3-1 a KILL request waits for the first TERM attempt + the grace  test_c5_no_kill_before_the_grace_after_the_first_term_attempt[term_then_early_kill]
+CAUGHT  C3-1 the one KILL sender refuses before the grace  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 an early KILL is remembered  test_c3_the_node_dies_and_its_shims_stop_their_groups_with_a_sibling_and_a_closed_event_pipe
+CAUGHT  C3-1 the grace runs from the TERM attempt, sent or failed  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 KILL repeated every grace after EOF  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 EOF stops the group  test_c3_the_node_dies_and_its_shims_stop_their_groups_with_a_sibling_and_a_closed_event_pipe
+CAUGHT  C3-1 a failed listing is never empty  test_unit_a_failed_or_nonempty_listing_is_never_empty[failed]
+CAUGHT  C3-1 a listed member is never empty  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 the leader is a confirmed zombie  test_unit_an_unconfirmed_zombie_is_never_empty
+CAUGHT  C3-1 absence is required after the reap  test_unit_unproved_after_the_reap[leader-pid-reused]
+CAUGHT  C3-1 a failed post-reap listing is unproved  test_unit_unproved_after_the_reap[failed]
+CAUGHT  C3-1 the marker carries this launch's nonce  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 the marker carries this boot  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 never started publishes the bound marker  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[eof-eof]
+CAUGHT  C3-1 a partial GO never starts  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[partial-partial]
+CAUGHT  C3-1 the event pipe is non-blocking  test_c3_the_node_dies_with_its_event_pipe_full_and_cleanup_still_completes   (re-run with the row corrected: see above)
+CAUGHT  C3-1 the shim drops its copies of the CLI's stdio  test_c6_stdio_env_and_session_are_what_a_direct_spawn_gives
+CAUGHT  C3-1 the CLI leads its own session  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 a direct child's SIGPIPE and SIGXFSZ  test_c6_signal_dispositions_are_what_a_direct_spawn_gives_and_an_ignored_sigchld_does_not_unanchor
+CAUGHT  C3-1 the node's ignored signals, ignored for the CLI  test_c6_signal_dispositions_are_what_a_direct_spawn_gives_and_an_ignored_sigchld_does_not_unanchor
+MISSED  C3-1 the shim keeps SIGCHLD at its default  
+CAUGHT  C3-1 the proof checks the nonce  test_c7_a_marker_of_another_launch_or_boot_is_no_proof
+CAUGHT  C3-1 the proof checks the boot  test_c7_a_marker_of_another_launch_or_boot_is_no_proof
+CAUGHT  C3-1 the EMPTY event is no proof  test_c7_the_empty_event_alone_is_no_proof
+CAUGHT  C3-1 the events are drained before the shim's exit is said  test_c1_an_exec_failure_is_said_and_then_proved_empty
+CAUGHT  C3-1 lost only once the shim has exited  test_c7_a_shim_that_exits_without_a_marker_is_lost
+CAUGHT  C3-1 a stop before GO is never-start  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[terminate-eof]
+CAUGHT  C3-1 the command write is pinned under the lock  test_c7_a_concurrent_retirement_cannot_close_the_pipe_under_a_write
+CAUGHT  C3-1 GO waits with poll, not select (FD_SETSIZE)  test_c7_go_waits_for_a_command_fd_above_fd_setsize
+rows: 33
+stale or broken: []
+missed: ['C3-1 the shim keeps SIGCHLD at its default']
 exit 0
+
+# Ownership C3-1, code review round 1 (DESIGN_NOTES "Ownership C3-1: code review round 1"): every C3-1 row, the 7 whose
+# lines the round rewrote re-anchored, and the round's 15 (R1 6, R2 3, R3 1, R4 4, plus the re-anchored). On 655a75d,
+# load averages about 8: 46 of 47 caught. MISSED, and equivalent: "the shim keeps SIGCHLD at its default" (as before).
+# "C3-1R4 the diagnostics never write in the loop" is caught first by a c5 test (its log lines doubled); run alone
+# against the stalled-sink tests it is caught by both of them.
+
+commit 655a75d
+CAUGHT  C3-1 the latch comes before the reap  test_unit_the_latch_comes_before_the_reap_and_absence_is_required_after_it
+CAUGHT  C3-1 every signal asks the anchor first  test_unit_the_latch_comes_before_the_reap_and_absence_is_required_after_it
+CAUGHT  C3-1 the anchor needs the CLI unreaped  test_unit_no_signal_without_the_anchor[reaped]
+CAUGHT  C3-1 the anchor needs signalling not latched off  test_unit_no_signal_without_the_anchor[latched]
+CAUGHT  C3-1 a KILL request waits for the first TERM attempt + the grace  test_c5_no_kill_before_the_grace_after_the_first_term_attempt[term_then_early_kill]
+CAUGHT  C3-1 the one KILL sender refuses before the grace  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 an early KILL is remembered  test_c3_the_node_dies_and_its_shims_stop_their_groups_with_a_sibling_and_a_closed_event_pipe
+CAUGHT  C3-1 KILL repeated every grace after EOF  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 a failed listing is never empty  test_unit_a_failed_or_nonempty_listing_is_never_empty[failed]
+CAUGHT  C3-1 a listed member is never empty  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 the leader is a confirmed zombie  test_unit_an_unconfirmed_zombie_is_never_empty
+CAUGHT  C3-1 absence is required after the reap  test_unit_unproved_after_the_reap[leader-pid-reused]
+CAUGHT  C3-1 a failed post-reap listing is unproved  test_unit_unproved_after_the_reap[failed]
+CAUGHT  C3-1 the marker carries this launch's nonce  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 the marker carries this boot  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 a partial GO never starts  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[partial-partial]
+CAUGHT  C3-1 the event pipe is non-blocking  test_c3_the_node_dies_with_its_event_pipe_full_and_cleanup_still_completes
+CAUGHT  C3-1 the CLI leads its own session  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 a direct child's SIGPIPE and SIGXFSZ  test_c6_signal_dispositions_are_what_a_direct_spawn_gives_and_an_ignored_sigchld_does_not_unanchor
+CAUGHT  C3-1 the node's ignored signals, ignored for the CLI  test_c6_signal_dispositions_are_what_a_direct_spawn_gives_and_an_ignored_sigchld_does_not_unanchor
+MISSED  C3-1 the shim keeps SIGCHLD at its default  
+CAUGHT  C3-1 the events are drained before the shim's exit is said  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[terminate-eof]
+CAUGHT  C3-1 lost only once the shim has exited  test_c7_a_shim_that_exits_without_a_marker_is_lost
+CAUGHT  C3-1 a stop before GO is never-start  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[terminate-eof]
+CAUGHT  C3-1 the command write is pinned under the lock  test_c7_a_concurrent_retirement_cannot_close_the_pipe_under_a_write
+CAUGHT  C3-1 GO waits with poll, not select (FD_SETSIZE)  test_c7_go_waits_for_a_command_fd_above_fd_setsize
+CAUGHT  C3-1 the grace runs from the TERM attempt, sent or failed (re-anchored)  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 EOF stops the group (re-anchored)  test_c3_the_node_dies_and_its_shims_stop_their_groups_with_a_sibling_and_a_closed_event_pipe
+CAUGHT  C3-1 never started publishes the bound marker (re-anchored)  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[eof-eof]
+CAUGHT  C3-1 the shim drops its copies of the CLI's stdio (re-anchored)  test_c6_stdio_env_and_session_are_what_a_direct_spawn_gives
+CAUGHT  C3-1 the proof checks the nonce (re-anchored)  test_c7_a_marker_of_another_launch_or_boot_is_no_proof
+CAUGHT  C3-1 the proof checks the boot (re-anchored)  test_c7_a_marker_of_another_launch_or_boot_is_no_proof
+CAUGHT  C3-1 the EMPTY event is no proof (re-anchored)  test_c7_the_empty_event_alone_is_no_proof
+CAUGHT  C3-1R1 the command pipe is watched during the launch  test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it[after-setsid]
+CAUGHT  C3-1R1 no group signal before establishment is observed  test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it[before-setsid]
+CAUGHT  C3-1R1 the group, not the pid, once established  test_c2_at_the_gate_before_its_killpg_the_zombie_still_anchors_the_pgid
+CAUGHT  C3-1R1 a pid-only signal is replayed to the group  test_r1_a_term_sent_to_the_pid_is_replayed_to_the_group_once_established_and_the_grace_is_unchanged
+CAUGHT  C3-1R1 a pid-only signal is remembered  test_r1_a_term_sent_to_the_pid_is_replayed_to_the_group_once_established_and_the_grace_is_unchanged
+CAUGHT  C3-1R1 the child execs only once released  test_c2_at_the_gate_before_its_killpg_the_zombie_still_anchors_the_pgid
+CAUGHT  C3-1R2 the reader opens without waiting (and looks before it opens)  test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits
+CAUGHT  C3-1R2 the reader takes a regular file only  test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits
+CAUGHT  C3-1R2 the strict version  test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits
+CAUGHT  C3-1R3 poll() reads the marker by itself  test_r3_a_poll_only_consumer_learns_the_exit_from_the_marker_when_leader_exit_was_dropped
+CAUGHT  C3-1R4 a temp-file sync failure publishes nothing  test_r4_a_failed_sync_file_publishes_nothing_and_dir_leaves_a_visible_marker_said_as_unsynced[file]
+CAUGHT  C3-1R4 a directory-sync failure is said, and exits non-zero  test_r4_a_failed_sync_file_publishes_nothing_and_dir_leaves_a_visible_marker_said_as_unsynced[dir]
+CAUGHT  C3-1R4 the diagnostics never write in the loop  test_c5_no_kill_before_the_grace_after_the_first_term_attempt[term_then_early_kill]
+CAUGHT  C3-1R4 a failing sink cannot raise into the loop  test_r4_the_signal_goes_before_its_diagnostic_and_a_failing_sink_cannot_stop_it
+rows: 47
+stale or broken: []
+missed: ['C3-1 the shim keeps SIGCHLD at its default']
+exit 0
+
+# The same 47 rows again on fe3c1ea (a signal's log line carries its attempt time; the grace row re-anchored twice),
+# load averages 8 to 11: 46 of 47 caught, the same equivalent row missed.
+
+commit fe3c1ea
+CAUGHT  C3-1 the latch comes before the reap  test_unit_the_latch_comes_before_the_reap_and_absence_is_required_after_it
+CAUGHT  C3-1 every signal asks the anchor first  test_unit_the_latch_comes_before_the_reap_and_absence_is_required_after_it
+CAUGHT  C3-1 the anchor needs the CLI unreaped  test_unit_no_signal_without_the_anchor[reaped]
+CAUGHT  C3-1 the anchor needs signalling not latched off  test_unit_no_signal_without_the_anchor[latched]
+CAUGHT  C3-1 a KILL request waits for the first TERM attempt + the grace  test_c5_no_kill_before_the_grace_after_the_first_term_attempt[term_then_early_kill]
+CAUGHT  C3-1 the one KILL sender refuses before the grace  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 an early KILL is remembered  test_c3_the_node_dies_and_its_shims_stop_their_groups_with_a_sibling_and_a_closed_event_pipe
+CAUGHT  C3-1 KILL repeated every grace after EOF  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 a failed listing is never empty  test_unit_a_failed_or_nonempty_listing_is_never_empty[failed]
+CAUGHT  C3-1 a listed member is never empty  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 the leader is a confirmed zombie  test_unit_an_unconfirmed_zombie_is_never_empty
+CAUGHT  C3-1 absence is required after the reap  test_unit_unproved_after_the_reap[leader-pid-reused]
+CAUGHT  C3-1 a failed post-reap listing is unproved  test_unit_unproved_after_the_reap[failed]
+CAUGHT  C3-1 the marker carries this launch's nonce  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 the marker carries this boot  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 a partial GO never starts  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[partial-partial]
+CAUGHT  C3-1 the event pipe is non-blocking  test_c3_the_node_dies_with_its_event_pipe_full_and_cleanup_still_completes
+CAUGHT  C3-1 the CLI leads its own session  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 a direct child's SIGPIPE and SIGXFSZ  test_c6_signal_dispositions_are_what_a_direct_spawn_gives_and_an_ignored_sigchld_does_not_unanchor
+CAUGHT  C3-1 the node's ignored signals, ignored for the CLI  test_c6_signal_dispositions_are_what_a_direct_spawn_gives_and_an_ignored_sigchld_does_not_unanchor
+MISSED  C3-1 the shim keeps SIGCHLD at its default  
+CAUGHT  C3-1 the events are drained before the shim's exit is said  test_c2_at_the_gate_before_its_killpg_the_zombie_still_anchors_the_pgid
+CAUGHT  C3-1 lost only once the shim has exited  test_c7_a_shim_that_exits_without_a_marker_is_lost
+CAUGHT  C3-1 a stop before GO is never-start  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[terminate-eof]
+CAUGHT  C3-1 the command write is pinned under the lock  test_c7_a_concurrent_retirement_cannot_close_the_pipe_under_a_write
+CAUGHT  C3-1 GO waits with poll, not select (FD_SETSIZE)  test_c7_go_waits_for_a_command_fd_above_fd_setsize
+CAUGHT  C3-1 the grace runs from the TERM attempt, sent or failed (re-anchored twice)  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 EOF stops the group (re-anchored)  test_c3_the_node_dies_and_its_shims_stop_their_groups_with_a_sibling_and_a_closed_event_pipe
+CAUGHT  C3-1 never started publishes the bound marker (re-anchored)  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[eof-eof]
+CAUGHT  C3-1 the shim drops its copies of the CLI's stdio (re-anchored)  test_c6_stdio_env_and_session_are_what_a_direct_spawn_gives
+CAUGHT  C3-1 the proof checks the nonce (re-anchored)  test_c7_a_marker_of_another_launch_or_boot_is_no_proof
+CAUGHT  C3-1 the proof checks the boot (re-anchored)  test_c7_a_marker_of_another_launch_or_boot_is_no_proof
+CAUGHT  C3-1 the EMPTY event is no proof (re-anchored)  test_c7_the_empty_event_alone_is_no_proof
+CAUGHT  C3-1R1 the command pipe is watched during the launch  test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it[after-setsid]
+CAUGHT  C3-1R1 no group signal before establishment is observed  test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it[before-setsid]
+CAUGHT  C3-1R1 the group, not the pid, once established  test_c2_at_the_gate_before_its_killpg_the_zombie_still_anchors_the_pgid
+CAUGHT  C3-1R1 a pid-only signal is replayed to the group  test_r1_a_term_sent_to_the_pid_is_replayed_to_the_group_once_established_and_the_grace_is_unchanged
+CAUGHT  C3-1R1 a pid-only signal is remembered  test_r1_a_term_sent_to_the_pid_is_replayed_to_the_group_once_established_and_the_grace_is_unchanged
+CAUGHT  C3-1R1 the child execs only once released  test_c2_at_the_gate_before_its_killpg_the_zombie_still_anchors_the_pgid
+CAUGHT  C3-1R2 the reader opens without waiting (and looks before it opens)  test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits
+CAUGHT  C3-1R2 the reader takes a regular file only  test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits
+CAUGHT  C3-1R2 the strict version  test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits
+CAUGHT  C3-1R3 poll() reads the marker by itself  test_r3_a_poll_only_consumer_learns_the_exit_from_the_marker_when_leader_exit_was_dropped
+CAUGHT  C3-1R4 a temp-file sync failure publishes nothing  test_r4_a_failed_sync_file_publishes_nothing_and_dir_leaves_a_visible_marker_said_as_unsynced[file]
+CAUGHT  C3-1R4 a directory-sync failure is said, and exits non-zero  test_r4_a_failed_sync_file_publishes_nothing_and_dir_leaves_a_visible_marker_said_as_unsynced[dir]
+CAUGHT  C3-1R4 the diagnostics never write in the loop  test_c5_no_kill_before_the_grace_after_the_first_term_attempt[term_then_early_kill]
+CAUGHT  C3-1R4 a failing sink cannot raise into the loop  test_r4_the_signal_goes_before_its_diagnostic_and_a_failing_sink_cannot_stop_it
+rows: 47
+stale or broken: []
+missed: ['C3-1 the shim keeps SIGCHLD at its default']
+exit 0
+
+# Ownership C3-1, code review round 2 (DESIGN_NOTES "Ownership C3-1: code review round 2"): all 52 C3-1 rows (5
+# re-anchored, 5 new: R5 4, R6 1), on ff6bf5c (round 2 merged with origin/main 9388477, #123), load averages about 7:
+# 51 of 52 caught; MISSED, and equivalent as before: "the shim keeps SIGCHLD at its default".
+
+commit ff6bf5c
+CAUGHT  C3-1 the latch comes before the reap  test_unit_the_latch_comes_before_the_reap_and_absence_is_required_after_it
+CAUGHT  C3-1 every signal asks the anchor first  test_unit_the_latch_comes_before_the_reap_and_absence_is_required_after_it
+CAUGHT  C3-1 the anchor needs the CLI unreaped  test_unit_no_signal_without_the_anchor[reaped]
+CAUGHT  C3-1 the anchor needs signalling not latched off  test_unit_no_signal_without_the_anchor[latched]
+CAUGHT  C3-1 a KILL request waits for the first TERM attempt + the grace  test_c5_no_kill_before_the_grace_after_the_first_term_attempt[term_then_early_kill]
+CAUGHT  C3-1 the one KILL sender refuses before the grace  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 an early KILL is remembered  test_c3_the_node_dies_and_its_shims_stop_their_groups_with_a_sibling_and_a_closed_event_pipe
+CAUGHT  C3-1 KILL repeated every grace after EOF  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 absence is required after the reap  test_unit_unproved_after_the_reap[leader-pid-reused]
+CAUGHT  C3-1 a failed post-reap listing is unproved  test_unit_unproved_after_the_reap[failed]
+CAUGHT  C3-1 the marker carries this launch's nonce  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 the marker carries this boot  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 a partial GO never starts  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[partial-partial]
+CAUGHT  C3-1 the event pipe is non-blocking  test_c3_the_node_dies_with_its_event_pipe_full_and_cleanup_still_completes
+CAUGHT  C3-1 the CLI leads its own session  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 a direct child's SIGPIPE and SIGXFSZ  test_c6_signal_dispositions_are_what_a_direct_spawn_gives_and_an_ignored_sigchld_does_not_unanchor
+CAUGHT  C3-1 the node's ignored signals, ignored for the CLI  test_c6_signal_dispositions_are_what_a_direct_spawn_gives_and_an_ignored_sigchld_does_not_unanchor
+MISSED  C3-1 the shim keeps SIGCHLD at its default  
+CAUGHT  C3-1 the events are drained before the shim's exit is said  test_c2_at_the_gate_before_its_killpg_the_zombie_still_anchors_the_pgid
+CAUGHT  C3-1 lost only once the shim has exited  test_c7_a_shim_that_exits_without_a_marker_is_lost
+CAUGHT  C3-1 a stop before GO is never-start  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[terminate-eof]
+CAUGHT  C3-1 the command write is pinned under the lock  test_c7_a_concurrent_retirement_cannot_close_the_pipe_under_a_write
+CAUGHT  C3-1 GO waits with poll, not select (FD_SETSIZE)  test_c7_go_waits_for_a_command_fd_above_fd_setsize
+CAUGHT  C3-1 the grace runs from the TERM attempt, sent or failed (re-anchored twice)  test_unit_kill_never_before_the_grace_and_repeated_after_eof
+CAUGHT  C3-1 EOF stops the group (re-anchored)  test_c3_the_node_dies_and_its_shims_stop_their_groups_with_a_sibling_and_a_closed_event_pipe
+CAUGHT  C3-1 never started publishes the bound marker (re-anchored)  test_c4_nothing_starts_before_a_whole_valid_go_and_the_bound_marker_says_so[eof-eof]
+CAUGHT  C3-1 the proof checks the nonce (re-anchored)  test_c7_a_marker_of_another_launch_or_boot_is_no_proof
+CAUGHT  C3-1 the proof checks the boot (re-anchored)  test_c7_a_marker_of_another_launch_or_boot_is_no_proof
+CAUGHT  C3-1 the EMPTY event is no proof (re-anchored)  test_c7_the_empty_event_alone_is_no_proof
+CAUGHT  C3-1R1 the command pipe is watched during the launch  test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it[after-setsid]
+CAUGHT  C3-1R1 no group signal before establishment is observed  test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it[before-setsid]
+CAUGHT  C3-1R1 the group, not the pid, once established  test_c2_at_the_gate_before_its_killpg_the_zombie_still_anchors_the_pgid
+CAUGHT  C3-1R1 a pid-only signal is replayed to the group  test_r1_a_term_sent_to_the_pid_is_replayed_to_the_group_once_established_and_the_grace_is_unchanged
+CAUGHT  C3-1R1 a pid-only signal is remembered  test_r1_a_term_sent_to_the_pid_is_replayed_to_the_group_once_established_and_the_grace_is_unchanged
+CAUGHT  C3-1R2 the reader opens without waiting (and looks before it opens)  test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits
+CAUGHT  C3-1R2 the reader takes a regular file only  test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits
+CAUGHT  C3-1R2 the strict version  test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits
+CAUGHT  C3-1R3 poll() reads the marker by itself  test_r3_a_poll_only_consumer_learns_the_exit_from_the_marker_when_leader_exit_was_dropped
+CAUGHT  C3-1R4 a temp-file sync failure publishes nothing  test_r4_a_failed_sync_file_publishes_nothing_and_dir_leaves_a_visible_marker_said_as_unsynced[file]
+CAUGHT  C3-1R4 a directory-sync failure is said, and exits non-zero  test_r4_a_failed_sync_file_publishes_nothing_and_dir_leaves_a_visible_marker_said_as_unsynced[dir]
+CAUGHT  C3-1R4 the diagnostics never write in the loop  test_c5_no_kill_before_the_grace_after_the_first_term_attempt[term_then_early_kill]
+CAUGHT  C3-1R4 a failing sink cannot raise into the loop  test_r4_the_signal_goes_before_its_diagnostic_and_a_failing_sink_cannot_stop_it
+CAUGHT  C3-1 a failed listing is never empty (re-anchored)  test_unit_a_failed_or_nonempty_listing_is_never_empty[failed]
+CAUGHT  C3-1 a listed member is never empty (re-anchored)  test_c1_the_leaders_exit_status_is_reported_and_it_is_not_reaped_early[exit-7]
+CAUGHT  C3-1 the leader is a confirmed zombie (re-anchored)  test_unit_an_unconfirmed_zombie_is_never_empty
+CAUGHT  C3-1 the shim drops its copies of the CLI's stdio (re-anchored twice)  test_c6_stdio_env_and_session_are_what_a_direct_spawn_gives
+CAUGHT  C3-1R1 the child execs only once released (re-anchored)  test_c2_at_the_gate_before_its_killpg_the_zombie_still_anchors_the_pgid
+CAUGHT  C3-1R5 the diagnostics start is best-effort  test_r5_a_failed_diagnostics_start_never_ends_supervision[after-setsid]
+CAUGHT  C3-1R5 RELEASE is read before chdir  test_r5_a_child_whose_shim_dies_before_release_never_enters_the_checkout
+CAUGHT  C3-1R5 the child closes the shim's ends first  test_r5_a_child_whose_shim_dies_before_release_never_enters_the_checkout
+CAUGHT  C3-1R5 the kqueue wait is contained  test_unit_r5_the_loop_survives_every_non_essential_failure
+CAUGHT  C3-1R6 the watch is installed before RELEASE is written  test_c2_at_the_gate_before_its_killpg_the_zombie_still_anchors_the_pgid
+rows: 52
+stale or broken: []
+missed: ['C3-1 the shim keeps SIGCHLD at its default']
+exit 0
+
+# Ownership C3-1, after Sol's approval of 05fbde5 (START_UNKNOWN): the one new row, on d371c4f. Caught first, in file
+# order, by an R1 node-death test (it expects START_UNKNOWN); run against the two new unit tests alone, it is caught by
+# test_unit_an_exec_whose_outcome_was_not_observed_is_unknown_not_failed.
+
+commit d371c4f
+CAUGHT  C3-1 an unobserved exec is unknown, not failed  test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it[after-setsid]
+rows: 1
+stale or broken: []
+missed: []
