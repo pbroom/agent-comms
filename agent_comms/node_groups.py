@@ -406,8 +406,9 @@ class Groups:
 
     def restore_held(self, token: Hashable, keys: list, cwd: Any) -> None:
         """(Ownership C3-2b-1) Install a reservation restored from the supervised-launch journal (shimjournal.restore,
-        at the node's start, before any admission; or a launch whose admission an interrupt cut after its GO may have
-        been written, shimlaunch): HELD under `token`, a SUPERVISED token only, under each of `keys` (its checkout's
+        at the node's start, before any admission), or one for a committed launch that `start` did not admit or whose
+        admission an interrupt cut after its GO may have been written (shimlaunch.launch): HELD under `token`, a
+        SUPERVISED token only, under each of `keys` (its checkout's
         identities), and in the HELD index. HELD fences admission and is proof-only; it leaves only through `release`
         with a True proof (nothing releases a restored one in this PR). The keys are computed by the caller: no I/O
         under the lock."""

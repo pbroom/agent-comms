@@ -170,7 +170,7 @@ def test_the_host_side_modules_take_their_loggers_from_hostlog():
     names = {"session_host.py": "agent_comms.session_host", "node_sessions.py": "agent_comms.node_sessions",
              "node.py": "agent_comms.node", "providers/claude.py": "agent_comms.providers.claude",
              "providers/codex.py": "agent_comms.providers.codex", "node_groups.py": None,
-             "providers/__init__.py": None, "shimchild.py": None, "shimjournal.py": None}
+             "providers/__init__.py": None, "shimchild.py": None, "shimjournal.py": None, "shimlaunch.py": None}
     emitting = {"getLogger", "debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log",
                 "basicConfig"}
     for rel, name in names.items():
@@ -228,7 +228,7 @@ def _line():
 HOST_SIDE = ["session_host.py", "node_sessions.py", "node.py", "node_groups.py", "providers/__init__.py",
              "providers/claude.py", "providers/codex.py", "hostlog.py",
              # (Ownership C3-2b-1) the supervisor's node-side handle, and the journal (host-side, never logging)
-             "shimchild.py", "shimjournal.py"]
+             "shimchild.py", "shimjournal.py", "shimlaunch.py"]
 LOCK_KINDS = {"Lock", "RLock", "Condition", "Semaphore", "BoundedSemaphore", "Event", "Barrier"}
 # (Review round 1, R1) The locks of the host-side modules under which no line can be logged, each with why; every
 # other lock constructed there is a HOST lock (BOUNDARIES): a native lock, entered only as
