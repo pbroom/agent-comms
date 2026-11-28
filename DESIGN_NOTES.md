@@ -17514,9 +17514,10 @@ publish a marker bound to its launch:
   `groupshim`. It never opens the board, reads config, imports the session host, or logs through `logging`.
 
 **Start, in order:**
-1. It opens its log (close-on-exec).
+1. Its diagnostics go to a bounded in-memory queue. One writer thread alone opens and writes the log, and it starts
+   only after the shim's single fork, or at its exit if it never forks (review round 1, A4).
 2. It puts fds 0, 1 and 2 aside as close-on-exec copies: they are the CLI's future stdio. Its own 0, 1 and 2 become
-   `/dev/null` and its log, so nothing the shim or its interpreter says ever reaches the CLI's stderr.
+   `/dev/null`, so nothing the shim or its interpreter says ever reaches the CLI's stdio, and nothing waits on a log.
 3. It makes the control fds close-on-exec and non-blocking.
 4. It calls `setsid()` if `Popen(start_new_session=True)` has not already made it a session leader.
 5. It checks the boot.
@@ -17540,22 +17541,27 @@ newline are kept as commands. In each of these cases the CLI is NEVER forked, th
 | `GO` with an unknown version | `version` |
 | (a failed `fork()`: `START_FAILED <errno>` first) | `fork` |
 
-**The spawn.**
-- **In the child (Python, after `fork()`; the shim is single-threaded):**
+**The spawn** (as changed by review round 1, R1).
+- **In the child (Python, after `fork()`; the shim is single-threaded at the fork):**
   1. `setsid()` (the CLI leads its own session and group, as `start_new_session=True` gave it) and one byte `S` on the
-     handshake pipe;
+     handshake pipe: GROUP ESTABLISHED;
   2. SIGPIPE and SIGXFSZ back to their defaults (what Popen's `restore_signals` gives a direct child), and every signal
      that was ignored at the shim's start ignored again;
   3. `dup2` of the three put-aside fds onto 0, 1 and 2;
-  4. every other fd closed (listed from `/dev/fd`), except the handshake's;
-  5. `chdir(cwd)` and `execvpe(argv[0], argv, env)`.
+  4. every other fd closed (listed from `/dev/fd`), except the handshake's and the release pipe's;
+  5. `chdir(cwd)`;
+  6. one byte `G` read from the release pipe. The shim writes it only once the child's exit and exec are registered,
+     so the CLI never runs unwatched; at EOF (the shim gone, or its registration refused) the child never execs;
+  7. `execvpe(argv[0], argv, env)`: EXEC CONFIRMED is kqueue's NOTE_EXEC.
 
   A failure at any step writes `F<stage> <errno>` on the handshake and calls `_exit(127)`. No text goes into it.
-- **In the shim.** It registers kqueue `EVFILT_PROC` `NOTE_EXIT | NOTE_EXITSTATUS` on the child, then reads the
-  handshake to EOF (close-on-exec: EOF means the child exec'd or died). Then it closes its own copies of the CLI's
-  stdio, so that the node's close of stdin, and the CLI's exit, give the same EOFs as a direct spawn. The event is
-  `STARTED <pid>`, or `START_FAILED <errno>` (followed by the empty path, as for any CLI exit). Nothing reaps the child
-  here.
+- **In the shim.** Right after the fork it closes its own copies of the CLI's stdio, so that the node's close of
+  stdin, and the CLI's exit, give the same EOFs as a direct spawn. It registers kqueue `EVFILT_PROC`
+  `NOTE_EXIT | NOTE_EXITSTATUS | NOTE_EXEC` (`EV_CLEAR`) and writes the release byte. From then on everything is in
+  the one loop: the command pipe, the handshake (non-blocking) and the child's exec and exit. Commands and EOF are
+  acted on from the fork on. The event is `STARTED <pid>` at EXEC CONFIRMED (what today's callers have once `Popen`
+  returns: the CLI runs), or `START_FAILED <errno>` (`0` when the child died before its exec without saying why),
+  followed by the empty path, as for any CLI exit. Nothing reaps the child here.
 - **`NOTE_EXITSTATUS`** is `0x04000000`; Python 3.12 does not name it. It is pinned in one place with its self-check:
   - the kernel echoes the flag in the event when it filled `data` (measured: fflags `0x84000000`, `data` the wait
     status);
@@ -17568,24 +17574,25 @@ newline are kept as commands. In each of these cases the CLI is NEVER forked, th
 
 | Command (node to shim) | What the shim does |
 | --- | --- |
-| `TERM` | `killpg(cli_pgid, SIGTERM)` if the anchor holds; the first such ATTEMPT (sent or failed) starts the grace |
+| `TERM` | if the anchor holds: `kill(pid)` before GROUP ESTABLISHED is observed, `killpg(pgid)` after; the first such ATTEMPT (sent or failed) starts the grace |
 | `KILL` | no TERM attempted yet: one is attempted now; then a KILL at first TERM attempt + `kill_grace` (an early one is remembered: `DEFERRED`) |
 | anything else, or a line over 256 bytes | `UNKNOWN`, then ignored |
 | EOF (the node died or let go) | a TERM now if none was attempted; a KILL at first TERM + grace; and a KILL every grace while the anchor holds |
 
 | Event (shim to node) | Meaning |
 | --- | --- |
-| `STARTED <pid>` / `START_FAILED <errno>` | the exec happened / the child could not become the CLI (stage in the log) |
+| `STARTED <pid>` / `START_FAILED <errno>` | EXEC CONFIRMED / the child could not become the CLI (stage in the log; 0: it died before its exec) |
 | `LEADER_EXIT <code>` | the CLI exited: `Popen.returncode`'s value (negative for a signal) |
-| `SENT TERM`, `SENT KILL` | the signal was ATTEMPTED successfully: never a claim that anything exited |
-| `FAILED <sig> <errno>` | `killpg` raised (the attempt still counts for the grace) |
+| `SENT <sig> pid` / `SENT <sig> group` | the signal was ATTEMPTED successfully, to the child's pid or to its group: never a claim that anything exited |
+| `FAILED <sig> <errno> pid\|group` | the call raised (the attempt still counts for the grace) |
 | `DEFERRED KILL <ms>` | a KILL is remembered and fires in that many ms |
 | `REFUSED <sig>` | no anchor (not forked, latched or reaped): nothing sent |
 | `UNKNOWN` | an unknown command |
 | `NOGO <reason>` | see `GO` |
 | `EMPTY` | ADVISORY: a prompt to look at the marker, which is the proof |
 | `UNPROVED` | after the reap the group was not proved absent: no marker, no more signals |
-| `MARKER_FAILED <errno>` | the marker could not be published: no proof |
+| `MARKER_FAILED <errno>` | the marker could not be published: nothing is visible, no proof |
+| `UNSYNCED <errno>` | the marker is visible and valid (followed by `EMPTY`), but its directory's sync failed: not known to be durable |
 
 | Exit | When | Marker |
 | --- | --- | --- |
@@ -17595,6 +17602,7 @@ newline are kept as commands. In each of these cases the CLI is NEVER forked, th
 | 3 | the CLI was never forked (`NOGO`) | `never_started` |
 | 4 | `MARKER_FAILED` | none |
 | 5 | an unexpected exception (its traceback is in the log) | none |
+| 6 | `UNSYNCED`: proved absent (or never started), the marker visible, its directory's sync failed | visible, not known durable |
 | -9 and so on | the shim was killed: the anchor is lost | none |
 
 **Events never hold up cleanup.** The event fd is non-blocking, and every event line is shorter than `PIPE_BUF` (512),
@@ -17610,7 +17618,8 @@ command plus a handful per life.
 | State | Anchor | Leaves by | To |
 | --- | --- | --- | --- |
 | WAIT_GO | none (no CLI) | a whole valid `GO` / anything else | SPAWN / NOGO (marker, exit 3) |
-| SPAWN | the child is forked and unreaped | the handshake read | RUNNING (`STARTED` or `START_FAILED`) |
+| FORKED | the child, forked and unreaped: its pid is pinned (signals go to the pid) | `S` read (GROUP ESTABLISHED) / its exit | ESTABLISHED / EXITED |
+| ESTABLISHED | the child leads its group: the pgid is pinned (signals go to the group; any pid-only TERM or KILL is replayed to it once) | NOTE_EXEC (`STARTED`) / its exit | RUNNING / EXITED |
 | RUNNING | the CLI is alive | the CLI's exit (`LEADER_EXIT`) | EXITED |
 | EXITED | the CLI's zombie, unreaped: the pgid is pinned | a COMPLETE listing holding nothing but the leader, and `waitid(WNOWAIT)` confirming our exited child | LATCHED |
 | LATCHED | none: signalling OFF, for good | the reap (`waitpid`) | REAPED |
@@ -17694,6 +17703,12 @@ A failure removes the temp file and publishes nothing.
 | `recover` (session host and node: `stop_verified`, `group_alive`, `signal_group`) | numeric signals at start | C3-3: restore and verify by marker and boot, no signal |
 | the shutdown waits on `group_alive` (`_stop_all`, `await_kills`, `unproved`) | numeric probes | `empty()` within the same bounds |
 
+**LOST (review round 1, A2).** Every reap and shutdown path must ask `child.lost()` on its own, BEFORE it reads
+`poll() is None` as "still running". A lost shim's `poll()` stays None for ever (the CLI's exit is unknown, and is
+never made up), and `empty()` stays False. LOST ends supervision of that launch, while its checkout stays retained
+(HELD) for a human. The sites: `SessionHost._reap`, `_stop_all`'s watch, `Node._reap`, `await_kills`,
+`report_stopped`, `SessionRunner.unproved`.
+
 The in-process dispatcher (dispatch.py's `Dispatcher`) stays out of scope (design §8). C3-2 must also add
 integration tests of main's shutdown and reap timing with real shims (Sol).
 
@@ -17776,8 +17791,11 @@ file the cleanup writes, or after 60 s. Every wait is bounded (20 s each).
   - Every spawn in agent_comms uses `close_fds=True` (none passes `close_fds=False`, and none calls `os.fork` or
     `posix_spawn`), so the node's own spawns are covered. The test now uses that style.
   - Closing the window entirely would need descriptors that are close-on-exec atomically: named FIFOs in a private
-    directory, opened with `O_CLOEXEC`. That is a decision for C3-2. The same window exists today for the CLI's own
-    stdin pipe (Popen's `os.pipe()`).
+    directory, opened with `O_CLOEXEC`. The same window exists today for the CLI's own stdin pipe (Popen's
+    `os.pipe()`).
+  - **DECIDED (review round 1): option (A), at C3-2.** Anonymous pipes stay, and close-fds is enforced at every node
+    launch that can run concurrently. A package scan in C3-2 is a regression catch only: it cannot enforce the
+    contract for fork callers outside agent_comms. The real sibling test is the evidence for the supported launchers.
 - **The shim's own death.** If the shim is killed, launchd reaps the CLI's zombie and the anchor is lost. Nothing is
   published, the handle answers `lost()`, and it is held for a human (by design).
 - **Descendants that leave the group** (`setsid`/`setpgid`) are outside group-based ownership: the inherited limit.
@@ -17786,12 +17804,9 @@ file the cleanup writes, or after 60 s. Every wait is bounded (20 s each).
   - So "the group is empty" says nothing about a tool command that outlives the CLI. Such a command can still be
     working in the checkout when the marker says the group is gone.
   - This is the inherited limit, not solved here. Excluding it would need containment beyond process groups.
-- **No live watch during the handshake read.** The shim does not watch its command pipe while it reads the handshake,
-  that is, while its child is between `fork` and `exec` (a `chdir` that hangs, for example). EOF is acted on once it
-  returns.
 - **The default `go` timeout is 5 s.** On a timeout the shim never starts: fail-closed.
 - **Dropped events.** If the node does not pump, events can be dropped. A dropped `LEADER_EXIT` leaves `poll()` None
-  until the shim exits, and then the marker's code answers.
+  only until the marker is there; `poll()` reads it by itself (review round 1, R3).
 - **Two layers, each enough alone.** The CLI's fds are closed by both close-on-exec and the child's close loop.
   Removing either one alone changes nothing a test can see, so there is no row for them.
 - **The SIGCHLD reset is not observable on macOS.** Its row ("the shim keeps SIGCHLD at its default") is MISSED, and
@@ -17851,3 +17866,175 @@ The results are in scripts/steering-mutation-results.txt.
     `test_c4_...[overlong]`, which found the `select` bug fixed in 3ecb22c.
 - The parallel run on the final head is in the hand-back.
 
+
+### Ownership C3-1: code review round 1 (Sol on ae9866f: CHANGES, 3 blockers and 1 should; then an amendment, A1 to A5)
+
+Everything else was accepted as built:
+- the single signal site checks the forked, unreaped anchor;
+- signals are latched off before `waitpid`, then the second listing must be empty;
+- a failed exec goes through the ordinary absence proof;
+- only a rejection before the fork, or a failed fork, publishes `never_started`;
+- `_kill_now` enforces the grace for commands and EOF;
+- event writes are non-blocking;
+- the shim runs with `-I` and the absolute package root.
+
+**The descriptor question is decided: option (A), at C3-2** (see the limits above).
+
+The tables above have been brought up to date with this round.
+
+#### R1 [blocker], with A1: node death during the launch cannot strand the group
+
+- **The defect.** On ae9866f the shim read the launch handshake with a blocking `os.read`. A child stalled after its
+  `setsid()` (a slow `chdir`, a huge environment) kept the shim from ever looking at its command pipe: a node that
+  died then got no TERM and no KILL.
+- **Reproduced on ae9866f.** A scratch copy of that shim was given a 30 s stall after `setsid()`, standing in for a
+  hung `chdir`. 5 s after the node let go there was no TERM, no KILL and no marker. The shim acted only once the stall
+  ended, about 29 s later.
+- **The loop.** From the fork on, everything is one event loop: the command pipe, the handshake (non-blocking) and
+  the child's exec and exit (kqueue `NOTE_EXIT | NOTE_EXITSTATUS | NOTE_EXEC`, `EV_CLEAR`). Nothing blocks on the
+  child.
+- **Two facts, kept apart.**
+  - **GROUP ESTABLISHED:** the `S` byte, written right after the child's `setsid()`, has been read.
+  - **EXEC CONFIRMED:** kqueue's NOTE_EXEC. Measured: it is reported for an exec, also folded into a late exit event
+    (fflags `0xa4000000`), and never for a death before exec.
+  - **Why the release byte.** The child execs only after reading a release byte, which the shim writes once that
+    watch is registered. So no exec can happen unwatched, and a child whose shim is already gone never execs.
+  - `STARTED` is sent at EXEC CONFIRMED: that is what today's callers have once `Popen` returns (the CLI runs).
+    `START_FAILED <errno>` is sent when the child gave up. `START_FAILED 0` is sent when it died before its exec
+    without saying why: our own KILL to its pid, for instance.
+- **What is signalled, in each state.**
+  - **FORKED** (`S` not yet read): the child's PID, with `kill`. It is our unreaped child, so no other process can
+    have that pid. `killpg` is never used here: it could answer ESRCH just before `setsid()` succeeds.
+  - **ESTABLISHED and after:** the child's GROUP, with `killpg`. Its leader is our unreaped child, so no other group
+    can have that id.
+  - **Before the fork:** nothing is signalled; there is nothing to signal.
+- **The replay (A1).** When establishment is observed, each TERM or KILL that went to the pid alone is sent once more
+  to the group, so members that appeared before the shim read `S` are reached.
+  - The replay changes no clock: the grace still runs from the FIRST TERM attempt.
+  - A KILL is replayed only if one was sent, and that one already waited for the grace.
+- **A test-only hook in the child,** enabled only by `--test-gate DIR` and a `pause.<name>` file there. It pauses
+  before or after `setsid()`, can ignore SIGTERM, and can fork a member. A second test-only switch,
+  `defer-handshake`, delays the shim's reading of `S`. The numbered shim gates now need a `numbered` file too.
+- **Tests (real processes and real signals):**
+  - `test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it[after-setsid|before-setsid]`:
+    the node stand-in is SIGKILLed while the child is paused. The shim sends TERM, then KILL at least 0.5 s later,
+    then proves the group gone and publishes the marker. The calls are `killpg` after `setsid` and `kill` before it.
+    The log shows `START_FAILED 0` and no `STARTED`.
+  - `test_r1_a_term_sent_to_the_pid_is_replayed_to_the_group_once_established_and_the_grace_is_unchanged`:
+    - the TERM to the pid does not reach the member, and the replay does;
+    - the KILL asked for after the replay fires at the first TERM + 2 s, more than 0.3 s before a restarted grace
+      would allow.
+  - `test_r1_a_kill_sent_to_the_pid_is_replayed_to_the_group_once_established`: the member survives a KILL to the
+    pid alone and keeps the proof back. Once `S` is read, TERM and KILL go to the group and the marker follows.
+  - `test_unit_the_signal_target_follows_establishment_and_the_replay_keeps_the_clock`.
+- **Changed tests.** `test_c1_an_exit_before_its_registration_...` now uses a child that fails at `chdir` before its
+  release, the only kind of child that can exit before the registration now. Events carry their scope (`SENT TERM
+  group`).
+
+#### R2 [blocker], with A5: one marker reader, regular files only, a complete record
+
+- **The defect.** On ae9866f:
+  - a FIFO at the marker path blocked `empty()` (an open with no writer);
+  - a FIFO with a writer supplying matching JSON was proof;
+  - JSON `true` passed as version 1.
+- **`shimchild.read_marker`** is the one reader, used by `empty()`, `lost()` and `poll()`. In order:
+  1. `lstat`: it must be a regular file of at most `MARKER_MAX` (4096) bytes, so no special file is opened.
+  2. Open with `O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC`. `fstat` must show the same regular file: a special
+     file swapped in between is opened without waiting and refused unread.
+  3. The bytes must be exactly one line ending in a newline.
+  4. The JSON object must have exactly the shim's keys and exact types:
+     - `v` an int, never a bool, equal to 1;
+     - the nonce and the boot exact strings;
+     - `empty` with an int `cli_pid` above 1 and an int or null `leader_exit`;
+     - or `never_started` with both null.
+
+  Anything else is "no proof": never an exception, never a wait.
+- **The scope of "never waits" (A5).** The reader never opens or reads a special file and never waits on one.
+  `O_NONBLOCK` does not bound ordinary filesystem I/O on a regular file: a stalled filesystem can still stall the read.
+- **Test:** `test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits`. Each case is
+  refused promptly (in a bounded thread):
+  - a FIFO with no writer, and one with a writer holding a matching record;
+  - a directory, and `/dev/null` as the device (no device node can be made without root);
+  - a truncated record, no newline, two records;
+  - versions `true`, `1.0`, `"1"` and 2;
+  - another nonce, another boot, an extra key, a missing key, a wrong outcome;
+  - a bool or null `cli_pid`, a float exit code, `never_started` with a pid;
+  - an over-size file, a list.
+
+  The shim's own marker, and a valid `never_started` one, are accepted.
+
+#### R3 [blocker], with A2: `poll()` learns the exit from the marker
+
+- **The defect.** On ae9866f `poll()` read the marker only after something else had reaped the shim. When
+  backpressure dropped `LEADER_EXIT`, a consumer that only called `poll()` saw None for ever.
+- **Now:** `poll()` pumps the events and, with no `LEADER_EXIT`, reads the validated marker by itself on every call.
+- **LOST (A2).** When the CLI's exit is unknown, `poll()` stays None. Nothing is made up, and nothing proves a
+  release.
+
+| `LEADER_EXIT` seen | shim | marker (valid for this launch) | `poll()` | `empty()` | `lost()` |
+| --- | --- | --- | --- | --- | --- |
+| yes | running | none yet | the code | False | False |
+| yes | running or exited | `empty` | the code | True | False |
+| yes | exited | none (UNPROVED, MARKER_FAILED, a crash, killed) | the code | False | **True** |
+| no | running | none yet | None (running, or its event not read yet) | False | False |
+| no | running or exited | `empty` | the marker's code | True | False |
+| no | running or exited | `never_started` | None (it never ran) | True | False |
+| no | exited | none | **None for ever: LOST** | False | **True** |
+
+A valid marker includes one published `UNSYNCED`. **A caller that only ever calls `poll()` sees None for a LOST
+shim.** That is why C3-2 must ask `lost()` first (see "What C3-2 must replace").
+
+**Test:** `test_r3_a_poll_only_consumer_learns_the_exit_from_the_marker_when_leader_exit_was_dropped`. Unknown
+commands fill the event pipe while nobody reads it. The CLI exits 7, and its `LEADER_EXIT` is dropped (checked after
+the drain). A loop that calls only `poll()` gets 7 once the marker is there.
+
+#### R4 [should, then a blocker for A4]: visible proof versus durable publication; diagnostics off the path
+
+**The proof and its durability (A3).**
+- `empty()` means a valid, complete, VISIBLE marker for this launch: proof of absence for the living node that reads
+  it.
+- Durability across a crash is the shim's best effort.
+- **A temp-file sync failure publishes nothing:** no marker and no temp file, `MARKER_FAILED <errno>`, exit 4.
+- **A directory-sync failure leaves the valid, visible marker,** which `empty()` accepts. The shim says
+  `UNSYNCED <errno>`, then `EMPTY`, and exits 6, a distinct non-zero status.
+- If a marker disappears in a crash, recovery retains the checkout (C3-3): the conservative direction.
+- **Test:** `test_r4_a_failed_sync_..._said_as_unsynced[file|dir]`, with the sync failure injected in process.
+
+**Diagnostics (A4).** Nothing the loop does between the node's death and the proof may wait on the diagnostics sink,
+including opening it.
+- **The mechanism.** `Diag.put` only appends a line to a bounded in-memory list (`DIAG_CAPACITY`, 4096 lines; more
+  are dropped and counted).
+- **One daemon thread alone opens the log and writes it.**
+  - It starts only after the shim's single fork, so the fork is made single-threaded and no lock can be held in the
+    child. If the shim never forks, the thread starts at its exit.
+  - The exit waits for it at most `DIAG_FLUSH` (0.5 s), and then `os._exit`.
+- **Why a thread, not O_NONBLOCK.** A regular file on a stalled filesystem blocks whatever its flags, and so does
+  opening a FIFO nobody reads.
+- **The order.** Every signal, the latch, the reap and the publish are made before their diagnostic line. An event
+  is written before its log line, and a sink that raises is swallowed.
+- **Tests:**
+  - `test_r4_a_stalled_diagnostics_sink_never_holds_up_the_escalation[open_blocks|accepts_then_stalls]` (real): the
+    log is a FIFO that nobody opens, or one whose reader never reads. In the second case a FIFO holds about 8 KiB here
+    (measured), and 400 TERMs' worth of diagnostics stall it. Either way the EOF still brings TERM, KILL at the
+    grace, the proof and the marker in under 6 s.
+  - `test_r4_the_signal_goes_before_its_diagnostic_and_a_failing_sink_cannot_stop_it`.
+
+#### Also: why `UNPROVED` stays unit-only
+
+A real-process `UNPROVED` would need the group to be non-empty after the reap although the first listing held
+nothing but the zombie leader. No ordinary process can do that:
+- joining a group needs a live process in the CLI's session, and the first listing showed there is none;
+- after the reap the group no longer exists, so `setpgid` into it fails.
+
+The only real ways are the reuse of the leader's pid by a new group leader, or a failed listing. Forcing pid reuse
+safely is not possible from a test. So the post-reap permutations stay pinned in process (a member, the reused pid, a
+failed listing), with the real listing proved elsewhere (C1's R4).
+
+#### Measurements, again (scratch, 20 shims, load average 6.9)
+
+- `start()` to "ready": median 49.8 ms, max 89.2 ms.
+- `start()` to `STARTED`: median 71.4 ms, max 117.9 ms. This includes GO, the fork, the release and the exec.
+- Publishing the marker: median 10.8 ms.
+- A direct `spawn_piped`: median 3.8 ms.
+- RSS: 18.0 MiB waiting for `GO`, and 18.1 MiB while its CLI runs.
+- 67 modules are imported. The diagnostics thread adds no measurable start-up time.

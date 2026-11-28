@@ -7,9 +7,13 @@ place of the CLI's `Popen` once C3-2 wires it in. NOT used by any spawn site yet
   start": it publishes its bound marker and exits.
 - It has no thread. Events are pumped, non-blocking, in `poll()`, `empty()` and `lost()`; before a shim exit is
   classified, the event pipe is drained to EOF.
-- Three facts, never conflated: the CLI's exit (`poll()`: the `LEADER_EXIT` code, or None), the shim's exit
-  (`shim_poll()`: the node's own child, `Popen.poll()`), and the group's absence (`empty()`: the durable marker bound to
-  this launch's nonce and this boot, never the `EMPTY` event alone).
+- Three facts, never conflated: the CLI's exit (`poll()`: the `LEADER_EXIT` code, or the exit code a valid marker
+  carries, or None), the shim's exit (`shim_poll()`: the node's own child, `Popen.poll()`), and the group's absence
+  (`empty()`: a valid, complete, VISIBLE marker for this launch's nonce and this boot, never the `EMPTY` event alone).
+  `empty()` is proof of absence for the living node that reads it. Durability across a crash is the shim's best effort
+  (a directory sync that failed is said by `UNSYNCED`): a marker lost in a crash leaves the checkout held at the next
+  start, the conservative direction. A LOST shim (`lost()`) leaves `poll()` at None forever: callers must ask `lost()`
+  on their own, before they read None as "still running" (C3-2: every reap and shutdown path).
 - `terminate()`/`kill()` write `TERM`/`KILL`: one non-blocking write each, under the handle's own lock, which also
   guards closing the pipe, so a concurrent retirement cannot close the fd and have its number reused for another
   shim's pipe mid-write. A closed or broken pipe raises `BrokenPipeError`; a full one `BlockingIOError` (both
@@ -30,6 +34,7 @@ import json
 import os
 import secrets
 import select
+import stat
 import subprocess
 import sys
 import threading
@@ -39,13 +44,13 @@ from . import groupshim
 from .dispatch import PipedChild
 
 boot_id = groupshim.boot_id
-MARKER_MAX = 64 * 1024
+MARKER_MAX = 4096                   # bytes a marker may have (the shim's are about 200): larger is no proof
 # The shim runs THIS process's own agent_comms (the directory that holds the package imported here), never whatever
 # `-m agent_comms.groupshim` would find on the interpreter's path: `-I` (isolated: no PYTHON* variables, no user site,
 # no current directory on the path), then the package's own root first. Equivalent to `python -m agent_comms.groupshim`.
 _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(groupshim.__file__)))
-_BOOT = ("import sys; sys.path.insert(0, sys.argv.pop(1)); from agent_comms.groupshim import main; "
-         "sys.exit(main(sys.argv[1:]))")
+_BOOT = ("import sys; sys.path.insert(0, sys.argv.pop(1)); from agent_comms.groupshim import entry; "
+         "entry(sys.argv[1:])")
 EVENTS_PER_PUMP = 256 * 1024        # bytes one pump takes at most (non-blocking: never waits)
 
 
@@ -57,29 +62,61 @@ def wait_writable(fd: int, timeout: float) -> None:
     p.poll(max(0, int(timeout * 1000)))
 
 
-def marker_proves(path: str, nonce: str, boot: str) -> bool:
-    """Whether the marker at `path` proves the group of launch `nonce`, on boot `boot`, absent (or never made): a
-    regular file (no symlink), small, a JSON object of this protocol whose nonce and boot are exactly these and whose
-    outcome is `empty` or `never_started`. Anything else, an unreadable file included, is no proof."""
+_MARKER_KEYS = frozenset({"v", "nonce", "boot", "outcome", "cli_pid", "leader_exit"})
+
+
+def read_marker(path: str, nonce: str, boot: str) -> dict | None:
+    """THE one marker reader (`empty()`, `lost()` and `poll()` all use it): the marker at `path` when it proves the
+    group of launch `nonce`, on boot `boot`, absent (or never made); else None, never an exception.
+
+    It must be a REGULAR file: `lstat` first (no symlink, FIFO, socket, device or directory is opened), then an open with
+    O_NONBLOCK | O_NOFOLLOW, and `fstat` of what was opened must be the same regular file (a special file swapped in
+    between is opened without waiting, and refused unread). At most MARKER_MAX bytes, one line ending in a newline, a
+    JSON object with exactly the shim's keys and exact types: `v` an int (never a bool) equal to the protocol; the nonce
+    and the boot exactly these; the outcome `empty` (with an int `cli_pid` and an int or null `leader_exit`) or
+    `never_started` (both null). The scope of "never waits": the reader never opens or reads a special file and never
+    waits on one; O_NONBLOCK does not bound ordinary filesystem I/O on a regular file (a stalled filesystem can still
+    stall the read)."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError:
-        return False
-    try:
-        data = os.read(fd, MARKER_MAX + 1)
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-    if len(data) > MARKER_MAX:
-        return False
-    try:
+        if type(nonce) is not str or not nonce or type(boot) is not str or not boot:
+            return None
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MARKER_MAX:
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            got = os.fstat(fd)
+            if not stat.S_ISREG(got.st_mode) or (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
+                return None
+            data = os.read(fd, MARKER_MAX + 1)
+        finally:
+            os.close(fd)
+        if len(data) > MARKER_MAX or not data.endswith(b"\n") or data.count(b"\n") != 1:
+            return None
         rec = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return False
-    return (isinstance(rec, dict) and rec.get("v") == groupshim.PROTOCOL and isinstance(nonce, str) and nonce
-            and rec.get("nonce") == nonce and isinstance(boot, str) and boot and rec.get("boot") == boot
-            and rec.get("outcome") in ("empty", "never_started"))
+        if type(rec) is not dict or set(rec) != _MARKER_KEYS:
+            return None
+        if type(rec["v"]) is not int or rec["v"] != groupshim.PROTOCOL:
+            return None
+        if type(rec["nonce"]) is not str or rec["nonce"] != nonce or type(rec["boot"]) is not str or rec["boot"] != boot:
+            return None
+        pid, code = rec["cli_pid"], rec["leader_exit"]
+        if rec["outcome"] == "empty":
+            if type(pid) is not int or pid <= 1 or not (code is None or type(code) is int):
+                return None
+        elif rec["outcome"] == "never_started":
+            if pid is not None or code is not None:
+                return None
+        else:
+            return None
+        return rec
+    except Exception:
+        return None
+
+
+def marker_proves(path: str, nonce: str, boot: str) -> bool:
+    """Whether `read_marker` accepts the marker at `path` for this launch and boot."""
+    return read_marker(path, nonce, boot) is not None
 
 
 class ShimChild:
@@ -264,17 +301,17 @@ class ShimChild:
     # -------- the three facts
 
     def poll(self) -> int | None:
-        """The CLI's exit: the `LEADER_EXIT` code (as `Popen.returncode`: negative for a signal), or None. Once the shim
-        exited without saying it, the code its marker carries, if it has one."""
+        """The CLI's exit: the `LEADER_EXIT` code (as `Popen.returncode`: negative for a signal), else the exit code a
+        valid marker for this launch carries (read by itself on every call: an event dropped by backpressure is not
+        needed), else None. None also when the shim is LOST (the CLI's exit is unknown, and never made up): ask
+        `lost()` (DESIGN_NOTES C3-1 review round 1 has the whole table)."""
         self._pump()
-        if self.leader_code is None and self.proc.returncode is not None and self.empty():
-            try:
-                with open(self.marker, "rb") as f:
-                    code = json.loads(f.read(MARKER_MAX).decode("utf-8")).get("leader_exit")
-                if isinstance(code, int) and not isinstance(code, bool):
-                    self.leader_code = code
-            except (OSError, ValueError, UnicodeDecodeError, AttributeError):
-                pass
+        if self.leader_code is None:
+            rec = read_marker(self.marker, self.nonce, self.boot)
+            if rec is not None:
+                self._proved = True
+                if type(rec["leader_exit"]) is int:
+                    self.leader_code = rec["leader_exit"]
         return self.leader_code
 
     def shim_poll(self) -> int | None:
@@ -282,11 +319,12 @@ class ShimChild:
         return self._drained_exit()
 
     def empty(self) -> bool:
-        """The PROOF that this launch's group is absent (or was never made): the durable marker carries this launch's
-        nonce and this boot's identity. The `EMPTY` event alone is advisory: a prompt to look, never the proof."""
+        """The PROOF that this launch's group is absent (or was never made), for the living node: a valid, complete,
+        visible marker for this launch's nonce and this boot (`read_marker`). Not a claim that it is durable (see the
+        module text). The `EMPTY` event alone is advisory: a prompt to look, never the proof."""
         self._pump()
         if not self._proved:
-            self._proved = marker_proves(self.marker, self.nonce, self.boot)
+            self._proved = read_marker(self.marker, self.nonce, self.boot) is not None
         return self._proved
 
     def lost(self) -> bool:

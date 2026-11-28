@@ -222,17 +222,25 @@ class Kit:
         spec.setdefault("abort", self.abort)
         return [PY, str(self.standin), json.dumps(spec)]
 
-    def start(self, gate: bool = False, **kw) -> ShimChild:
+    def start(self, gate: bool = False, pauses: dict | None = None, defer: bool = False, **kw) -> ShimChild:
+        """`pauses`: the child's test-only pauses ({"before-setsid" | "after-setsid": options}); `defer`: the shim reads
+        the launch handshake only once `defer-handshake.go` exists. Both imply the test gate."""
         self.n += 1
         d = self.tmp / f"shim{self.n}"
         d.mkdir()
         g = None
-        if gate:
+        if gate or pauses or defer:
             g = d / "gate"
             g.mkdir()
+            if gate:
+                (g / "numbered").write_text("")     # (the shim's numbered gates: register, every signal)
+            for name, opts in (pauses or {}).items():
+                (g / f"pause.{name}").write_text(json.dumps(opts))
+            if defer:
+                (g / "defer-handshake").write_text("")
         kw.setdefault("stderr_log", str(d / "stderr.log"))
-        c = ShimChild.start(marker=str(d / "marker.json"), log=str(d / "shim.log"),
-                            test_gate=None if g is None else str(g), **kw)
+        kw.setdefault("log", str(d / "shim.log"))
+        c = ShimChild.start(marker=str(d / "marker.json"), test_gate=None if g is None else str(g), **kw)
         c.dir, c.gate_dir = d, g
         self.children.append(c)
         return c
@@ -248,6 +256,8 @@ class Kit:
             if c.gate_dir is not None:          # (release any gate it may be waiting at)
                 for i in range(1, 64):
                     (c.gate_dir / f"go.{i}").write_text("")
+                for name in ("before-setsid.go", "after-setsid.go", "defer-handshake.go", "abort"):
+                    (c.gate_dir / name).write_text("")
             if c.shim_poll() is None:
                 c.close_commands()              # (EOF: the shim stops its own group, then exits)
                 if not wait_for(lambda: c.shim_poll() is not None, 15):
@@ -334,17 +344,22 @@ def test_c1_a_fast_exit_is_reported(kit):
 
 
 def test_c1_an_exit_before_its_registration_is_read_without_reaping(kit):
-    """The test-only gate holds the shim between the fork and the kqueue registration until the CLI is already a
-    zombie: the registration is refused (ESRCH), and the status is read by waitid(WNOWAIT), without reaping."""
-    c = kit.run(["/bin/sh", "-c", "exit 5"], gate=True)
+    """The test-only gate holds the shim between the fork and the kqueue registration until the child is already a
+    zombie: the registration is refused (ESRCH), and the status is read by waitid(WNOWAIT), without reaping. (Since
+    review round 1 a child execs only after the shim watches it, so only a child that gives up before its release, here
+    at a `chdir` into a missing directory, can exit before the registration.)"""
+    c = kit.start(gate=True)
+    c.go(["/bin/sh", "-c", "exit 5"], cwd=str(kit.tmp / "missing"), env=ENV, kill_grace=1.0)
     name, pid = gate_reach(c, 1).split()
     assert name == "register"
     pid = int(pid)
-    assert wait_for(lambda: (kinfo(pid) or (0,))[0] == SZOMB), "the CLI exited before its registration"
+    assert wait_for(lambda: (kinfo(pid) or (0,))[0] == SZOMB), "the child exited before its registration"
     gate_open(c, 1)
     assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
-    assert c.poll() == 5 and c.cli_pid == pid and c.empty()
-    assert "exit registration refused (errno 3)" in (c.dir / "shim.log").read_text()
+    assert c.poll() == 127 and c.start_errno == 2 and c.cli_pid is None and c.empty()
+    assert kinds(c) == ["START_FAILED", "LEADER_EXIT", "EMPTY"]
+    log = (c.dir / "shim.log").read_text()
+    assert "exit registration refused (errno 3)" in log and "chdir failed (errno 2)" in log
 
 
 def test_c1_an_exec_failure_is_said_and_then_proved_empty(kit):
@@ -379,7 +394,7 @@ def test_c2_at_the_gate_before_its_killpg_the_zombie_still_anchors_the_pgid(kit)
     assert node_groups.group_members(pg) == (pg,), "still pinned: the zombie holds the pid and so the pgid"
     gate_open(c, 2)
     assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
-    assert ("SENT", "TERM") in c.events or any(e[:2] == ("FAILED", "TERM") for e in c.events)
+    assert ("SENT", "TERM", "group") in c.events or any(e[:2] == ("FAILED", "TERM") for e in c.events)
     assert kinds(c)[-1] == "EMPTY" and c.empty()
     log = (c.dir / "shim.log").read_text()
     assert f"killpg({pg}, TERM)" in log and log.index(f"killpg({pg}, TERM)") < log.index("reaped the CLI")
@@ -398,7 +413,7 @@ barrier = threading.Barrier(len(spec["shims"]) + 1)
 def one(name, s):
     try:
         barrier.wait(10)
-        c = ShimChild.start(marker=s["marker"], log=s["log"], stderr_log=s["stderr"])
+        c = ShimChild.start(marker=s["marker"], log=s["log"], stderr_log=s["stderr"], test_gate=s.get("gate"))
         c.go(s["argv"], cwd=s["cwd"], env=s["env"], kill_grace=s["grace"])
         children[name] = c
     except BaseException as e:
@@ -421,7 +436,8 @@ for t in threads:
 for t in threads:
     t.join(30)
 deadline = time.monotonic() + 30
-while time.monotonic() < deadline and (errors or any(c.cli_pid is None for c in children.values())):
+while time.monotonic() < deadline and (errors or any(c.cli_pid is None for n, c in children.items()
+                                                     if spec["shims"][n].get("wait_started", True))):
     if errors:
         break
     for c in children.values():
@@ -497,14 +513,17 @@ def test_c3_the_node_dies_and_its_shims_stop_their_groups_with_a_sibling_and_a_c
     took = time.monotonic() - t_kill
     assert took < 6.0, f"A saw EOF at once: nobody else held its command writer ({took:.2f} s)"
     assert os.path.exists(a_term), "A's CLI got the TERM (and ignored it)"
-    log = Path(spec["shims"]["A"]["log"]).read_text()
+    a_log = Path(spec["shims"]["A"]["log"])
+    assert wait_for(lambda: "exit 0" in a_log.read_text()), "A's log, written by its own thread, is complete"
+    log = a_log.read_text()
     term_at = diag_times(Path(spec["shims"]["A"]["log"]), f"killpg({a['cli']}, TERM) sent")
     kill_at = diag_times(Path(spec["shims"]["A"]["log"]), f"killpg({a['cli']}, KILL) sent")
     assert term_at and kill_at and kill_at[0] - term_at[0] >= 0.5, (term_at, kill_at)
     assert "EOF on the command pipe" in log and "event channel closed" in log, "(a): events stopped, cleanup went on"
     assert not os.path.exists(b_marker) and any(not gone(p) for p in rep["noise"]), "B and the others still live"
+    assert wait_for(lambda: "EOF on the command pipe" in Path(spec["shims"]["B"]["log"]).read_text())
     b_log = Path(spec["shims"]["B"]["log"]).read_text()
-    assert "EOF on the command pipe" in b_log and f"killpg({b['cli']}, TERM) sent" in b_log
+    assert f"killpg({b['cli']}, TERM) sent" in b_log
     assert f"killpg({b['cli']}, KILL)" not in b_log, "B's KILL waits for its own grace"
     Path(b_go).write_text("")
     assert wait_for(lambda: marker_proves(b_marker, b["nonce"], b["boot"])), "B proved its group gone"
@@ -614,7 +633,7 @@ def test_c5_a_survivor_keeps_the_marker_back_until_it_is_gone(kit):
     assert beat and time.monotonic() - beat < 0.5, "the member outlived the leader and its TERM"
     c.kill()
     assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
-    assert ("SENT", "KILL") in c.events and c.empty()
+    assert ("SENT", "KILL", "group") in c.events and c.empty()
 
 
 @pytest.mark.parametrize("route", ["term_then_early_kill", "kill_without_term"])
@@ -633,7 +652,8 @@ def test_c5_no_kill_before_the_grace_after_the_first_term_attempt(kit, route):
     assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
     assert c.poll() == -signal.SIGKILL
     sent = [e for e in c.events if e[0] in ("SENT", "FAILED", "DEFERRED")]
-    assert sent[0] == ("SENT", "TERM") and sent[1][:2] == ("DEFERRED", "KILL") and sent[2] == ("SENT", "KILL"), sent
+    assert sent[0] == ("SENT", "TERM", "group") and sent[1][:2] == ("DEFERRED", "KILL") \
+        and sent[2] == ("SENT", "KILL", "group"), sent
     assert 0 < int(sent[1][2]) <= grace * 1000
     log = c.dir / "shim.log"
     t_term = diag_times(log, f"killpg({c.cli_pid}, TERM)")
@@ -850,8 +870,7 @@ def test_c7_command_writes_raise_when_the_pipe_is_full_closed_or_broken(kit):
             os.write(c._cmd, b"NOP\n")
     with pytest.raises(BlockingIOError):
         c.terminate()
-    gate_open(c, 1)
-    assert wait_event(c, "STARTED")
+    gate_open(c, 1)     # (its answers to the NOPs fill the event pipe: STARTED may be dropped, so it is not awaited)
     c.close_commands()
     with pytest.raises(BrokenPipeError):
         c.terminate()
@@ -929,16 +948,16 @@ def test_c7_a_shim_that_exits_without_a_marker_is_lost(kit):
 
 def test_c7_a_marker_of_another_launch_or_boot_is_no_proof(kit, tmp_path):
     nonce, boot = "a" * 32, groupshim.boot_id()
-    good = {"v": 1, "nonce": nonce, "boot": boot, "outcome": "empty", "cli_pid": 1, "leader_exit": 0}
+    good = {"v": 1, "nonce": nonce, "boot": boot, "outcome": "empty", "cli_pid": 4242, "leader_exit": 0}
     p = tmp_path / "m.json"
     for bad in ({**good, "nonce": "b" * 32}, {**good, "boot": "1.000000"}, {**good, "outcome": "held"},
                 {**good, "v": 2}, {k: v for k, v in good.items() if k != "nonce"}, [good]):
-        p.write_text(json.dumps(bad))
+        p.write_text(json.dumps(bad) + "\n")
         assert not marker_proves(str(p), nonce, boot), bad
     p.write_text("{not json")
     assert not marker_proves(str(p), nonce, boot)
     real = tmp_path / "real.json"
-    real.write_text(json.dumps(good))
+    real.write_text(json.dumps(good) + "\n")
     p.unlink()
     p.symlink_to(real)
     assert not marker_proves(str(p), nonce, boot), "no symlink"
@@ -990,6 +1009,7 @@ class Fakes:
         self.now = 100.0
         shim.members = self._members
         shim.killpg = self._killpg
+        shim.kill = self._kill
         shim.waitpid = self._waitpid
         shim.waitid = lambda pid: 0
         shim.clock = lambda: self.now
@@ -1005,9 +1025,29 @@ class Fakes:
         if sig in self.raise_on:
             raise ProcessLookupError(3, "no such process")
 
+    def _kill(self, pid, sig):
+        self.calls.append(("kill", sig, self.shim.latched, self.shim.reaped))
+        if sig in self.raise_on:
+            raise ProcessLookupError(3, "no such process")
+
     def _waitpid(self, pid, flags):
         self.calls.append(("waitpid", self.shim.latched))
         return pid, 0
+
+
+class ListSink:
+    """A diagnostics sink that records, in order, beside the fakes' calls (when given their list)."""
+
+    def __init__(self, calls=None):
+        self.lines, self.calls = [], calls
+
+    def put(self, msg):
+        self.lines.append(msg)
+        if self.calls is not None:
+            self.calls.append(("diag", msg))
+
+    def start(self):
+        pass
 
 
 @pytest.fixture
@@ -1016,15 +1056,15 @@ def shim(tmp_path):
     evt_r, evt_w = os.pipe()
     os.set_blocking(evt_w, False)
     os.set_blocking(evt_r, False)
-    log = os.open(tmp_path / "shim.log", os.O_WRONLY | os.O_CREAT, 0o600)
     s = groupshim.Shim(nonce="n" * 32, boot="1.000001", marker=str(tmp_path / "marker.json"), cmd_fd=cmd_r,
-                       event_fd=evt_w, log_fd=log)
-    s.pgid, s.grace = 987654321, 1.0      # (a fake pgid: the fake killpg below is all that ever "signals" it)
+                       event_fd=evt_w, sink=ListSink())
+    s.pgid, s.grace = 987654321, 1.0      # (a fake pid: the fake kill and killpg below are all that "signal" it)
+    s.established = True                # (most decisions are about an established group; the launch tests set it)
     s.evt_r = evt_r
     try:
         yield s
     finally:
-        for fd in (cmd_r, cmd_w, evt_r, log) + ((s.event_fd,) if s.event_fd is not None else ()):
+        for fd in (cmd_r, cmd_w, evt_r) + ((s.event_fd,) if s.event_fd is not None else ()):
             try:
                 os.close(fd)
             except OSError:
@@ -1138,3 +1178,295 @@ def test_unit_the_exit_status_flag_is_the_one_pinned():
     assert groupshim.NOTE_EXITSTATUS == 0x04000000
     assert groupshim.decode_status(7 << 8) == 7 and groupshim.decode_status(signal.SIGKILL) == -signal.SIGKILL
     assert groupshim.boot_id() == shimchild.boot_id() and groupshim.boot_id().count(".") == 1
+
+
+# ---------------------------------------------------------------- code review round 1 (Sol on ae9866f)
+
+def child_at(c: ShimChild, name: str, timeout: float = WAIT):
+    """The child's test-only pause `name` is reached: what it announced (its pid, and a member's)."""
+    return wait_for(lambda: read_json(c.gate_dir / f"{name}.at"), timeout)
+
+
+def bounded(fn, timeout: float = 3.0):
+    """(finished within `timeout`, its value): for a call that must never wait."""
+    out: dict = {}
+    t = threading.Thread(target=lambda: out.setdefault("v", fn()), daemon=True)
+    t.start()
+    t.join(timeout)
+    return not t.is_alive(), out.get("v")
+
+
+def fionread(fd: int) -> int:
+    import fcntl
+    import termios
+    n = ctypes.c_int()
+    fcntl.ioctl(fd, termios.FIONREAD, n)
+    return n.value
+
+
+@pytest.mark.parametrize("where", ["after-setsid", "before-setsid"])
+def test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it(kit, where):
+    """R1: the child pauses (a test-only pause in the child) before or after its setsid(), so it never reaches its exec
+    and holds the handshake open. The node stand-in dies. The shim reads the handshake in its loop, so it sees the EOF
+    at once: a TERM, a KILL at the grace (the paused child ignores TERM), the proof and the marker. Before setsid() both
+    go to the child's pid (no group by its id exists yet); after, to its group. (On ae9866f the shim blocks reading the
+    handshake and never looks at the command pipe.)"""
+    spec = node_spec(kit, {"P": (kit.argv(), 0.5)})
+    gate = kit.tmp / "node-P" / "gate"
+    gate.mkdir()
+    (gate / f"pause.{where}").write_text(json.dumps({"ignore_term": True}))
+    spec["shims"]["P"].update(gate=str(gate), wait_started=False)
+    node = start_node(kit, spec)
+    try:
+        rep = wait_for(lambda: read_json(spec["report"]), 40)
+        assert rep and not rep["errors"], rep
+        child = wait_for(lambda: read_json(gate / f"{where}.at"))
+        assert child, "the child paused in its launch"
+        pid, p = child["pid"], rep["shims"]["P"]
+        node.kill()                         # (its own handle)
+        node.wait(timeout=10)
+        assert wait_for(lambda: marker_proves(spec["shims"]["P"]["marker"], p["nonce"], p["boot"])), "the marker"
+        log_path = Path(spec["shims"]["P"]["log"])
+        assert wait_for(lambda: "exit 0" in log_path.read_text())
+        call = "killpg" if where == "after-setsid" else "kill"
+        t_term = diag_times(log_path, f"{call}({pid}, TERM) sent")
+        t_kill = diag_times(log_path, f"{call}({pid}, KILL) sent")
+        assert t_term and t_kill and t_kill[0] - t_term[0] >= 0.5, (t_term, t_kill)
+        log = log_path.read_text()
+        assert "EOF on the command pipe" in log and "event STARTED" not in log and "event START_FAILED 0" in log
+        assert wait_for(lambda: gone(p["shim"]))
+    finally:
+        for name in ("abort", f"{where}.go"):
+            (gate / name).write_text("")
+
+
+def test_r1_a_term_sent_to_the_pid_is_replayed_to_the_group_once_established_and_the_grace_is_unchanged(kit):
+    """A1: the child has done its setsid() and forked a member (a test-only pause after setsid), but the shim has not
+    read its `S` yet (a test-only deferral of the handshake). A TERM then goes to the pid only and does not reach the
+    member. Once the shim reads `S`, the TERM is replayed to the group (the member gets it), and a KILL asked for after
+    the replay still fires at the FIRST TERM attempt + the grace, not the replay's."""
+    mt, grace = kit.path("member-term"), 2.0
+    c = kit.start(pauses={"after-setsid": {"ignore_term": True, "member_term_file": mt}}, defer=True)
+    c.go(kit.argv(), cwd=str(kit.work), env=ENV, kill_grace=grace)
+    child = child_at(c, "after-setsid")
+    assert child and wait_for(lambda: os.path.exists(mt + ".ready")), "the child paused, its member is up"
+    pid = child["pid"]
+    c.terminate()
+    assert wait_event(c, "SENT") == ("SENT", "TERM", "pid")
+    time.sleep(0.3)
+    assert not os.path.exists(mt), "a TERM to the pid alone does not reach the member"
+    time.sleep(1.2)
+    (c.gate_dir / "defer-handshake.go").write_text("")
+    assert wait_for(lambda: os.path.exists(mt)), "the replay reached the member"
+    assert wait_for(lambda: c.poll() is None and ("SENT", "TERM", "group") in c.events)
+    c.kill()
+    assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
+    seq = [e[:2] if e[0] == "DEFERRED" else e for e in c.events if e[0] in ("SENT", "DEFERRED", "FAILED")]
+    assert seq == [("SENT", "TERM", "pid"), ("SENT", "TERM", "group"), ("DEFERRED", "KILL"),
+                   ("SENT", "KILL", "group")], seq
+    log = c.dir / "shim.log"
+    first = diag_times(log, f"kill({pid}, TERM) sent")
+    replay = diag_times(log, f"killpg({pid}, TERM) sent")
+    killed = diag_times(log, f"killpg({pid}, KILL) sent")
+    assert first and replay and killed
+    assert killed[0] - first[0] >= grace, "no KILL before the first TERM attempt + the grace"
+    assert killed[0] < replay[0] + grace - 0.3, "the replay did not restart the grace"
+
+
+def test_r1_a_kill_sent_to_the_pid_is_replayed_to_the_group_once_established(kit):
+    """A1: as above, with the KILL already sent to the pid before the shim read `S`: the child dies, its member (in the
+    child's group, ignoring nothing but surviving a KILL to the pid alone) keeps the proof back; once `S` is read, the
+    TERM and the KILL are replayed to the group, the member dies, and the marker follows."""
+    mt = kit.path("member-term")
+    c = kit.start(pauses={"after-setsid": {"ignore_term": True, "member_term_file": mt}}, defer=True)
+    c.go(kit.argv(), cwd=str(kit.work), env=ENV, kill_grace=0.5)
+    child = child_at(c, "after-setsid")
+    assert child and wait_for(lambda: os.path.exists(mt + ".ready"))
+    pid, member = child["pid"], child["member"]
+    c.kill()
+    assert wait_event(c, "LEADER_EXIT") and c.poll() == -signal.SIGKILL
+    assert [e for e in c.events if e[0] == "SENT"] == [("SENT", "TERM", "pid"), ("SENT", "KILL", "pid")]
+    time.sleep(0.5)
+    k = kinfo(member)
+    assert k is not None and k[0] != SZOMB and k[2] == pid, "the member survived a KILL to the pid alone"
+    assert c.shim_poll() is None and not c.empty(), "and keeps the proof back"
+    (c.gate_dir / "defer-handshake.go").write_text("")
+    assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
+    assert ("SENT", "TERM", "group") in c.events and ("SENT", "KILL", "group") in c.events
+    assert wait_for(lambda: (kinfo(member) or (SZOMB, 0, 0))[2] != pid or kinfo(member) is None)
+
+
+def test_r2_the_marker_reader_takes_only_a_complete_record_in_a_regular_file_and_never_waits(tmp_path):
+    """R2 and A5: one reader for every use. A FIFO (with no writer, or with one that supplies a matching record), a
+    directory and a device are refused without waiting; so are a truncated or doubled record, a version that is
+    `true`, `1.0` or `"1"`, an over-size file, another nonce or boot, and any key or type that is not exactly the
+    shim's. (On ae9866f the FIFO with no writer blocks the reader, and the FIFO with a writer and `true` are proof.)"""
+    nonce, boot = "a" * 32, groupshim.boot_id()
+    good = {"v": 1, "nonce": nonce, "boot": boot, "outcome": "empty", "cli_pid": 4242, "leader_exit": 0}
+    line = json.dumps(good).encode() + b"\n"
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    try:
+        assert bounded(lambda: marker_proves(str(fifo), nonce, boot)) == (True, False), "a FIFO with no writer"
+    finally:
+        try:        # (a reader the old code left blocked in its open gets a writer, and returns)
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+    fd = os.open(fifo, os.O_RDWR)
+    try:
+        os.write(fd, line)
+        assert bounded(lambda: marker_proves(str(fifo), nonce, boot)) == (True, False), "a FIFO with a matching record"
+    finally:
+        os.close(fd)
+    (tmp_path / "dir").mkdir()
+    assert bounded(lambda: marker_proves(str(tmp_path / "dir"), nonce, boot)) == (True, False)
+    assert bounded(lambda: marker_proves("/dev/null", nonce, boot)) == (True, False), "a device"
+    dump = lambda rec: json.dumps(rec).encode() + b"\n"       # noqa: E731
+    cases = {
+        "truncated": line[:-6], "no newline": line[:-1], "two records": line + line,
+        "v true": dump({**good, "v": True}), "v 1.0": dump({**good, "v": 1.0}), "v '1'": dump({**good, "v": "1"}),
+        "v 2": dump({**good, "v": 2}), "other nonce": dump({**good, "nonce": "b" * 32}),
+        "other boot": dump({**good, "boot": "1.000000"}), "extra key": dump({**good, "x": 1}),
+        "missing key": dump({k: v for k, v in good.items() if k != "leader_exit"}),
+        "outcome held": dump({**good, "outcome": "held"}), "bool pid": dump({**good, "cli_pid": True}),
+        "no pid": dump({**good, "cli_pid": None}), "float exit": dump({**good, "leader_exit": 1.0}),
+        "never_started with a pid": dump({**good, "outcome": "never_started"}),
+        "over-size": line.replace(b",", b"," + b" " * 5000, 1), "a list": dump([good]),
+    }
+    p = tmp_path / "marker.json"
+    for name, data in cases.items():
+        p.write_bytes(data)
+        assert not marker_proves(str(p), nonce, boot), name
+    p.write_bytes(dump({**good, "outcome": "never_started", "cli_pid": None, "leader_exit": None}))
+    assert marker_proves(str(p), nonce, boot) and not marker_proves(str(p), nonce, "")
+    p.unlink()
+    assert groupshim.write_marker(str(p), good) == (groupshim.PUBLISHED, 0) and marker_proves(str(p), nonce, boot)
+    assert shimchild.read_marker(str(p), nonce, boot) == good
+
+
+def test_r3_a_poll_only_consumer_learns_the_exit_from_the_marker_when_leader_exit_was_dropped(kit):
+    """R3: the event pipe is full (unknown commands flood it, nobody reads), so the CLI's LEADER_EXIT and EMPTY are
+    dropped. A consumer that only ever calls poll() still gets the CLI's exit code, from the marker, once it is there.
+    (On ae9866f poll() looked at the marker only after something else had reaped the shim: None for ever.)"""
+    go_file = kit.path("cli-go")
+    c = kit.run(kit.argv(until=go_file, exit=7))
+    assert wait_event(c, "STARTED")
+    log = c.dir / "shim.log"
+    end = time.monotonic() + WAIT
+    while time.monotonic() < end and "event dropped" not in log.read_text():
+        for _ in range(2000):
+            try:
+                os.write(c._cmd, b"NOP\n")
+            except BlockingIOError:
+                time.sleep(0.001)
+    assert "event dropped" in log.read_text(), "the event pipe is full"
+    Path(go_file).write_text("")
+    assert wait_for(lambda: os.path.exists(c.marker)), "the shim proved the group gone"
+    assert wait_for(c.poll) == 7, "poll() alone gives the exit code"
+    assert shim_exit(c) == groupshim.EXIT_EMPTY
+    assert not any(e[0] == "LEADER_EXIT" for e in c.events), "(LEADER_EXIT really was dropped)"
+
+
+@pytest.mark.parametrize("which", ["file", "dir"])
+def test_r4_a_failed_sync_file_publishes_nothing_and_dir_leaves_a_visible_marker_said_as_unsynced(shim, monkeypatch,
+                                                                                                  which):
+    """A3: the temp file's sync fails: nothing is published (no marker, no temp file), MARKER_FAILED, exit 4. The
+    directory's sync fails: the complete marker is visible and valid (the living node's proof: `empty()` takes it), and
+    the shim says `UNSYNCED <errno>` before `EMPTY` and exits 6, not 0."""
+    calls = []
+    real = groupshim._fullsync
+
+    def fake(fd):
+        calls.append(fd)
+        if len(calls) == (1 if which == "file" else 2):
+            raise OSError(5, "injected EIO")
+        real(fd)
+    monkeypatch.setattr(groupshim, "_fullsync", fake)
+    Fakes(shim, [(shim.pgid,), ()])
+    shim.leader_exited, shim.leader_code = True, 0
+    code = shim._check_empty()
+    said = events_of(shim)
+    if which == "file":
+        assert code == groupshim.EXIT_MARKER_FAILED and not os.path.exists(shim.marker)
+        assert not [f for f in os.listdir(os.path.dirname(shim.marker)) if f.endswith(".tmp")]
+        assert "MARKER_FAILED" in said and "EMPTY" not in said
+    else:
+        assert code == groupshim.EXIT_UNSYNCED and marker_proves(shim.marker, shim.nonce, shim.boot)
+        assert said[said.index("UNSYNCED") + 1] == "5" and said.index("UNSYNCED") < said.index("EMPTY")
+
+
+def test_r4_the_signal_goes_before_its_diagnostic_and_a_failing_sink_cannot_stop_it(shim):
+    f = Fakes(shim, [])
+    shim.sink = ListSink(f.calls)
+    shim._on_eof()
+    assert f.calls[0] == ("killpg", signal.SIGTERM, False, False), f.calls
+    assert any(c[0] == "diag" and c[1].startswith("EOF on the command pipe") for c in f.calls[1:])
+
+    class Broken:
+        def put(self, msg):
+            raise RuntimeError("a diagnostics sink that fails")
+
+        def start(self):
+            pass
+    shim.sink, f.calls[:] = Broken(), []
+    f.now += 5
+    shim._kill_now()
+    assert f.calls == [("killpg", signal.SIGKILL, False, False)], "the KILL went, the sink's failure stayed out"
+
+
+@pytest.mark.parametrize("stall", ["open_blocks", "accepts_then_stalls"])
+def test_r4_a_stalled_diagnostics_sink_never_holds_up_the_escalation(kit, stall):
+    """A4: the log is a FIFO. (1) Nobody ever opens its read end, so opening it blocks. (2) A reader holds it open and
+    never reads, so it takes some 8 KiB (a FIFO's buffer, measured) and then every write blocks. In both, the shim
+    still does its TERM, its KILL at the grace, the proof and the marker, on time: only its diagnostics thread waits.
+    (On ae9866f the shim's own loop opened and wrote the log.)"""
+    fifo = kit.tmp / "log.fifo"
+    os.mkfifo(fifo)
+    held = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK) if stall == "accepts_then_stalls" else None
+    up = kit.path("up")
+    try:
+        c = kit.run(kit.argv(ignore_term=True, started=up, wait_abort=True), grace=0.5, log=str(fifo))
+        assert wait_event(c, "STARTED") and wait_for(lambda: os.path.exists(up))
+        if held is not None:
+            sent = 0
+            end = time.monotonic() + WAIT
+            while sent < 400 and time.monotonic() < end:
+                try:
+                    c.terminate()
+                    sent += 1
+                except BlockingIOError:
+                    time.sleep(0.005)
+                c.poll()
+            assert wait_for(lambda: fionread(held) >= 4096), \
+                f"the sink took bytes, and now holds them unread ({sent} TERMs, {fionread(held)} bytes, {c.events[-3:]})"
+        t0 = time.monotonic()
+        c.close_commands()
+        assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events
+        assert time.monotonic() - t0 < 6.0
+        assert ("SENT", "KILL", "group") in c.events and c.empty()
+    finally:
+        if held is not None:
+            os.close(held)
+
+
+def test_unit_the_signal_target_follows_establishment_and_the_replay_keeps_the_clock(shim):
+    """Before establishment is observed, the child's pid (`kill`), never `killpg`; at establishment, each pid-only signal
+    once more to the group; after, the group. The replay changes neither the first TERM time nor the KILL deadline."""
+    f = Fakes(shim, [])
+    shim.established = False
+    shim._kill_request()
+    assert f.calls == [("kill", signal.SIGTERM, False, False)] and shim.first_term_at == 100.0
+    assert shim.kill_due == 101.0
+    f.now = 100.6
+    shim._established()
+    assert f.calls[1:] == [("killpg", signal.SIGTERM, False, False)] and shim.pid_only == []
+    assert shim.first_term_at == 100.0 and shim.kill_due == 101.0
+    f.now = 101.0
+    shim._kill_now()
+    assert f.calls[2:] == [("killpg", signal.SIGKILL, False, False)]
+    # a KILL sent to the pid is replayed too
+    shim.established, shim.pid_only, f.calls[:] = False, [], []
+    shim._signal(signal.SIGKILL)
+    shim._established()
+    assert f.calls == [("kill", signal.SIGKILL, False, False), ("killpg", signal.SIGKILL, False, False)]
