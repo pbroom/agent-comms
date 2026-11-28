@@ -1,7 +1,7 @@
-"""(Ownership C3-1) The per-group supervisor ("the shim"): ONE small process per process group the node starts, run as
-`python -I -m agent_comms.groupshim <args>` (agent_comms/shimchild.py starts it). NOT wired into any spawn site yet
-(C3-2 does that); DESIGN_NOTES "Ownership C3-1: the group supervisor (unwired)" and its "code review round 1" have the
-protocol as tables.
+"""(Ownership C3-1, C3-2a) The per-group supervisor ("the shim"): ONE small process per process group the node starts, run
+as `python -I -m agent_comms.groupshim <args>` (agent_comms/shimchild.py starts it). NOT wired into any spawn site yet;
+DESIGN_NOTES "Ownership C3-1: the group supervisor (unwired)", its review rounds, and "Ownership C3-2a: the proof is
+authenticated (still unwired)" have the protocol as tables.
 
 What it is for. The node used to signal a process group by number: between a probe and a `killpg`, the last member can
 exit and the group id be reused, and after a node crash nobody stops the orphans or can prove a checkout free. The shim
@@ -10,29 +10,40 @@ the CLI's pid, and so its pgid, cannot be reused while it may still signal. It s
 on its command pipe). It leaves a proof (the marker) when the group is gone, or when none was ever made.
 
 The life of one shim:
-1. Arguments, before anything durable exists: the launch nonce, the boot identity the node read, the marker path, the
-   protocol version, the two control fds and its own diagnostics log. Any bad argument: exit 2, nothing published.
+1. Arguments, before anything durable exists: the boot identity the node read (`kern.bootsessionuuid`), the marker
+   path, the protocol version, the two control fds and its own diagnostics log. NO secret: the CLI, the shim's child
+   and the same user, can read its parent's argv and environment. Any bad argument, or a boot identity that is not this
+   boot's or cannot be read: exit 2, nothing started, nothing published.
 2. `setsid()`. fd 0/1/2 are the CLI's future stdio: they are put aside (close-on-exec copies) and replaced by /dev/null.
    The control fds are made close-on-exec.
-3. `GO`: one bounded, newline-terminated, versioned frame, `GO 1 <json>\\n`. Anything else (EOF first, a partial frame
+3. (C3-2a) `NONCE`: the launch secret, in ONE bounded frame, `NONCE 1 <64 hex>\\n`, the first thing on the command pipe.
+   Missing, partial, over-long, malformed, or followed by a second one: `NOSECRET <reason>`, exit 7, nothing started and
+   no marker (none could be authenticated). The secret is in no argv, environment, file, event or diagnostic.
+4. `GO`: one bounded, newline-terminated, versioned frame, `GO 1 <json>\\n`. Anything else (EOF first, a partial frame
    then EOF, an over-long, unparseable or unknown-version frame) never starts the CLI: the bound marker is published
    (`never_started`) and the shim exits 3.
-4. Spawn: fork. From the fork on, everything is in the single event loop: the command pipe, the launch handshake and
-   the child's exit. The child calls `setsid()` and says so (GROUP ESTABLISHED), reads the shim's RELEASE byte before
-   any checkout work (it is written only once the child's exit and exec watch is INSTALLED; at EOF the child never
-   enters the checkout), restores a direct `Popen` child's signal dispositions, takes back fds 0/1/2, closes every
-   other fd, `chdir`s and `execvpe`s (EXEC CONFIRMED: kqueue NOTE_EXEC). Nothing reaps it early. RELEASE cannot keep
-   the watcher alive: a shim killed after writing it can still let the child exec (that launch is LOST).
-5. Watch: kqueue `EVFILT_PROC` `NOTE_EXIT | NOTE_EXITSTATUS | NOTE_EXEC`, never reaping: the zombie pins the pgid.
-6. `TERM` / `KILL`, from the fork on, only while the anchor holds (the child unreaped, signalling not latched off): to
+5. Spawn: fork (the package's only one, C3-2a F6). From the fork on, everything is in the single event loop: the command
+   pipe, the launch handshake and the child's exit. The child, every statement of it inside one failure boundary that
+   leaves only by `os._exit` (F5), calls `setsid()` and says so (GROUP ESTABLISHED), reads the shim's RELEASE byte
+   before any checkout work (it is written only once the child's exit and exec watch is INSTALLED; at EOF the child
+   never enters the checkout), restores a direct `Popen` child's signal dispositions, takes back fds 0/1/2, closes
+   every other fd, `chdir`s and `execvpe`s (EXEC CONFIRMED: kqueue NOTE_EXEC). Nothing reaps it early. RELEASE cannot
+   keep the watcher alive: a shim killed after writing it can still let the child exec (that launch is LOST).
+6. Watch: kqueue `EVFILT_PROC` `NOTE_EXIT | NOTE_EXITSTATUS | NOTE_EXEC`, never reaping: the zombie pins the pgid.
+7. `TERM` / `KILL`, from the fork on, only while the anchor holds (the child unreaped, signalling not latched off): to
    the child's pid until its group is observed established, to its group after (and then any pid-only TERM or KILL is
    replayed to the group once). A KILL is sent no earlier than `kill_grace` after the shim's first TERM attempt.
-7. EOF on the command pipe (the node died or let go): TERM at once, KILL at first TERM + `kill_grace`, KILL again every
+8. EOF on the command pipe (the node died or let go): TERM at once, KILL at first TERM + `kill_grace`, KILL again every
    `kill_grace` while the anchor holds. Neither event writes nor diagnostics can block or abort this.
-8. Empty: a complete listing (`node_groups.group_members`) holding nothing but the exited, unreaped leader; then latch
-   signalling OFF, reap, list again and require ABSENT; then publish the marker atomically, `EMPTY`, exit 0. Anything
-   else after the reap: no marker, `UNPROVED`, exit 1.
-9. If the shim itself is killed, launchd reaps the CLI's zombie and the anchor is lost: nothing is published (held, for
+9. Empty: a complete listing (`node_groups.group_members`) holding nothing but the exited, unreaped leader; then latch
+   signalling OFF, reap, list again and require ABSENT; then publish the marker, every field authenticated by
+   HMAC-SHA256 under the launch secret (`marker_mac`), created exclusively at its path and written in place with no
+   staging file (nothing is ever replaced or unlinked; atomicity for the reader is the release pair and the MAC),
+   `EMPTY`, exit 0. Anything else after the reap: no marker, `UNPROVED`, exit 1.
+10. (C3-2a, F2) An unexpected exception after the fork: the degraded stop (`Shim.stop_after_crash`): TERM, KILL at the
+   first TERM + the grace, repeated, and the same proof; if the kernel cannot confirm the anchor, no signal and no
+   marker (exit 5).
+11. If the shim itself is killed, launchd reaps the CLI's zombie and the anchor is lost: nothing is published (held, for
    a human). Descendants that leave the group (`setsid`/`setpgid`) are outside group-based ownership.
 
 It never opens the board, reads config or imports the session host, and it never logs through `logging`. Its
@@ -42,6 +53,8 @@ started only after the single fork, alone opens and writes the log (`Diag`).
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import hmac
 import json
 import os
 import select
@@ -52,7 +65,15 @@ import time
 
 from . import node_groups
 
-PROTOCOL = 1
+PROTOCOL = 1                    # the command pipe's frames: `NONCE 1 <hex>\n`, then `GO 1 <json>\n`
+# (C3-2a) The marker record's version. 2: every field authenticated by HMAC-SHA256 under the launch secret (1 was
+# C3-1's unauthenticated record, which the reader refuses). A later, stronger verifier takes a new number.
+MARKER_VERSION = 2
+KEY_BYTES = 32                  # the launch secret: fresh random bytes per launch, carried only by the NONCE frame
+MAX_NONCE = 128                 # bytes of the NONCE frame at most, newline included (a valid one is 73)
+MARKER_MAC_DOMAIN = b"agent-comms groupshim marker v2\0"
+# (C3-2a, F4) This boot's identity: the UUID the kernel draws at every boot. Never a wall-clock value.
+BOOT_SYSCTL = b"kern.bootsessionuuid"
 # <sys/event.h>: ask EVFILT_PROC's NOTE_EXIT to carry the wait(2) status in `data`. Python 3.12's select module does not
 # name it. Pinned HERE only, with its self-check: the kernel echoes the flag in the event's fflags when it filled `data`
 # (measured on this Mac: fflags 0x84000000), and the decoded status is cross-checked against `waitid(WNOWAIT)` at every
@@ -81,17 +102,14 @@ EXIT_UNPROVED = 1       # after the reap the group was not proved absent: no mar
 EXIT_USAGE = 2          # bad arguments (or no waitid): nothing started, nothing published
 EXIT_NOGO = 3           # the CLI was never forked: marker `never_started`
 EXIT_MARKER_FAILED = 4  # the marker could not be published: no proof
-EXIT_CRASH = 5          # an unexpected exception (its traceback is in the log): no marker
+EXIT_CRASH = 5          # an unexpected exception (its frames are in the log): no marker
 EXIT_UNSYNCED = 6       # the marker is published and visible, but its directory's sync failed: not known durable
+EXIT_NOSECRET = 7       # (C3-2a) no single valid NONCE frame: nothing started, and no marker (none could be authenticated)
 
 SIGNAMES = {signal.SIGTERM: "TERM", signal.SIGKILL: "KILL"}
 
 
 # ---------------------------------------------------------------- small system helpers (no logging, no side effects)
-
-class _Timeval(ctypes.Structure):
-    _fields_ = [("sec", ctypes.c_long), ("usec", ctypes.c_int32)]
-
 
 _LIBC: list = []
 
@@ -108,22 +126,51 @@ def _libc():
     return _LIBC[0]
 
 
-def boot_id() -> str | None:
-    """This boot's identity: `kern.boottime` (seconds.microseconds), or None if it cannot be read. A pid or a start time
-    from another boot proves nothing; a marker carries the boot it was made on."""
+def _sysctl_string(name: bytes) -> str | None:
+    """A string sysctl by name, or None if it cannot be read or is not one NUL-terminated ASCII string."""
     lib = _libc()
     if lib is None or sys.platform != "darwin":
         return None
-    tv = _Timeval()
-    size = ctypes.c_size_t(ctypes.sizeof(tv))
+    buf = ctypes.create_string_buffer(128)
+    size = ctypes.c_size_t(ctypes.sizeof(buf))
     try:
-        if lib.sysctlbyname(b"kern.boottime", ctypes.byref(tv), ctypes.byref(size), None, 0) != 0:
+        if lib.sysctlbyname(name, buf, ctypes.byref(size), None, 0) != 0:
             return None
-    except (AttributeError, OSError):
+    except (AttributeError, OSError, ctypes.ArgumentError):
         return None
-    if tv.sec <= 0 or not 0 <= tv.usec < 1_000_000:
+    raw = buf.raw[:size.value] if 0 < size.value <= ctypes.sizeof(buf) else b""
+    if not raw.endswith(b"\0") or b"\0" in raw[:-1]:
         return None
-    return f"{tv.sec}.{tv.usec:06d}"
+    try:
+        return raw[:-1].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
+def valid_boot(value) -> bool:
+    """A boot identity's shape: a UUID in its 36-character text form (8-4-4-4-12 hex digits)."""
+    if type(value) is not str or len(value) != 36:
+        return False
+    parts = value.split("-")
+    return [len(p) for p in parts] == [8, 4, 4, 4, 12] and all(c in "0123456789abcdefABCDEF" for p in parts for c in p)
+
+
+def boot_id() -> str | None:
+    """(C3-2a, F4) This boot's identity: `kern.bootsessionuuid`, a UUID the kernel draws at every boot, validated for
+    its shape; None if it cannot be read or is not a UUID (the launch is then refused: there is no fallback, and never
+    a wall-clock value). A pid or a start time from another boot proves nothing; a marker carries the boot it was made
+    on."""
+    value = _sysctl_string(BOOT_SYSCTL)
+    return value if valid_boot(value) else None
+
+
+def marker_mac(key: bytes, fields: dict) -> str:
+    """(C3-2a, F1) The marker's authenticator: HMAC-SHA256 under the launch secret over a domain tag and the canonical
+    JSON of every field but `mac` (sorted keys, no spaces, ASCII), as 64 lowercase hex digits. The secret itself is
+    never written anywhere."""
+    body = {k: v for k, v in fields.items() if k != "mac"}
+    data = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return hmac.new(key, MARKER_MAC_DOMAIN + data, hashlib.sha256).hexdigest()
 
 
 def decode_status(status: int) -> int | None:
@@ -161,6 +208,23 @@ def waitid_nowait(pid: int) -> int | None:
     return None
 
 
+def child_state(pid: int) -> str | None:
+    """(C3-2a, F2) Whether `pid` is still this process's own UNREAPED child, asked of the kernel without reaping
+    (`waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`): "running", "exited" (a zombie, its pid pinned), or None when it
+    is not (ECHILD: never ours, or already reaped) or the call failed."""
+    lib = _libc()
+    if lib is None:
+        return None
+    info = ctypes.create_string_buffer(128)     # (zeroed: with WNOHANG and nothing to report, si_pid stays 0)
+    ctypes.set_errno(0)
+    if lib.waitid(_P_PID, pid, info, _WEXITED | _WNOHANG | _WNOWAIT) != 0:
+        return None
+    got = int.from_bytes(info.raw[12:16], "little", signed=True)
+    if got == 0:
+        return "running"
+    return "exited" if got == pid else None
+
+
 def _fullsync(fd: int) -> None:
     """fsync, with macOS's F_FULLFSYNC (through the drive's cache) where it is taken."""
     try:
@@ -175,38 +239,58 @@ def _fullsync(fd: int) -> None:
 PUBLISHED, UNSYNCED, NOT_PUBLISHED = "published", "unsynced", "not_published"
 
 
-def write_marker(path: str, record: dict) -> tuple[str, int]:
-    """Publish `record` at `path` atomically: a temp file in the destination directory (exclusive, no symlink), its
-    sync, the rename, the directory's sync. (outcome, errno):
-    - PUBLISHED, 0: visible and synced (as durable as this machine's F_FULLFSYNC makes it);
-    - NOT_PUBLISHED, errno: a failure up to and including the rename (the temp file's write or sync among them): the
-      temp file is removed and NOTHING is visible at `path`;
-    - UNSYNCED, errno: the rename happened, so the complete marker is VISIBLE (and valid proof of absence for a living
-      node), but the directory's sync failed: whether it survives a crash is not known. A marker lost in a crash leaves
-      the checkout held at the next start (C3-3), the conservative direction."""
-    tmp = f"{path}.{os.getpid()}.tmp"
+MARKER_MAX = 4096                   # bytes a marker record may have (the shim's are about 250)
+
+
+def write_marker(path: str, record: dict, fail_dir_sync: bool = False, fail_file_sync: bool = False,
+                 after_create=None) -> tuple[str, int]:
+    """Publish `record` at `path` with NO staging file (C3-2a review round 2, R5): the shim creates `path` ITSELF,
+    exclusively (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600: anything already there, a dangling symlink included, is
+    EEXIST and is never replaced), writes the whole record through that descriptor (a loop that completes a short
+    write), syncs the DESCRIPTOR (F_FULLFSYNC), closes it, then syncs the directory. No temp file, no link, no rename,
+    and nothing is EVER unlinked, on success or on any error: a same-user process can enter any directory the shim can,
+    so no other name could be protected anyway.
+
+    Atomicity for the READER does not come from the filesystem: a reader may see the file before it is complete. It
+    comes from the release pair and the MAC (`shimchild.read_marker`, `ShimChild.empty()`): a marker counts only with
+    the shim's own observed terminal status in a proof-bearing pair AND a MAC that verifies over the complete record.
+    A partial or substituted file fails one or the other, and the launch stays held. (outcome, errno):
+    - PUBLISHED, 0: written and synced, directory synced (as durable as this machine's F_FULLFSYNC makes it);
+    - NOT_PUBLISHED, errno: the create failed (EEXIST: whatever is there is left exactly as it was; nothing of ours
+      exists), or the write or the file's sync failed after the create: the file is LEFT as it is, possibly partial,
+      possibly complete and authentic, and the caller must end in a status that is in no release pair;
+    - UNSYNCED, errno: the file is written and synced, so the complete marker is VISIBLE (and valid proof of absence
+      for a living node), but the directory's sync failed: whether it survives a crash is not known.
+    TEST-ONLY (the test gate dir; the node never asks them): `fail_dir_sync` / `fail_file_sync` make that sync fail
+    with EIO; `after_create` is called right after the create."""
     data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    fd = -1
+    if len(data) > MARKER_MAX:
+        return NOT_PUBLISHED, 27        # (EFBIG; never: the shim's records are about 250 bytes)
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        return NOT_PUBLISHED, e.errno or -1     # (nothing of ours exists; whatever was there is untouched)
+    try:
+        if after_create is not None:
+            after_create()
         view = memoryview(data)
         while view:
-            view = view[os.write(fd, view):]
+            n = os.write(fd, view)
+            if n <= 0:
+                raise OSError(5, "a write wrote nothing")
+            view = view[n:]             # (a short write: the loop writes the rest)
+        if fail_file_sync:
+            raise OSError(5, "injected EIO (test-only)")
         _fullsync(fd)
-        os.close(fd)
-        fd = -1
-        os.rename(tmp, path)
     except OSError as e:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        return NOT_PUBLISHED, e.errno or -1
+        return NOT_PUBLISHED, e.errno or -1     # the file is left as it is, possibly partial: never unlinked
+    finally:
+        _close(fd)
     try:
         dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
+            if fail_dir_sync:
+                raise OSError(5, "injected EIO (test-only)")
             _fullsync(dfd)
         finally:
             os.close(dfd)
@@ -220,6 +304,33 @@ def _close(fd: int) -> None:
         os.close(fd)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------- a crash's description, with no source lookup
+
+CRASH_FRAMES = 32               # the innermost frames a crash's description keeps
+
+
+def crash_frames(exc: BaseException) -> tuple[str, tuple]:
+    """(C3-2a review round 1, R2) What a crash's diagnostic says, taken WITHOUT any source lookup or I/O (no
+    `traceback.format_*`, no `linecache`): the exception's type name and the innermost CRASH_FRAMES (file, line,
+    function) triples, read from the traceback objects' code objects."""
+    frames: list = []
+    tb = getattr(exc, "__traceback__", None)
+    walked = 0
+    while tb is not None and walked < 100_000:
+        code = tb.tb_frame.f_code
+        frames.append((code.co_filename, tb.tb_lineno, code.co_name))
+        if len(frames) > CRASH_FRAMES:
+            del frames[0]
+        tb, walked = tb.tb_next, walked + 1
+    return type(exc).__name__, tuple(frames)
+
+
+def render_crash(what: str, name: str, frames: tuple) -> str:
+    """The crash's diagnostic text. Called only by the diagnostics writer thread (`Diag.put_lazy`), never on the
+    escalation path."""
+    return f"{what}: {name}" + "".join(f"\n    at {f}:{line} in {fn}" for f, line, fn in frames)
 
 
 # ---------------------------------------------------------------- diagnostics, off the escalation path
@@ -251,6 +362,28 @@ class Diag:
             self.lines.append(line)
             self.cond.notify()
 
+    def put_lazy(self, render, *args) -> None:
+        """(C3-2a review round 1, R2) A line whose TEXT is made by the writer thread, `render(*args)`, never by the
+        caller: whatever rendering costs (or stalls on) is the writer's alone. Queued like `put`, stamped now."""
+        item = (f"{self.clock():.6f} shim {os.getpid()} ", render, args)
+        with self.cond:
+            if self.failed or len(self.lines) >= DIAG_CAPACITY:
+                self.dropped += 1
+                return
+            self.lines.append(item)
+            self.cond.notify()
+
+    @staticmethod
+    def _text(item) -> str:
+        if isinstance(item, str):
+            return item
+        prefix, render, args = item
+        try:
+            body = str(render(*args))
+        except Exception:
+            body = "(a line that could not be rendered)"
+        return prefix + body + "\n"
+
     def start(self) -> None:
         if self.thread is not None or self.failed or self.path is None:
             return
@@ -279,7 +412,7 @@ class Diag:
                 batch, self.lines, self.busy = self.lines, [], True
             if fd is None:
                 continue
-            data = "".join(batch).encode("utf-8", "replace")
+            data = "".join(self._text(item) for item in batch).encode("utf-8", "replace")
             try:
                 while data:
                     data = data[os.write(fd, data):]
@@ -298,7 +431,7 @@ class Diag:
             time.sleep(0.005)
 
 
-# ---------------------------------------------------------------- the GO frame
+# ---------------------------------------------------------------- the NONCE and GO frames
 
 class NoGo(Exception):
     """The GO frame was not a valid one: `reason` is eof, partial, overlong, invalid or version."""
@@ -306,6 +439,28 @@ class NoGo(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class NoSecret(Exception):
+    """(C3-2a) No single valid NONCE frame: `reason` is eof, partial, overlong, invalid, version or duplicate."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def parse_nonce(line: bytes) -> bytes:
+    """One NONCE line (without its newline), `NONCE 1 <64 lowercase hex digits>`, -> the launch secret's bytes;
+    NoSecret("version" | "invalid") otherwise."""
+    parts = line.split(b" ")
+    if len(parts) != 3 or parts[0] != b"NONCE" or not parts[1].isdigit():
+        raise NoSecret("invalid")
+    if int(parts[1]) != PROTOCOL:
+        raise NoSecret("version")
+    value = parts[2]
+    if len(value) != 2 * KEY_BYTES or any(c not in b"0123456789abcdef" for c in value):
+        raise NoSecret("invalid")
+    return bytes.fromhex(value.decode("ascii"))
 
 
 def parse_go(line: bytes) -> dict:
@@ -346,9 +501,10 @@ class Shim:
     decides with are attributes (`members`, `killpg`, `kill`, `waitpid`, `waitid`, `clock`) so the decisions can be
     pinned in process; the real process uses the real ones."""
 
-    def __init__(self, *, nonce: str, boot: str, marker: str, cmd_fd: int, event_fd: int | None,
+    def __init__(self, *, key: bytes | None, boot: str, marker: str, cmd_fd: int, event_fd: int | None,
                  sink: Diag | None = None, gate: str | None = None):
-        self.nonce, self.boot, self.marker = nonce, boot, marker
+        # The launch secret (C3-2a): None until the NONCE frame is read. Never in an event, a diagnostic or a file.
+        self.key, self.boot, self.marker = key, boot, marker
         self.cmd_fd, self.event_fd, self.sink = cmd_fd, event_fd, sink
         self.gate_dir, self.gate_seq = gate, 0
         self.members = node_groups.group_members
@@ -384,6 +540,8 @@ class Shim:
         self.dropped = self.dropped_after_eof = self.unknown = 0
         self.kq: select.kqueue | None = None
         self.watching = False           # the child's exit (and exec) are registered with the kqueue
+        self.rel_w: int | None = None   # RELEASE's write end, from the fork until it is written (or not) and closed
+        self.crash: BaseException | None = None     # (the degraded stop's exception, described once, after its TERM)
 
     # -------- diagnostics and events
 
@@ -393,6 +551,16 @@ class Shim:
             return
         try:
             self.sink.put(msg)
+        except Exception:
+            pass
+
+    def diag_crash(self, what: str, exc: BaseException) -> None:
+        """A crash's diagnostic (R2): its frames taken now from the code objects (memory only), its text rendered by the
+        diagnostics thread. Contained: it cannot raise into, wait in or reorder the caller."""
+        if self.sink is None:
+            return
+        try:
+            self.sink.put_lazy(render_crash, what, *crash_frames(exc))
         except Exception:
             pass
 
@@ -454,14 +622,22 @@ class Shim:
     # -------- the marker
 
     def publish(self, outcome: str) -> int | None:
-        """Publish the bound marker. None when it is published and synced; else the exit status to end with:
-        EXIT_MARKER_FAILED (nothing visible) or EXIT_UNSYNCED (visible, valid, its durability unknown)."""
-        record = {"v": PROTOCOL, "nonce": self.nonce, "boot": self.boot, "outcome": outcome,
-                  "cli_pid": self.pgid, "leader_exit": self.leader_code}
-        result, err = write_marker(self.marker, record)
+        """Publish the bound marker: every field authenticated under the launch secret (`marker_mac`), the secret
+        itself never written. None when it is published and synced; else the exit status to end with:
+        EXIT_MARKER_FAILED (no proof: nothing of ours at the path, or a file left as it is after a failed write or sync,
+        which no release pair takes) or EXIT_UNSYNCED (visible, valid, its durability unknown)."""
+        if self.key is None:            # (never: the shim publishes only after a valid NONCE frame)
+            self.emit("MARKER_FAILED 0")
+            return EXIT_MARKER_FAILED
+        record = {"v": MARKER_VERSION, "outcome": outcome, "cli_pid": self.pgid, "leader_exit": self.leader_code,
+                  "boot": self.boot}
+        record["mac"] = marker_mac(self.key, record)
+        result, err = write_marker(self.marker, record, fail_dir_sync=self._gate_file("fail-dir-sync"),
+                                   fail_file_sync=self._gate_file("fail-file-sync"),
+                                   after_create=self._marker_pause if self._gate_file("pause-after-create") else None)
         if result == NOT_PUBLISHED:
             self.emit(f"MARKER_FAILED {err}")
-            self.diag(f"the marker could not be published (errno {err}): no proof")
+            self.diag(f"the marker could not be published (errno {err}): no proof (any file there is left as it is)")
             return EXIT_MARKER_FAILED
         if result == UNSYNCED:
             self.emit(f"UNSYNCED {err}")
@@ -469,6 +645,18 @@ class Shim:
             return EXIT_UNSYNCED
         self.diag(f"marker published: {outcome}")
         return None
+
+    def _marker_pause(self) -> None:
+        """TEST-ONLY (`pause-after-create` in the test gate dir): right after the marker path is created, announce
+        `marker-created.at` (created exclusively, never renamed) and wait, bounded, for `marker-created.go`."""
+        try:
+            _close(os.open(os.path.join(self.gate_dir, "marker-created.at"),
+                           os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600))
+            deadline = self.clock() + GATE_WAIT
+            while not os.path.exists(os.path.join(self.gate_dir, "marker-created.go")) and self.clock() < deadline:
+                time.sleep(0.005)
+        except Exception:
+            pass
 
     def never_started(self, reason: str) -> int:
         """Every outcome in which the CLI was never forked: the bound marker (the group provably never existed)."""
@@ -479,33 +667,55 @@ class Shim:
         self.emit("EMPTY")
         return EXIT_NOGO if failed is None else failed
 
-    # -------- GO
+    def no_secret(self, reason: str) -> int:
+        """(C3-2a) No single valid NONCE frame: nothing was forked, and no marker is published, since none could be
+        authenticated. The node tells "never started" from this exit status (its own unreaped child's), not from a
+        file."""
+        self.emit(f"NOSECRET {reason}")
+        self.diag(f"no valid secret ({reason}): nothing started, no marker")
+        return EXIT_NOSECRET
 
-    def read_go(self) -> dict:
-        """Block (kqueue on the command fd) until one complete GO line; NoGo otherwise. Bytes after it stay buffered as
-        commands."""
+    # -------- NONCE, then GO
+
+    def _read_frame(self, limit: int, fail) -> bytes:
+        """Block (kqueue on the command fd) until one complete line of at most `limit` bytes, newline included, and
+        return it without its newline; `fail(reason)` is raised otherwise (eof, partial, overlong). Bytes after it stay
+        buffered."""
         kq = select.kqueue()
         try:
             kq.control([select.kevent(self.cmd_fd, select.KQ_FILTER_READ, select.KQ_EV_ADD)], 0)
             while True:
                 nl = self.buf.find(b"\n")
                 if nl >= 0:
-                    if nl + 1 > MAX_GO:
-                        raise NoGo("overlong")
+                    if nl + 1 > limit:
+                        raise fail("overlong")
                     line, self.buf = self.buf[:nl], self.buf[nl + 1:]
-                    return parse_go(line)
-                if len(self.buf) >= MAX_GO:
-                    raise NoGo("overlong")
+                    return line
+                if len(self.buf) >= limit:
+                    raise fail("overlong")
                 chunk = self._read_cmd()
                 if chunk is None:
                     kq.control(None, 1, None)
                     continue
                 if not chunk:
                     self.eof = True
-                    raise NoGo("partial" if self.buf else "eof")
+                    raise fail("partial" if self.buf else "eof")
                 self.buf += chunk
         finally:
             kq.close()
+
+    def read_secret(self) -> None:
+        """(C3-2a, F1) The launch secret: the first frame on the command pipe, one bounded `NONCE` line; NoSecret
+        otherwise. It never travels on the argv, in the environment or in a file."""
+        self.key = parse_nonce(self._read_frame(MAX_NONCE, NoSecret))
+
+    def read_go(self) -> dict:
+        """The GO frame, after the secret: one complete GO line; NoGo otherwise, and NoSecret("duplicate") for a
+        second NONCE frame. Bytes after it stay buffered as commands."""
+        line = self._read_frame(MAX_GO, NoGo)
+        if line.split(b" ", 1)[0] == b"NONCE":
+            raise NoSecret("duplicate")
+        return parse_go(line)
 
     def _read_cmd(self) -> bytes | None:
         """One non-blocking read of the command pipe: bytes, b"" at EOF, None when nothing is there now."""
@@ -554,9 +764,12 @@ class Shim:
             self.diag(f"fork failed (errno {e.errno})")
             return self.never_started("fork")
         if pid == 0:
-            _child(spec, stdio, hs_w, rel_r, ignored, self.gate_dir, (hs_r, rel_w))      # never returns
-        # ---- from here the shim holds an unreaped child: nothing below may end it (R5)
-        self.pgid, self.hs_fd = pid, hs_r
+            try:                        # (F5: the child's every statement inside its boundary, out by os._exit only)
+                _child(spec, stdio, hs_w, rel_r, ignored, self.gate_dir, (hs_r, rel_w))      # never returns
+            finally:
+                os._exit(127)
+        # ---- from here the shim holds an unreaped child: nothing below may end it (R5); a crash is stopped (F2)
+        self.pgid, self.hs_fd, self.rel_w = pid, hs_r, rel_w
         for fd in (hs_w, rel_r, *stdio):
             _close(fd)                # the CLI's stdio is the CLI's alone now
         if self.sink is not None:
@@ -583,6 +796,7 @@ class Shim:
                 self.released = True    # (from here an exec may happen: only NOTE_EXEC or a failure report settles it)
             except OSError:
                 pass
+        self.rel_w = None
         _close(rel_w)                   # (not written: EOF, and the child never enters the checkout)
         self.diag(f"forked the child, pid {pid}")
         self.hs_deferred = self._gate_file("defer-handshake")
@@ -627,6 +841,8 @@ class Shim:
         assert self.kq is not None and self.pgid is not None
         self._take_commands()           # (anything sent behind GO)
         while True:
+            if self.gate_dir is not None:
+                self._test_crash()
             if self.hs_deferred and self._gate_file("defer-handshake.go"):
                 self.hs_deferred = False
                 self._watch_handshake()
@@ -668,6 +884,102 @@ class Shim:
                 self._pump_handshake()
             if (self.degraded or not self.watching) and not self.leader_exited and self._exited() is not None:
                 self._leader_exit(None)
+
+    def _test_crash(self) -> None:
+        """TEST-ONLY (`--test-gate DIR`; the node never passes it): an unexpected exception in the loop, after the
+        fork. `crash-in-loop`: raise. `crash-reap`: first reap the child if it has exited (so its anchor is gone), then
+        raise."""
+        if self._gate_file("crash-reap"):
+            try:
+                os.waitpid(self.pgid, os.WNOHANG)
+            except OSError:
+                pass
+            raise RuntimeError("injected (test-only): a crash after the child was reaped")
+        if self._gate_file("crash-in-loop"):
+            raise RuntimeError("injected (test-only): an unexpected exception in the loop")
+
+    # -------- (C3-2a, F2) after an unexpected exception past the fork: the degraded stop
+
+    def stop_after_crash(self, exc: BaseException | None = None) -> int:
+        """An unexpected exception after the fork (a bug) must not leave the group running unsupervised. A minimal
+        loop, with as little of the normal machinery as it can: no kqueue, no commands. By the existing anchor and
+        target rules (`_signal`): a TERM now (the grace still counted from the FIRST TERM attempt, kept if one was
+        made), a KILL at that attempt + the grace (`_kill_now`, the one KILL sender), repeated every grace; the child's
+        exit polled by `waitid`; then the SAME verified release (`_check_empty`: listing, latch, reap, second listing,
+        authenticated marker). Before every signal and before the proof, the kernel must confirm the anchor (our own
+        unreaped child, `child_state`); if it cannot, nothing more is signalled and nothing is published: exit 5, no
+        marker (the node keeps the checkout held). A crash inside this loop ends it the same way.
+
+        (Review round 1, R2) It is the FIRST thing that runs after the exception: the crash is described only after
+        the first TERM (or the refusal), from its code objects alone, and rendered by the diagnostics thread."""
+        self.crash = exc
+        try:
+            return self._stop_after_crash()
+        except BaseException:
+            self.latched = True
+            self.diag("the degraded stop itself failed: no more signals, no marker")
+            return EXIT_CRASH
+
+    def _describe_crash(self) -> None:
+        if self.crash is not None:
+            exc, self.crash = self.crash, None
+            self.diag_crash("crashed after the fork; the degraded stop took over", exc)
+
+    def _anchor_confirmed(self) -> bool:
+        return self.anchored() and child_state(self.pgid) is not None
+
+    def _unanchored(self) -> int:
+        self.latched = True             # (no signal from here, for good)
+        self.emit("UNPROVED")
+        self.diag("after the crash the anchor cannot be established: no signal, no marker")
+        self._describe_crash()
+        return EXIT_CRASH
+
+    def _take_establishment(self) -> None:
+        """The child's `S`, read without the loop (non-blocking, contained): its group is the target from then on."""
+        if self.established or self.hs_fd is None:
+            return
+        try:
+            chunk = os.read(self.hs_fd, 256)
+        except Exception:
+            return
+        self.hs_said += chunk
+        if self.hs_said.startswith(b"S"):
+            self._established()
+
+    def _stop_after_crash(self) -> int:
+        self.emit("CRASHED")
+        self.eof = True                 # (as after the node's EOF: a KILL every grace while the anchor holds)
+        self.check_due = None
+        if self.rel_w is not None:      # (crashed before RELEASE was written: the child never enters the checkout)
+            _close(self.rel_w)
+            self.rel_w = None
+        if not self._anchor_confirmed():
+            return self._unanchored()
+        self._take_establishment()
+        self._signal(signal.SIGTERM)    # (sets the first TERM attempt only if none was made: the grace is not reset)
+        if self.first_term_at is None:
+            return self._unanchored()
+        self.kill_due = self.first_term_at + self.grace     # the ORIGINAL first TERM attempt's grace
+        self._describe_crash()          # (after the first TERM: queued, rendered by the diagnostics thread)
+        while True:
+            if self.kill_due is not None and self.clock() >= self.kill_due:
+                if not self._anchor_confirmed():
+                    return self._unanchored()
+                self._kill_now()
+            if not self.leader_exited:
+                code = self._exited()
+                if code is not None:
+                    self.leader_exited, self.leader_code = True, code
+                    self.emit(f"LEADER_EXIT {code}")
+            if self.leader_exited:
+                if not self._anchor_confirmed():
+                    return self._unanchored()
+                done = self._check_empty()
+                if done is not None:
+                    return done
+            self._take_establishment()
+            time.sleep(0.02)
 
     def _pump_commands(self) -> None:
         for _ in range(16):             # bounded per wake: timers are looked at between
@@ -909,11 +1221,21 @@ class Shim:
         self.diag(f"reaped the CLI, pid {self.pgid}")
 
 
+_GATE_MEMBER = ("import os, signal, sys, time\n"
+                "path, gate, wait = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
+                "signal.signal(signal.SIGTERM, lambda *_: open(path, 'w').close())\n"
+                "open(path + '.ready', 'w').close()\n"
+                "end = time.monotonic() + wait\n"
+                "while time.monotonic() < end and not os.path.exists(os.path.join(gate, 'abort')):\n"
+                "    time.sleep(0.01)\n")
+
+
 def _child_gate(gate_dir: str | None, name: str, member_spec: list) -> None:
     """TEST-ONLY, in the child (`--test-gate DIR` and a `pause.<name>` file there; the node never passes either): pause
     at `name`, announcing `<name>.at` (its pid, and a member's), until `<name>.go` (bounded). The pause file may ask to
-    ignore SIGTERM, to fork a member (which notes a TERM in `member_term_file`), to exit there (`exit`), or only to
-    announce (`wait: false`)."""
+    ignore SIGTERM, to start a member in the child's group (which notes a TERM in `member_term_file`; started with
+    `close_fds=True`, so the shim's one fork stays the package's only one, C3-2a F6), to exit there (`exit`), or only
+    to announce (`wait: false`)."""
     if gate_dir is None:
         return
     pause = os.path.join(gate_dir, f"pause.{name}")
@@ -925,17 +1247,10 @@ def _child_gate(gate_dir: str | None, name: str, member_spec: list) -> None:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     member = None
     if opts.get("member_term_file"):
-        member = os.fork()
-        if member == 0:
-            try:
-                path = opts["member_term_file"]
-                signal.signal(signal.SIGTERM, lambda *_: open(path, "w").close())
-                open(path + ".ready", "w").close()
-                end = time.monotonic() + GATE_WAIT
-                while time.monotonic() < end and not os.path.exists(os.path.join(gate_dir, "abort")):
-                    time.sleep(0.01)
-            finally:
-                os._exit(0)
+        import subprocess
+        member = subprocess.Popen([sys.executable, "-I", "-c", _GATE_MEMBER, opts["member_term_file"], gate_dir,
+                                   str(GATE_WAIT)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, close_fds=True).pid
         member_spec.append(member)
     at = os.path.join(gate_dir, f"{name}.at")
     with open(at + ".tmp", "w") as f:
@@ -955,11 +1270,13 @@ def _child(spec: dict, stdio: tuple[int, int, int], hs_w: int, rel_r: int, ignor
     """In the forked child: become the CLI, or say why not on the handshake pipe and `_exit(127)`. `shims_ends`: the
     shim's ends of the two pipes (the handshake's read end and RELEASE's write end), closed first: while the child
     held its copy of RELEASE's write end, a shim gone before writing it would never give it EOF (found in review
-    round 2)."""
-    stage = "setsid"
-    for fd in shims_ends:
-        _close(fd)
+    round 2). (C3-2a, F5) Every statement, from the first, is inside the one `try`; every way out is `os._exit` in its
+    `finally`, never a Python exit handler (tests pin it by AST)."""
     try:
+        stage = "close"
+        for fd in shims_ends:
+            _close(fd)
+        stage = "setsid"
         _child_gate(gate_dir, "before-setsid", [])
         os.setsid()
         os.write(hs_w, b"S")
@@ -1008,7 +1325,8 @@ def _child(spec: dict, stdio: tuple[int, int, int], hs_w: int, rel_r: int, ignor
 
 # ---------------------------------------------------------------- the process
 
-USAGE_KEYS = {"--version", "--nonce", "--boot", "--marker", "--cmd-fd", "--event-fd", "--log", "--test-gate"}
+# (C3-2a) No secret among them: the launch secret arrives only in the NONCE frame on the command pipe.
+USAGE_KEYS = {"--version", "--boot", "--marker", "--cmd-fd", "--event-fd", "--log", "--test-gate"}
 
 
 def parse_args(argv: list[str]) -> dict | None:
@@ -1022,18 +1340,15 @@ def parse_args(argv: list[str]) -> dict | None:
         version, cmd_fd, event_fd = int(args["--version"]), int(args["--cmd-fd"]), int(args["--event-fd"])
     except ValueError:
         return None
-    nonce, marker, log = args["--nonce"], args["--marker"], args["--log"]
-    if version != PROTOCOL or cmd_fd < 3 or event_fd < 3 or cmd_fd == event_fd:
-        return None
-    if not (8 <= len(nonce) <= 128 and all(c.isascii() and (c.isalnum() or c in "-_") for c in nonce)):
+    boot, marker, log = args["--boot"], args["--marker"], args["--log"]
+    if version != PROTOCOL or cmd_fd < 3 or event_fd < 3 or cmd_fd == event_fd or not valid_boot(boot):
         return None
     if not (os.path.isabs(marker) and os.path.isdir(os.path.dirname(marker)) and os.path.isabs(log)):
         return None
     gate = args.get("--test-gate")
     if gate is not None and not os.path.isdir(gate):
         return None
-    return {"nonce": nonce, "boot": args["--boot"], "marker": marker, "cmd_fd": cmd_fd, "event_fd": event_fd,
-            "log": log, "gate": gate}
+    return {"boot": boot, "marker": marker, "cmd_fd": cmd_fd, "event_fd": event_fd, "log": log, "gate": gate}
 
 
 def main(argv: list[str]) -> int:
@@ -1057,7 +1372,7 @@ def _main(args: dict, sink: Diag) -> int:
     for fd in (0, 1, 2):
         os.dup2(devnull, fd)
     os.close(devnull)
-    shim = Shim(nonce=args["nonce"], boot=args["boot"], marker=args["marker"], cmd_fd=args["cmd_fd"],
+    shim = Shim(key=None, boot=args["boot"], marker=args["marker"], cmd_fd=args["cmd_fd"],
                 event_fd=args["event_fd"], sink=sink, gate=args["gate"])
     try:
         for fd in (shim.cmd_fd, shim.event_fd):
@@ -1069,8 +1384,10 @@ def _main(args: dict, sink: Diag) -> int:
         return EXIT_USAGE
     if os.getsid(0) != os.getpid():
         os.setsid()
-    if args["boot"] != boot_id() or _libc() is None:
-        shim.diag("the boot identity given is not this boot's (or waitid is missing): exit, nothing published")
+    own = None if shim._gate_file("fail-boot") else boot_id()      # (fail-boot: TEST-ONLY, an unreadable identity)
+    if own is None or args["boot"] != own or _libc() is None:
+        shim.diag("the boot identity given is not this boot's, or this boot's cannot be read (or waitid is missing): "
+                  "exit, nothing started, nothing published")
         return EXIT_USAGE
     # The dispositions a direct Popen child would get: what was ignored when the node started the shim (Popen's
     # restore_signals resets SIGPIPE and SIGXFSZ, which Python then ignores again in the shim). The shim itself keeps
@@ -1082,23 +1399,32 @@ def _main(args: dict, sink: Diag) -> int:
                         and signal.getsignal(s) == signal.SIG_IGN)
     if signal.SIGCHLD in ignored:
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-    shim.diag(f"ready (protocol {PROTOCOL}, nonce {shim.nonce}, boot {shim.boot})")
+    shim.diag(f"ready (protocol {PROTOCOL}, boot {shim.boot})")     # (C3-2a: no secret in any diagnostic)
     try:
         try:
+            shim.read_secret()
+            shim.diag("the launch secret is received")
+            if shim._gate_file("crash-before-go"):      # (TEST-ONLY: a crash before the fork)
+                raise RuntimeError("injected (test-only): a crash before the fork")
             spec = shim.read_go()
-        except NoGo as e:
+        except (NoSecret, NoGo) as e:
             for fd in stdio:
                 os.close(fd)
+            if isinstance(e, NoSecret):
+                return shim.no_secret(e.reason)
             return shim.never_started(e.reason)
         shim.diag(f"GO: argv[0] {spec['argv'][0]!r}, cwd {spec['cwd']!r}, grace {spec['kill_grace']}")
         done = shim.spawn(spec, stdio, ignored)
         if done is not None:
             return done
         code = shim.run()
-    except Exception:
-        import traceback
-        shim.diag("crashed, no marker:\n" + traceback.format_exc())
-        return EXIT_CRASH
+    except BaseException as e:
+        if shim.pgid is None:
+            shim.diag_crash("crashed before the fork, no marker", e)
+            return EXIT_CRASH
+        # (C3-2a, F2; review round 1, R2) After the fork a crash must still stop the group, and NOTHING runs before the
+        # degraded stop: no traceback formatting, no source lookup. It describes the crash itself, after its TERM.
+        code = shim.stop_after_crash(e)
     if shim.dropped:
         shim.diag(f"events dropped: {shim.dropped} (after EOF: {shim.dropped_after_eof})")
     if sink.dropped:

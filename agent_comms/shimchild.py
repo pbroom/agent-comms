@@ -1,19 +1,26 @@
-"""(Ownership C3-1) The node's handle on one group supervisor (agent_comms/groupshim.py): what a spawn site will hold in
-place of the CLI's `Popen` once C3-2 wires it in. NOT used by any spawn site yet.
+"""(Ownership C3-1, C3-2a) The node's handle on one group supervisor (agent_comms/groupshim.py): what a spawn site will
+hold in place of the CLI's `Popen` once the wiring PRs wire it in. NOT used by any spawn site yet.
 
 - `ShimChild.start(...)` spawns the shim (cwd "/" by default, outside every checkout; only its two control fds passed
-  besides the CLI's future stdio) and returns BEFORE `GO`; `go(...)` writes `GO`. C3-2 fsyncs the durable record
-  between the two. Until `go`, a `terminate()`/`kill()`/`close()` closes the command pipe, which the shim takes as "never
-  start": it publishes its bound marker and exits.
+  besides the CLI's future stdio), sends it this launch's secret in one `NONCE` frame on the command pipe (never on its
+  argv or in its environment), and returns BEFORE `GO`; `go(...)` writes `GO`. The wiring fsyncs the durable record
+  between the two. Until `go`, a `terminate()`/`kill()`/`close()` closes the command pipe, which the shim takes as
+  "never start": it publishes its bound marker and exits. The marker's path is drawn afresh for each launch in the
+  node's private marker directory (`make_marker_dir`); an existing path is refused, never overwritten.
 - It has no thread. Events are pumped, non-blocking, in `poll()`, `empty()` and `lost()`; before a shim exit is
   classified, the event pipe is drained to EOF.
-- Three facts, never conflated: the CLI's exit (`poll()`: the `LEADER_EXIT` code, or the exit code a valid marker
-  carries, or None), the shim's exit (`shim_poll()`: the node's own child, `Popen.poll()`), and the group's absence
-  (`empty()`: a valid, complete, VISIBLE marker for this launch's nonce and this boot, never the `EMPTY` event alone).
-  `empty()` is proof of absence for the living node that reads it. Durability across a crash is the shim's best effort
-  (a directory sync that failed is said by `UNSYNCED`): a marker lost in a crash leaves the checkout held at the next
-  start, the conservative direction. A LOST shim (`lost()`) leaves `poll()` at None forever: callers must ask `lost()`
-  on their own, before they read None as "still running" (C3-2: every reap and shutdown path).
+- Three facts, never conflated: the CLI's exit (`poll()`: the `LEADER_EXIT` code, or the exit code the release pair's
+  marker carries, or None), the shim's exit (`shim_poll()`: the node's own child, reaped in ONE place, the handle's
+  own `waitpid` (`_observe`); STATUS_UNKNOWN if anyone else reaped it; its `Popen` is neutralised and never reaps or
+  signals it, review round 1 R3), and the group's
+  absence (`empty()`: the RELEASE PAIR, C3-2a: the shim's own terminal exit status, observed by this handle, AND an
+  authentic marker (HMAC under the launch secret) whose outcome belongs with that status; never a marker alone, never
+  the `EMPTY` event). `empty()` is proof of absence for the living node that reads it; proof after a node restart is
+  not decided (DESIGN_NOTES C3-2a). Durability across a crash is the shim's best effort (a directory sync that failed
+  is said by `UNSYNCED`): a marker lost in a crash leaves the checkout held at the next start, the conservative
+  direction. A LOST shim (`lost()`) leaves `poll()` at None forever: callers must ask `lost()` on their own, before
+  they read None as "still running" (every reap and shutdown path). `refused()`: the shim exited before any fork
+  (an OBSERVED exit 2 or 7), so nothing was ever started. An UNKNOWN status is never proof and never a refusal: LOST.
 - `terminate()`/`kill()` write `TERM`/`KILL`: one non-blocking write each, under the handle's own lock, which also
   guards closing the pipe, so a concurrent retirement cannot close the fd and have its number reused for another
   shim's pipe mid-write. A closed or broken pipe raises `BrokenPipeError`; a full one `BlockingIOError` (both
@@ -22,14 +29,16 @@ place of the CLI's `Popen` once C3-2 wires it in. NOT used by any spawn site yet
   code, over the shim's stdin and stdout pipes, which the CLI inherits as its stdio (a hosted session's shape,
   `spawn_piped`). `piped=False` gives a dispatched run's shape instead (`spawn_process`: stdin /dev/null, stdout and
   stderr to one new log), with no I/O methods.
-- `pid` is the SHIM's pid (the node's own unreaped child, so pinned until `shim_poll()` reaps it); `cli_pid` is the
-  CLI's, for diagnostics only: nothing signals or probes it by number.
+- `pid` is the SHIM's pid (the node's own unreaped child, so pinned until this handle reaps it: `shim_poll()`, and
+  `empty()`, `poll()`, `lost()`, `refused()`, which all observe its status); `cli_pid` is the CLI's, for diagnostics
+  only: nothing signals or probes it by number.
 
 It never logs: it reports by return value and exception.
 """
 from __future__ import annotations
 
 import errno
+import hmac
 import json
 import os
 import secrets
@@ -44,7 +53,7 @@ from . import groupshim
 from .dispatch import PipedChild
 
 boot_id = groupshim.boot_id
-MARKER_MAX = 4096                   # bytes a marker may have (the shim's are about 200): larger is no proof
+MARKER_MAX = groupshim.MARKER_MAX   # bytes a marker may have (4096; the shim's are about 250): larger is no proof
 # The shim runs THIS process's own agent_comms (the directory that holds the package imported here), never whatever
 # `-m agent_comms.groupshim` would find on the interpreter's path: `-I` (isolated: no PYTHON* variables, no user site,
 # no current directory on the path), then the package's own root first. Equivalent to `python -m agent_comms.groupshim`.
@@ -62,23 +71,69 @@ def wait_writable(fd: int, timeout: float) -> None:
     p.poll(max(0, int(timeout * 1000)))
 
 
-_MARKER_KEYS = frozenset({"v", "nonce", "boot", "outcome", "cli_pid", "leader_exit"})
+_MARKER_KEYS = frozenset({"v", "outcome", "cli_pid", "leader_exit", "boot", "mac"})
+_HEX = frozenset("0123456789abcdef")
+# (C3-2a, F1.4) The release pairs: the shim's own terminal exit status, and the outcome of the authenticated marker
+# that belongs with it. Every other pair proves nothing.
+PROOF_PAIRS = frozenset({(groupshim.EXIT_EMPTY, "empty"), (groupshim.EXIT_NOGO, "never_started"),
+                         (groupshim.EXIT_UNSYNCED, "empty"), (groupshim.EXIT_UNSYNCED, "never_started")})
+# The statuses the shim returns only before any fork, with no marker: nothing was ever started.
+REFUSED_EXITS = frozenset({groupshim.EXIT_USAGE, groupshim.EXIT_NOSECRET})
 
 
-def read_marker(path: str, nonce: str, boot: str) -> dict | None:
-    """THE one marker reader (`empty()`, `lost()` and `poll()` all use it): the marker at `path` when it proves the
-    group of launch `nonce`, on boot `boot`, absent (or never made); else None, never an exception.
+def check_marker_dir(path: str) -> None:
+    """(C3-2a, F3) Raise unless `path` is a trusted marker directory: a real directory (not a symlink), owned by this
+    process's effective user, with no group or other permission bit. Nothing is changed."""
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise PermissionError(errno.EPERM, "the marker directory is a symlink", path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "the marker directory is not a directory", path)
+    if st.st_uid != os.geteuid():
+        raise PermissionError(errno.EPERM, "the marker directory is owned by another user", path)
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        raise PermissionError(errno.EPERM, "the marker directory is open to its group or to others", path)
+
+
+def make_marker_dir(path: str) -> str:
+    """(C3-2a, F3) The node's marker directory: created mode 0700 if absent (its parent must exist), and in either case
+    checked (`check_marker_dir`); an unsafe one is refused, never repaired. Its absolute path."""
+    path = os.path.abspath(path)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    check_marker_dir(path)
+    return path
+
+
+def _new_marker_name() -> str:
+    """A fresh marker name for one launch, drawn apart from the launch secret (so neither tells anything of the other)
+    and never reused."""
+    return f"{secrets.token_hex(16)}.marker"
+
+
+def read_marker(path: str, key: bytes, boot: str) -> dict | None:
+    """THE one marker reader: the marker at `path` when it is an AUTHENTIC record of the launch whose secret is `key`,
+    on boot `boot`; else None, never an exception. It is half of the proof only: `ShimChild.empty()` also needs the
+    shim's own terminal exit status (`PROOF_PAIRS`).
+
+    (Review round 2, R5) The shim writes its marker in place, with no staging file, so this reader may see a file
+    that is incomplete, or one a same-user process substituted. Atomicity comes from the release pair and the MAC, not
+    from the filesystem: an incomplete record fails the parse or the MAC; a substituted one fails the MAC; a complete,
+    authentic one whose write the shim did not finish to a proof-bearing exit fails the pair.
 
     It must be a REGULAR file: `lstat` first (no symlink, FIFO, socket, device or directory is opened), then an open with
     O_NONBLOCK | O_NOFOLLOW, and `fstat` of what was opened must be the same regular file (a special file swapped in
     between is opened without waiting, and refused unread). At most MARKER_MAX bytes, one line ending in a newline, a
-    JSON object with exactly the shim's keys and exact types: `v` an int (never a bool) equal to the protocol; the nonce
-    and the boot exactly these; the outcome `empty` (with an int `cli_pid` and an int or null `leader_exit`) or
-    `never_started` (both null). The scope of "never waits": the reader never opens or reads a special file and never
-    waits on one; O_NONBLOCK does not bound ordinary filesystem I/O on a regular file (a stalled filesystem can still
-    stall the read)."""
+    JSON object with exactly the shim's keys and exact types: `v` an int (never a bool) equal to MARKER_VERSION; the boot
+    exactly this one; the outcome `empty` (with an int `cli_pid` and an int or null `leader_exit`) or `never_started`
+    (both null); `mac` 64 lowercase hex digits equal (compared in constant time) to `marker_mac(key, the other
+    fields)`, which the reader recomputes. The scope of "never waits": the reader never opens or reads a special file
+    and never waits on one; O_NONBLOCK does not bound ordinary filesystem I/O on a regular file (a stalled filesystem
+    can still stall the read)."""
     try:
-        if type(nonce) is not str or not nonce or type(boot) is not str or not boot:
+        if type(key) is not bytes or len(key) != groupshim.KEY_BYTES or type(boot) is not str or not boot:
             return None
         st = os.lstat(path)
         if not stat.S_ISREG(st.st_mode) or st.st_size > MARKER_MAX:
@@ -96,9 +151,9 @@ def read_marker(path: str, nonce: str, boot: str) -> dict | None:
         rec = json.loads(data.decode("utf-8"))
         if type(rec) is not dict or set(rec) != _MARKER_KEYS:
             return None
-        if type(rec["v"]) is not int or rec["v"] != groupshim.PROTOCOL:
+        if type(rec["v"]) is not int or rec["v"] != groupshim.MARKER_VERSION:
             return None
-        if type(rec["nonce"]) is not str or rec["nonce"] != nonce or type(rec["boot"]) is not str or rec["boot"] != boot:
+        if type(rec["boot"]) is not str or rec["boot"] != boot:
             return None
         pid, code = rec["cli_pid"], rec["leader_exit"]
         if rec["outcome"] == "empty":
@@ -109,21 +164,49 @@ def read_marker(path: str, nonce: str, boot: str) -> dict | None:
                 return None
         else:
             return None
+        mac = rec["mac"]
+        if type(mac) is not str or len(mac) != 64 or not set(mac) <= _HEX:
+            return None
+        if not hmac.compare_digest(groupshim.marker_mac(key, rec), mac):
+            return None
         return rec
     except Exception:
         return None
 
 
-def marker_proves(path: str, nonce: str, boot: str) -> bool:
-    """Whether `read_marker` accepts the marker at `path` for this launch and boot."""
-    return read_marker(path, nonce, boot) is not None
+def marker_proves(path: str, key: bytes, boot: str) -> bool:
+    """Whether `read_marker` accepts the marker at `path` as authentic for this launch and boot. NOT release
+    authority on its own: that is `ShimChild.empty()` (the shim's status too)."""
+    return read_marker(path, key, boot) is not None
+
+
+# (C3-2a review round 1, R3) The shim's wait status is the HANDLE's: `ShimChild._observe` is the one place it is reaped.
+STATUS_UNKNOWN = "unknown"          # the shim was reaped by someone else (or the kernel): no status was observed
+
+
+class _HandleOwnsStatus:
+    """Put in the shim's `Popen.returncode` at once: `Popen.poll()`, `wait()`, `send_signal()` and `__del__` (and
+    subprocess's `_cleanup` of collected Popens) all act only while `returncode` is None, so none of them ever calls
+    `waitpid` on the shim, or signals it. Only `ShimChild._observe` reaps it."""
+
+    def __repr__(self) -> str:
+        return "<the shim's status is owned by its ShimChild>"
+
+
+_OWNED = _HandleOwnsStatus()
 
 
 class ShimChild:
-    def __init__(self, proc: subprocess.Popen, cmd_w: int, evt_r: int, *, nonce: str, boot: str, marker: str):
-        self.proc = proc
+    def __init__(self, proc: subprocess.Popen, cmd_w: int, evt_r: int, *, key: bytes, boot: str, marker: str):
+        proc.returncode = _OWNED        # (R3: before anything else can poll it; see `_HandleOwnsStatus`)
+        self._popen = proc              # (for its stdio pipes only; never polled, waited on or signalled)
         self.pid = proc.pid             # the shim's (see the module text)
-        self.nonce, self.boot, self.marker = nonce, boot, marker
+        self._wait_lock = threading.Lock()
+        self._status: int | str | None = None   # None while running; then the observed status, or STATUS_UNKNOWN
+        # The launch secret (C3-2a): sent once, in the NONCE frame; never in an argv, an environment, an event or a log.
+        self._key = key
+        self.boot, self.marker = boot, marker
+        self._proof: dict | None = None     # the release pair, once both halves held (it cannot change after)
         # (piped: its stdin/stdout pipes, non-blocking: today's I/O contract; else no I/O, as spawn_process's child)
         self._io = PipedChild(proc) if proc.stdin is not None else None
         self._wlock = threading.Lock()  # pins the command endpoint through each write, and its close
@@ -132,7 +215,6 @@ class ShimChild:
         self._evt: int | None = evt_r
         self._evt_buf = b""
         self._went = False
-        self._proved = False
         self.events: list[tuple[str, ...]] = []     # every event seen, in order (diagnostics and tests)
         self.cli_pid: int | None = None
         self.start_errno: int | None = None     # START_FAILED: positive evidence the CLI never exec'd
@@ -141,22 +223,58 @@ class ShimChild:
         self.start_unknown = False
         self.leader_code: int | None = None
         self.nogo: str | None = None
+        self.nosecret: str | None = None    # NOSECRET <reason>: the shim got no single valid NONCE frame
 
     # -------- start and GO
 
     @classmethod
-    def start(cls, *, marker: str, log: str, stderr_log: str, nonce: str | None = None, boot: str | None = None,
-              cwd: str = "/", python: str | None = None, test_gate: str | None = None,
-              piped: bool = True) -> "ShimChild":
-        """Spawn the shim; return before GO. `marker`: where it publishes its proof (its directory must exist);
-        `log`: its own diagnostics. The CLI's stdio, exactly today's: `piped` (a hosted session, as `spawn_piped`):
-        stdin and stdout are pipes to the node and stderr is appended to `stderr_log`, mode 600; not `piped` (a
-        dispatched run, as `spawn_process`): stdin is /dev/null and stdout and stderr go to `stderr_log`, a NEW file
-        (O_EXCL), mode 600."""
-        nonce = nonce if nonce is not None else secrets.token_hex(16)
-        boot = boot if boot is not None else boot_id()
+    def start(cls, *, marker_dir: str, log: str, stderr_log: str, cwd: str = "/", python: str | None = None,
+              test_gate: str | None = None, piped: bool = True) -> "ShimChild":
+        """Spawn the shim and send it this launch's secret; return before GO. `marker_dir`: the node's private marker
+        directory (`make_marker_dir`; checked again here); the marker's path in it is drawn afresh for this launch
+        (`self.marker`), and an existing path, in any form, is refused before anything is spawned, never overwritten or
+        removed. `log`: the shim's own diagnostics. The boot identity is read here (`boot_id`); if it cannot be read or
+        validated, nothing is started (OSError). The CLI's stdio, exactly today's: `piped` (a hosted session, as
+        `spawn_piped`): stdin and stdout are pipes to the node and stderr is appended to `stderr_log`, mode 600; not
+        `piped` (a dispatched run, as `spawn_process`): stdin is /dev/null and stdout and stderr go to `stderr_log`, a
+        NEW file (O_EXCL), mode 600.
+
+        The secret (fresh random bytes, `secrets.token_bytes`) goes only into ONE `NONCE` frame on the command pipe,
+        written here, before GO: it is never on the shim's argv, in its environment, or in any file. If that write
+        fails, the command pipe is closed: the shim sees no valid frame, starts nothing and exits 7 (`refused()`)."""
+        boot = boot_id()
         if boot is None:
-            raise OSError(errno.ENOTSUP, "this boot's identity cannot be read")
+            raise OSError(errno.ENOTSUP, "this boot's identity (kern.bootsessionuuid) cannot be read or validated: "
+                                         "nothing is started")
+        check_marker_dir(marker_dir)
+        marker = os.path.join(os.path.abspath(marker_dir), _new_marker_name())
+        try:
+            os.lstat(marker)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(errno.EEXIST, "the marker path exists: refused, and left as it is", marker)
+        child = cls._launch(marker=marker, key=secrets.token_bytes(groupshim.KEY_BYTES), boot=boot, log=log,
+                            stderr_log=stderr_log, cwd=cwd, python=python, test_gate=test_gate, piped=piped)
+        child._send_secret()
+        return child
+
+    def _send_secret(self) -> None:
+        frame = b"NONCE %d %s\n" % (groupshim.PROTOCOL, self._key.hex().encode("ascii"))
+        with self._wlock:
+            if self._cmd is None:
+                return
+            try:
+                if os.write(self._cmd, frame) != len(frame):     # (< PIPE_BUF on a fresh pipe: all or nothing)
+                    self._close_cmd()
+            except OSError:
+                self._close_cmd()       # (the shim then sees EOF or a partial frame: NOSECRET, nothing starts)
+
+    @classmethod
+    def _launch(cls, *, marker: str, key: bytes, boot: str, log: str, stderr_log: str, cwd: str = "/",
+                python: str | None = None, test_gate: str | None = None, piped: bool = True) -> "ShimChild":
+        """Spawn the shim with nothing sent yet (`start` sends the secret; tests call this directly to send their own
+        frames)."""
         cmd_r, cmd_w = os.pipe()        # (close-on-exec: no other child of the node inherits either end)
         evt_r = evt_w = err_fd = -1
         try:
@@ -164,8 +282,9 @@ class ShimChild:
             flags = os.O_APPEND if piped else os.O_EXCL
             err_fd = os.open(stderr_log, os.O_WRONLY | os.O_CREAT | flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
             os.fchmod(err_fd, 0o600)
+            # (C3-2a) No secret on the argv, nor in the environment below: the CLI, the shim's child, can read both.
             argv = [python or sys.executable, "-I", "-c", _BOOT, _PACKAGE_ROOT, "--version", str(groupshim.PROTOCOL),
-                    "--nonce", nonce, "--boot", boot, "--marker", marker, "--cmd-fd", str(cmd_r),
+                    "--boot", boot, "--marker", marker, "--cmd-fd", str(cmd_r),
                     "--event-fd", str(evt_w), "--log", log]
             if test_gate is not None:
                 argv += ["--test-gate", test_gate]
@@ -185,7 +304,7 @@ class ShimChild:
                     os.close(fd)
         os.set_blocking(cmd_w, False)
         os.set_blocking(evt_r, False)
-        return cls(proc, cmd_w, evt_r, nonce=nonce, boot=boot, marker=marker)
+        return cls(proc, cmd_w, evt_r, key=key, boot=boot, marker=marker)
 
     def go(self, argv: list[str], *, cwd: str, env: dict[str, str], kill_grace: float, timeout: float = 5.0) -> None:
         """Write GO: the CLI's argv, checkout cwd, its WHOLE environment (the shim runs with a minimal one of its own,
@@ -290,11 +409,39 @@ class ShimChild:
                     self.leader_code = int(args[0])
             elif kind == "NOGO" and args:
                 self.nogo = args[0]
+            elif kind == "NOSECRET" and args:
+                self.nosecret = args[0]
 
-    def _drained_exit(self) -> int | None:
-        """The shim's exit status, with every event it wrote taken first (its write end is closed once it exited, and
-        no other process holds it, so the drain ends at EOF)."""
-        code = self.proc.poll()
+    def _observe(self) -> int | str | None:
+        """(C3-2a review round 1, R3) THE one place the shim is reaped: `waitpid(pid, WNOHANG)` called here, the real
+        status recorded exactly once (as `Popen.returncode` reads: negative for a signal). ECHILD (someone else reaped
+        it, or the kernel did, for a process that ignores SIGCHLD or sets SA_NOCLDWAIT) is STATUS_UNKNOWN: no status was
+        observed, and none is ever made up. None while it runs."""
+        with self._wait_lock:
+            if self._status is not None:
+                return self._status
+            try:
+                pid, raw = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self._status = STATUS_UNKNOWN
+                return self._status
+            except OSError:
+                return None
+            if pid != self.pid:
+                return None
+            self._status = os.waitstatus_to_exitcode(raw)
+            return self._status
+
+    def _kill_shim(self, sig: int = 9) -> None:     # (9: SIGKILL)
+        """TEST-ONLY: signal the shim itself, only while this handle has not reaped it (its pid is pinned until then)."""
+        with self._wait_lock:
+            if self._status is None:
+                os.kill(self.pid, sig)
+
+    def _drained_exit(self) -> int | str | None:
+        """The shim's exit status (`_observe`), with every event it wrote taken first once it is over (its write end
+        is closed once it exited, and no other process holds it, so the drain ends at EOF)."""
+        code = self._observe()
         if code is None:
             self._pump()
             return None
@@ -305,40 +452,60 @@ class ShimChild:
 
     # -------- the three facts
 
+    def _release_pair(self) -> dict | None:
+        """(C3-2a, F1.4) The proof, while the node lives: BOTH the shim's own terminal exit status, OBSERVED by this
+        handle's own `waitpid` (`_observe`; the shim is the node's own unreaped child: the CLI cannot forge it; an
+        UNKNOWN status is no status), AND an authentic marker (`read_marker`) whose outcome belongs with that status
+        (`PROOF_PAIRS`). A marker alone, with the shim running or exited otherwise, proves nothing. Once both held, the
+        pair is kept (the reaped status cannot change)."""
+        if self._proof is not None:
+            return self._proof
+        status = self._drained_exit()
+        rec = read_marker(self.marker, self._key, self.boot)
+        if type(status) is not int or rec is None or (status, rec["outcome"]) not in PROOF_PAIRS:
+            return None
+        self._proof = rec
+        return rec
+
     def poll(self) -> int | None:
-        """The CLI's exit: the `LEADER_EXIT` code (as `Popen.returncode`: negative for a signal), else the exit code a
-        valid marker for this launch carries (read by itself on every call: an event dropped by backpressure is not
-        needed), else None. None also when the shim is LOST (the CLI's exit is unknown, and never made up): ask
-        `lost()` (DESIGN_NOTES C3-1 review round 1 has the whole table)."""
+        """The CLI's exit: the `LEADER_EXIT` code (as `Popen.returncode`: negative for a signal), else the exit code the
+        release pair's marker carries (looked at by itself on every call, so an event dropped by backpressure is not
+        needed; and only with the shim's matching exit status, never from a marker alone), else None. None also when
+        the shim is LOST (the CLI's exit is unknown, and never made up): ask `lost()` (DESIGN_NOTES C3-2a has the
+        table)."""
         self._pump()
         if self.leader_code is None:
-            rec = read_marker(self.marker, self.nonce, self.boot)
-            if rec is not None:
-                self._proved = True
-                if type(rec["leader_exit"]) is int:
-                    self.leader_code = rec["leader_exit"]
+            rec = self._release_pair()
+            if rec is not None and type(rec["leader_exit"]) is int:
+                self.leader_code = rec["leader_exit"]
         return self.leader_code
 
-    def shim_poll(self) -> int | None:
-        """The shim's own exit status (the node's own child: `Popen.poll()`, which reaps it), events drained first."""
+    def shim_poll(self) -> int | str | None:
+        """The shim's own exit status, as this handle observed it (`_observe`, which reaps it), events drained first:
+        None while it runs, then its status, or STATUS_UNKNOWN if someone else reaped it."""
         return self._drained_exit()
 
     def empty(self) -> bool:
-        """The PROOF that this launch's group is absent (or was never made), for the living node: a valid, complete,
-        visible marker for this launch's nonce and this boot (`read_marker`). Not a claim that it is durable (see the
-        module text). The `EMPTY` event alone is advisory: a prompt to look, never the proof."""
+        """The PROOF that this launch's group is absent (or was never made), for the living node: the release pair
+        (`_release_pair`). Not a claim that the marker is durable (see the module text). The `EMPTY` event alone is
+        advisory: a prompt to look, never the proof."""
         self._pump()
-        if not self._proved:
-            self._proved = read_marker(self.marker, self.nonce, self.boot) is not None
-        return self._proved
+        return self._release_pair() is not None
+
+    def refused(self) -> bool:
+        """(C3-2a) The shim exited before any fork, publishing nothing: no single valid NONCE frame (exit 7) or bad
+        arguments, an unreadable or foreign boot identity (exit 2). Its own exit status (the node's unreaped child)
+        says nothing was ever started; no file is trusted for it. Only an OBSERVED status: a signal exit or
+        STATUS_UNKNOWN is never a refusal. Neither `empty()` nor `lost()`."""
+        status = self._drained_exit()
+        return type(status) is int and status in REFUSED_EXITS
 
     def lost(self) -> bool:
-        """The shim has exited and, every event drained, there is no matching marker: the anchor is gone without a
-        proof (held, for a human). False while the shim runs (the marker is published before its exit, so it cannot
-        appear after)."""
+        """The shim is over (exited, or its status UNKNOWN), every event drained, it did not refuse the launch, and
+        there is no release pair: the anchor is gone without a proof (held, for a human). False while the shim runs."""
         if self._drained_exit() is None:
             return False
-        return not self.empty()
+        return not self.refused() and not self.empty()
 
     # -------- today's I/O contract (dispatch.PipedChild's code, over the shim's stdio pipes; `piped` only)
 

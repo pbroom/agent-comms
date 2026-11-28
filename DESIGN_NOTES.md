@@ -18969,7 +18969,8 @@ A failure removes the temp file and publishes nothing.
     code in a matching marker.
   - **The shim's exit:** `shim_poll()` is `Popen.poll()` on the node's own child. It is safe, and it reaps the shim.
   - **The group's absence:** `empty()` is True ONLY when the marker exists, is a regular file (no symlink), is at most
-    64 KiB, is protocol 1, carries this launch's nonce and this boot, and has the outcome `empty` or `never_started`.
+    4096 bytes (`MARKER_MAX`), is protocol 1, carries this launch's nonce and this boot, and has the outcome `empty` or
+    `never_started`. (Superseded by C3-2a: the release pair, below.)
     The `EMPTY` event is never the proof. This is the proof `Groups.release` will take in C3-2.
 - **`lost()`:** the shim has exited and, every event drained, there is no matching marker. The marker is published
   before any exit, so it cannot appear later. While the shim runs, the answer is False.
@@ -19729,3 +19730,480 @@ It cannot recreate the acquire-window deadlock. The main thread's two explicit a
 report lock's) run only inside cleanup, which such a signal either skips or finds already latched, so no later
 signal raises there. `try_stopping` runs on threads that take no signals. The same text is in `ShutdownLatch`'s
 docstring.
+
+## Ownership C3-2a: the proof is authenticated (still unwired)
+
+The first part of C3-2: what an independent review said must be fixed in the shim and its handle before they are
+wired in. **Still nothing is wired in.** Only `agent_comms/groupshim.py` and `agent_comms/shimchild.py` change among
+the product modules, and nothing else imports them. New: `tests/test_spawn_discipline.py`. The C3-1 sections above
+stay as the history; where they disagree with this one, this one holds.
+
+### The defect, reproduced
+
+- **What it was.** Up to 06866a5 the launch nonce, the boot identity and the marker path were on the shim's command
+  line. The CLI is the shim's child and runs as the same user, so it can read them (`ps -o args= -p $PPID`) and write
+  a marker the reader accepts. The reviewer's probe did, and `ShimChild.empty()` answered True while the CLI was still
+  running. The shim's "ready" diagnostic also carried the nonce, in a log next to the marker.
+- **Reproduced on 06866a5** by `test_f1_the_supervised_cli_cannot_forge_the_proof`, run against 06866a5's product
+  code before any fix: it fails at "a marker the CLI wrote proves nothing" (`empty()` True with the forger alive).
+- **Two fixes, each enough against this probe alone, and both kept:** the secret leaves every place the CLI can read
+  (the NONCE frame), and a marker alone is no longer release authority (the release pair).
+
+### The secret: one NONCE frame (F1.1, F1.2)
+
+- **What it is.** 32 fresh random bytes per launch (`secrets.token_bytes`), drawn by `ShimChild.start`. The marker's
+  path is drawn separately (`secrets.token_hex(16)` + `.marker`), so neither tells anything about the other.
+- **How it travels.** One frame, `NONCE 1 <64 lowercase hex>\n` (73 bytes, at most `MAX_NONCE` = 128), the FIRST thing
+  written on the command pipe, before `GO`. The handle writes it right after the shim is spawned; on a fresh pipe a
+  write under `PIPE_BUF` is all or nothing.
+- **Where it never is:** the shim's argv (`--nonce` is gone; `parse_args` takes `--version --boot --marker --cmd-fd
+  --event-fd --log [--test-gate]`), its environment, any file, any event, any diagnostic line ("ready" now says only
+  the protocol and the boot). The marker carries a MAC, never the secret. The command pipe's read end is the shim's
+  alone, close-on-exec, and the child closes every descriptor but its stdio and the handshake before its exec, as in
+  C3-1.
+
+| What arrived first on the command pipe | Event | Exit | Marker |
+| --- | --- | --- | --- |
+| a valid NONCE, then a valid GO | as in C3-1 | as in C3-1 | as in C3-1 |
+| a valid NONCE, then EOF / a bad GO | `NOGO <reason>`, `EMPTY` | 3 | `never_started`, authenticated |
+| EOF | `NOSECRET eof` | 7 | none |
+| part of a frame, then EOF | `NOSECRET partial` | 7 | none |
+| 128 bytes with no newline (a GO line first is this) | `NOSECRET overlong` | 7 | none |
+| a line that is not `NONCE <digits> <64 lowercase hex>` (a command, upper case, short, extra field) | `NOSECRET invalid` | 7 | none |
+| `NONCE` with another version | `NOSECRET version` | 7 | none |
+| a valid NONCE, then a second NONCE | `NOSECRET duplicate` | 7 | none |
+
+- **Nothing is forked in any `NOSECRET` case**, and no marker is published: none could be authenticated (a duplicate
+  is refused as a protocol fault, though a secret was read).
+- **What the node sees.** It tells "never started" from the shim's own exit status, not from a file. The shim is the
+  node's own unreaped child, so its status cannot be forged by anything the shim supervises, and the shim returns 7
+  (and 2) only before any fork. `ShimChild.refused()` is True for exit 7 or 2; then `empty()` is False and `lost()` is
+  False. The wiring decides whether `refused()` releases the reservation (my recommendation: yes, for these two
+  statuses only).
+
+### The marker's authenticated record (F1.3)
+
+`{"v": 2, "outcome", "cli_pid", "leader_exit", "boot", "mac"}`, one line. (How it is written changed twice in review:
+since round 2 the shim creates the marker path itself, exclusively, and writes it in place with no staging file; see
+"review round 2" below.)
+
+- **`v` = `MARKER_VERSION` = 2:** every field authenticated by HMAC-SHA256 under the launch secret. 1 was C3-1's
+  unauthenticated record, which the reader now refuses. A later, stronger verifier (one the CLI cannot even in
+  principle compute) takes a new number.
+- **`mac`:** `HMAC-SHA256(secret, "agent-comms groupshim marker v2\0" + canonical JSON of every other field)`, the
+  canonical JSON being sorted keys, no spaces, ASCII (`groupshim.marker_mac`), as 64 lowercase hex digits. A known
+  answer computed by the test from the literal bytes pins the encoding.
+- **The reader** (`read_marker(path, key, boot)`) keeps every C3-1 check (a regular file by `lstat`, opened
+  non-blocking with no symlink and `fstat`-matched, at most `MARKER_MAX` = 4096 bytes, one line, exact keys and exact
+  types), checks `v` is exactly the int 2 and the boot is this one, then recomputes the MAC over the fields it parsed
+  and compares in constant time (`hmac.compare_digest`). A copied marker (another launch's key), any changed field, and
+  any MAC that is not 64 lowercase hex digits are refused.
+- `read_marker` and `marker_proves` say whether a record is AUTHENTIC. They are not release authority.
+
+### Release authority while the node lives: the release pair (F1.4, F1.5)
+
+`ShimChild.empty()` is True only when BOTH hold:
+1. **the shim's own terminal exit status,** observed by the handle (`Popen.poll()` on the node's own child);
+2. **an authentic marker** for this launch and boot whose outcome belongs with that status:
+
+| Shim exit status | Marker outcome | Proof? |
+| --- | --- | --- |
+| 0 (`EMPTY`) | `empty` | **yes** |
+| 3 (`NOGO`: never forked) | `never_started` | **yes** |
+| 6 (`UNSYNCED`: visible, the directory's sync failed) | `empty` or `never_started` | **yes** (for the living node) |
+| still running | anything | no |
+| 0 | `never_started` | no |
+| 3 | `empty` | no |
+| 1, 4, 5, a signal (killed) | anything | no |
+| 2, 7 | (none exists) | no: `refused()` instead |
+
+- **A marker alone proves nothing**, whatever it says, while the shim runs or after it exited with another status.
+  `poll()` takes a code from the marker only through the same pair (never while the shim runs). Once both halves
+  held, the pair is kept: a reaped status cannot change.
+- **Found in this build: a node that ignores SIGCHLD.** The kernel then reaps the node's children itself, and
+  `Popen.poll()` reports ECHILD as exit 0, a status nobody observed. With SIGCHLD ignored in the handle's process the
+  pair is refused (`empty()` False; the c6 node stand-in, which ignores SIGCHLD, shows it). A requirement on the
+  wiring: the node must not ignore SIGCHLD, set `SA_NOCLDWAIT`, or reap its children with `waitpid(-1)` (no code in
+  `agent_comms` does any of these today).
+
+| `LEADER_EXIT` seen | shim | authentic marker | `poll()` | `empty()` | `lost()` | `refused()` |
+| --- | --- | --- | --- | --- | --- | --- |
+| yes | running | any or none | the code | False | False | False |
+| yes | exited 0 / 6 | `empty` | the code | True | False | False |
+| yes | exited, any other pair (incl. none, tampered, 1, 4, 5, killed) | | the code | False | **True** | False |
+| no | running | any or none | None | False | False | False |
+| no | exited 0 / 6 | `empty` | the marker's code | True | False | False |
+| no | exited 3 / 6 | `never_started` | None (it never ran) | True | False | False |
+| no, `START_UNKNOWN` | exited 0 / 6 | `empty` | the marker's code | True | False | False |
+| no | exited 2 / 7 | none | None (never started) | False | False | **True** |
+| no | exited, no pair | | **None for ever: LOST** | False | **True** | False |
+
+- **Proof after a node RESTART is not decided** (no code here). After a restart nobody holds the shim's status: it
+  was the dead node's child. A marker alone would be the only evidence, and a same-user CLI, or a descendant that left
+  its group, can read ANY durable record the node can write (the secret, if the node kept it on disk), so HMAC under a
+  node-held secret proves nothing against it then. Until C3-3 decides, a restarted node treats every unproved
+  reservation as held.
+  - **For C3-3 (Sol, review round 2):** a complete, HMAC-valid marker can be visible before the sync finishes or after
+    a sync fails; the HMAC proves authenticity and completeness, not that the shim reached a proof-bearing exit; if
+    restart recovery needs that exit decision it must retain the reservation unless it has independent evidence of
+    it.
+
+### The degraded stop: after the fork, a crash still stops the group (F2)
+
+- **The defect.** Up to 06866a5 an unexpected exception after the fork ended the shim (exit 5) with the group
+  untouched and running.
+- **Now** `_main` sends any exception after the fork (any `BaseException`) to `Shim.stop_after_crash`: a minimal loop,
+  with no kqueue and no commands.
+  - It emits `CRASHED`, closes RELEASE's write end if it was never written (the child then never enters the checkout).
+  - Before every signal and before the proof, the kernel must confirm the anchor: `child_state(pid)`, a
+    `waitid(WEXITED | WNOHANG | WNOWAIT)` on our own child, which answers "running" or "exited" for our unreaped child
+    and ECHILD otherwise; and `anchored()` (not latched, not reaped).
+  - By the existing target rules (`_signal`, with the child's `S` read non-blocking to learn establishment): a TERM
+    now; a KILL at the FIRST TERM attempt + the grace (kept if one was made before the crash), through `_kill_now`,
+    repeated every grace.
+  - The child's exit is polled with `waitid`; then the SAME verified release, `_check_empty` (listing, latch, reap,
+    second listing, authenticated marker): exit 0 (or 6, 1, 4) as in the normal path.
+  - **If the anchor cannot be confirmed:** no signal from then on (latched), `UNPROVED`, no marker, exit 5: the
+    reservation stays unproved (`lost()`).
+  - A crash inside the degraded stop ends it the same way: latched, no marker, exit 5.
+- **Test-only injections** (in the test gate dir): `crash-in-loop` raises in the loop; `crash-reap` reaps the exited
+  child first, then raises; `crash-before-go` raises before the fork.
+
+### Marker paths and the marker directory (F3)
+
+- `ShimChild.start(marker_dir=...)` replaces `start(marker=...)` (and its `nonce=` and `boot=` arguments are gone). The
+  marker's name is drawn afresh per launch. If that path exists in any form (a file, a directory, a symlink, a dangling
+  symlink, a FIFO), `start()` raises `FileExistsError` before anything is spawned, and neither overwrites nor deletes
+  it.
+- `make_marker_dir(path)` creates the node's marker directory mode 0700 (its parent must exist) and checks it;
+  `check_marker_dir` (also run by `start()`) refuses a symlink, a non-directory, a directory owned by another user,
+  and any group or other permission bit, and repairs nothing.
+- The existence check is an `lstat`, not an atomic reservation: within the private directory only the node's user can
+  create a name, and the name is unguessable until it is on the new shim's argv.
+
+### The boot identity (F4)
+
+- `boot_id()` is `kern.bootsessionuuid` (`sysctlbyname`), validated as a 36-character UUID; None otherwise. There is
+  no fallback, and never a wall-clock value (`kern.boottime` is gone).
+- The handle reads it in `start()`: None refuses the launch (OSError, nothing spawned). The shim validates `--boot`'s
+  shape and compares it with its own read: a mismatch or an unreadable value is exit 2, nothing started (`refused()`).
+  The marker carries it; the reader compares it exactly.
+
+### The forked child (F5)
+
+`_child`'s body is one `try` from its first statement (the stage, the closing of the shim's ends, every pause, the
+release, the dispositions, the stdio, the closing loop, the `chdir`, the `exec`); its handlers take every exception
+and its `finally` is `os._exit(127)`. The call in `Shim.spawn` is also wrapped in `try: _child(...) finally:
+os._exit(127)`. No `sys.exit`, `exit`, `quit` or `raise SystemExit` in the child's code. An AST test pins all of it.
+
+### Every spawn in the package closes inherited descriptors (F6)
+
+`tests/test_spawn_discipline.py` scans `agent_comms/` (AST, every platform):
+- no call passes `close_fds` as anything but the literal `True` (whatever it calls, a `Popen` held in a variable
+  included), and no `subprocess` spawn call takes `**kwargs`;
+- no `os.fork`, `os.forkpty`, `os.posix_spawn*`, `os.spawn*`, `os.system`, `os.popen`, `pty`, `multiprocessing`,
+  `_posixsubprocess` or `ProcessPoolExecutor`, outside the allow-list: exactly the shim's own single `os.fork()` in
+  `Shim.spawn`.
+- The test-only member of `_child_gate` (C3-1 forked it) is now started with `subprocess.Popen(close_fds=True)`, so the
+  allow-list holds one entry.
+- A self-test feeds each banned form to the scan.
+- **It cannot cover a third-party library that forks**, nor code outside `agent_comms`. That is still the contract of
+  C3-1's decision (A): every node launch that can run concurrently closes descriptors.
+
+### Limits, stated
+
+- **The trust in the shim's status and memory.** The proof assumes a same-user process cannot take control of the shim
+  (`task_for_pid`: on macOS a debugger needs the target to allow it, or root). A CLI that could attach to the shim, or
+  to its child before the exec (the forked child holds a copy of the secret until `execvpe` replaces its memory),
+  could read the secret.
+- **Descendants that leave the group** (Claude Code's tool commands run in their own sessions) can still run in the
+  checkout after the proof (C3-1's inherited limit). They can also delete or replace the marker in the marker
+  directory: then the pair fails and the launch is LOST (held), the conservative direction. The test
+  `test_f1_a_forgery_put_back_by_an_escaped_descendant_is_no_proof` does exactly this.
+- **A mismatched handle and shim** (different package roots) would disagree on the frames and give `NOSECRET` or `NOGO`:
+  nothing started. Both come from the same package root by construction.
+
+### Tests (tests/test_groupshim.py unless named; real processes and real signals unless marked)
+
+Each was run against 06866a5's product code before the fix. "Fails" means it failed there.
+
+- **F1:**
+  - `test_f1_the_supervised_cli_cannot_forge_the_proof`: a stand-in CLI reads its shim's argv and environment with
+    `ps`, and every file under the directory that holds its marker and the shim's logs, and writes the best marker it
+    can (06866a5: the argv's nonce; now: an HMAC keyed by every token it saw, and every 64-hex token as the MAC). While
+    it runs `empty()` is False, `poll()` None; every one of its forgeries is refused by the reader alone; the secret is
+    in none of what it read, no event and no diagnostic. Once it exits the shim publishes its own marker: `empty()`.
+    Fails (assertion: `empty()` True while the forger runs).
+  - `test_f1_a_forgery_put_back_by_an_escaped_descendant_is_no_proof`: a `setsid` descendant replaces the shim's own
+    marker with the forgery after the publish; the shim exits 0; `empty()` False, `lost()`. Fails (the forgery was
+    proof).
+  - `test_f1_a_marker_replayed_with_one_field_changed_is_no_proof` (exit code, pid, boot, one MAC digit; put back
+    whole it is proof again). Fails (a changed exit code was accepted).
+  - `test_f1_a_marker_copied_from_another_launch_is_no_proof`. Passes on 06866a5 too (the nonce caught it): a pin.
+  - `test_f1_each_proof_bearing_pair_is_accepted[empty|never_started|unsynced-empty|unsynced-never_started]`: the
+    `unsynced` cases inject the directory-sync failure through the test gate (`fail-dir-sync`). The two `unsynced` cases
+    fail (no such injection); the other two pass there (pins).
+  - `test_f1_every_other_pair_is_refused[alive|crashed|killed|nogo-with-empty|empty-with-never_started]`: a valid
+    authenticated marker written by the test (which holds the secret) is no proof without the matching status, and
+    `poll()` takes no code from it. All fail.
+  - `test_f1_a_missing_duplicate_overlong_or_malformed_nonce_starts_nothing[...]` (11 cases, the table above): exit 7,
+    exactly `NOSECRET <reason>`, no marker, the stand-in never started, `refused()`. Fail (no NONCE frame).
+  - In process: `test_unit_the_nonce_frame_parser`, `test_unit_the_marker_mac_is_hmac_sha256_over_the_canonical_fields`
+    (the known answer).
+  - Changed: the reader tests (`test_r2_...`, `test_c7_a_marker_of_another_launch_or_boot_is_no_proof`) now use
+    records AUTHENTIC under the key they were made with, so each type check, the version, the boot and the key stand
+    on their own; `test_c7_a_stale_handle_against_its_successor` now gives each launch its own path;
+    `test_c6_signal_dispositions_...` also shows the SIGCHLD refusal.
+- **F2:** `test_f2_a_crash_after_the_fork_still_stops_the_group_and_proves_it`: the CLI and its member ignore TERM, a
+  TERM was sent 1.2 s before the injected crash; the degraded stop TERMs again and KILLs at the ORIGINAL TERM + 2 s
+  (more than 0.3 s before a restarted grace would), the member got the TERM, the group is gone, exit 0, `empty()`.
+  `test_f2_a_crash_that_leaves_no_anchor_signals_nothing_and_publishes_nothing`: the injected crash reaps the leader
+  first; the member (it notes every TERM) never gets one and lives on; no marker, exit 5, `lost()`. Both fail (no
+  injection there: the group is never stopped, the shim never exits).
+- **F3:** `test_f3_start_refuses_an_existing_marker_path_and_leaves_it_alone[file|dir|symlink|dangling-symlink|fifo]`
+  (nothing spawned; inode, mode, mtime and content unchanged; a dangling symlink's target not created) and
+  `test_f3_the_marker_directory_is_private_to_this_user` (0700 made; an existing private one taken; a symlink, a file,
+  modes 0750, 0705, 0701, 0710 and 0777, and another owner refused and left unchanged; `start()` refuses them). Fail
+  (no marker directory).
+- **F4:** `test_f4_the_boot_identity_is_this_boots_session_uuid` (UUID-shaped, two equal reads, equal to
+  `/usr/sbin/sysctl -n kern.bootsessionuuid`): fails (seconds.microseconds).
+  `test_f4_a_boot_identity_that_cannot_be_read_or_validated_refuses_the_launch[unreadable|wall-clock-shaped|not-a-string]`
+  (in process; nothing spawned) and `test_f4_a_shim_that_cannot_read_the_boot_identity_starts_nothing` (real, test gate
+  `fail-boot`: exit 2, `refused()`): fail.
+- **F5:** `test_f5_every_statement_of_the_forked_child_is_inside_its_failure_boundary` (AST); the real launch tests
+  still pass. Fails (the stage and the close loop were before the `try`).
+- **F6:** `tests/test_spawn_discipline.py`: `test_no_spawn_in_the_package_keeps_inherited_descriptors` and
+  `test_the_allowed_fork_is_the_shims_single_one` fail (the test gate's member fork);
+  `test_the_scan_sees_each_kind_of_spawn_that_keeps_descriptors` passes (the scan's self-test).
+
+### Mutation check (C3-2a)
+
+The GS and SC rows are now 68. Every anchor was checked (a scratch check, not committed) to occur exactly once in its
+file. The script itself was not run in this build; three rows were applied by hand and run against their tests, and
+each was caught: the secret on the argv, the pair's first half, and the original first TERM time.
+- **Re-anchored (7), renamed with "(re-anchored: C3-2a)":** the marker bound to this launch (now its MAC under the
+  secret), the marker's boot, a partial GO (the one frame reader), the EMPTY event, the strict version, `poll()` reads
+  the marker by itself, the child closes the shim's ends first.
+- **Removed (1):** "the proof checks the nonce", superseded by the HMAC check.
+- **New (16):** the secret is not on the shim's argv; the secret is in no diagnostic; the HMAC check; the release
+  needs the shim's own terminal status; the release needs the authenticated marker; the marker's outcome must belong
+  with the status; no release pair while this process ignores SIGCHLD; a refused launch is not lost; `start()`
+  refuses an existing marker path; the marker directory must be private; the boot identity is
+  `kern.bootsessionuuid`; no valid NONCE frame, nothing starts; a second NONCE frame is refused; the degraded loop's
+  KILL gate; the degraded loop keeps the ORIGINAL first TERM time; a crash after the fork goes to the degraded stop.
+- **Deliberately not written:** a row that removes the kernel's anchor confirmation from the degraded stop. Its mutant
+  would go on KILLing a process-group id after the leader was reaped and the last member died, an id another process
+  group on the machine running the check could reuse.
+
+### What the wiring PRs must do (updated)
+
+- Everything in "What C3-2 must replace" above, with `child.empty()` meaning the release pair.
+- Create the marker directory once with `make_marker_dir` (inside the node's private state), and start every shim with
+  `ShimChild.start(marker_dir=...)`; never pass a path.
+- Ask `refused()` (nothing started), `lost()` (held) and `empty()` (proved) on every reap and shutdown path, before
+  reading `poll() is None` as "still running".
+- Never ignore SIGCHLD, set `SA_NOCLDWAIT`, or reap with `waitpid(-1)` in the node (since review round 1 any of these
+  makes every shim's status UNKNOWN: safe, but every launch is then held).
+- Release on `refused()` only as ruled in review round 1 (an observed exit 2 or 7 of the trusted shim launch).
+- Keep every node spawn `close_fds=True` (the F6 scan catches a regression inside `agent_comms` only).
+- Keep the handle's locks as host locks (`with hostlog.BOUNDARY, lock:`), as before.
+- C3-3 decides proof after a restart (above); until then a restarted node holds every unproved reservation.
+
+### Ownership C3-2a: review round 1 (Sol on 7047f3a: 2 blockers, 2 shoulds)
+
+Accepted as built: the secret's channel, the domain-separated canonical encoding and exact field validation, the four
+matching (status, outcome) pairs (exit 6 with either outcome included), the boot UUID read, the forked child's exit
+path, and the degraded loop's rules once it is entered.
+
+**The two decisions, answered.**
+- **`refused()`:** the wiring MAY release on it, but only on a genuinely OBSERVED exit 2 or 7 of the trusted shim
+  launch. A signal exit, an unknown status (R3) or an untrusted launcher is not enough. `refused()` now answers True
+  only for an int status observed by the handle's own `waitpid`.
+- **SIGCHLD:** the finding stands; R3 replaces the disposition guard with something stronger (below).
+
+#### R1 [blocker]: publishing the marker never replaces a file
+
+- **The defect.** `start()` checked the path, but the shim published with a replacing `rename`. A same-user process
+  can read the path on the shim's argv, put a file there while the CLI runs, and have it overwritten at cleanup. Also,
+  after a failed exclusive create of its temp name, the shim unlinked that name, though it was not its own.
+- **Now** (`write_marker`): the temp file `<marker>.<pid>.tmp` is created exclusively (`O_EXCL | O_NOFOLLOW`), synced,
+  and published by `os.link(temp, path)`, which fails with EEXIST if anything is at the path (a dangling symlink
+  included) and never replaces it; then the temp name is unlinked; then the directory is synced, as before. The temp
+  name is unlinked only if THIS call created it (`created`). On any failure up to the link: `MARKER_FAILED <errno>`
+  (17 when something was already there), no `EMPTY`, exit 4, no marker of ours, and whatever was there left exactly
+  as it was. Exit 4 is in no release pair: the node sees a launch not proved, `lost()`, held.
+- **A consequence:** a forgery the CLI leaves at the marker path now blocks the publish (held), rather than being
+  replaced by the shim's marker; the F1 forger test says so. A file put there AFTER the publish (the escaped
+  descendant's case) still makes the pair fail, as before.
+- **Tests** (real): `test_rr1_publishing_never_replaces_a_file_at_the_marker_path[empty|never_started]`: the planted
+  file is there byte for byte, `MARKER_FAILED 17`, exit 4, `empty()` False, `lost()`, no temp file left. Both fail on
+  7047f3a (exit 0 / 3: replaced). `test_rr1_a_temp_name_the_shim_did_not_create_is_never_unlinked`: fails on 7047f3a
+  (the planted temp file is gone).
+
+#### R2 [blocker]: nothing runs between a post-fork crash and the degraded stop
+
+- **The defect.** `_main` called `traceback.format_exc()` before `stop_after_crash`. It reads source files
+  (`linecache`); if that stalled with a live CLI, no cleanup TERM was ever sent, even after the node's EOF.
+- **Now.** After an exception past the fork the FIRST call is `shim.stop_after_crash(e)`. The crash is described only
+  after the first TERM (or after the refusal, when the anchor cannot be confirmed): `crash_frames` takes the type name
+  and the innermost 32 (file, line, function) triples from the traceback objects' code objects (memory only: no
+  `traceback`, no `linecache`); the TEXT is made by `render_crash`, which only the diagnostics writer thread calls
+  (`Diag.put_lazy`). A rendering that stalls stalls that thread alone; one that raises gives a placeholder line. The
+  crash before the fork is described the same way. `groupshim` no longer imports `traceback`.
+- **The rest checked:** every other handler between an exception and a signal (the loop's `OSError` handlers, the
+  event writer, the reads) only formats an errno into a queued line; signals are sent before their diagnostics.
+- **Test** (real): `test_rr2_a_stalled_crash_description_never_holds_up_the_degraded_stop`: the shim runs under a
+  stand-in interpreter (a shell script passed as `python=`) whose traceback formatters, `linecache` and
+  `groupshim.render_crash` all stall until the test's `abort`. With the CLI and its member ignoring TERM, an injected
+  crash past the fork still brings the TERM at once, KILL at the 1 s grace, the proof and the marker: exit 0 within
+  8 s. Fails on 7047f3a (no TERM within 5 s).
+
+#### R3 [should]: the handle owns the shim's wait status; an unknown status proves nothing
+
+- **The defect.** `Popen.poll()` turns ECHILD into exit 0. An earlier auto-reap (SIGCHLD ignored, `SA_NOCLDWAIT`) or
+  another waiter therefore gave a status nobody observed. The SIGCHLD-disposition guard of 7047f3a could not see
+  `SA_NOCLDWAIT` nor another waiter.
+- **Now.** `ShimChild._observe` is the ONE place the shim is reaped: `os.waitpid(pid, WNOHANG)`, the status recorded
+  exactly once (`os.waitstatus_to_exitcode`: negative for a signal). `ChildProcessError` (ECHILD) records
+  `STATUS_UNKNOWN`. `shim_poll()` answers None (running), the status, or `STATUS_UNKNOWN`.
+- **Popen is neutralised:** at construction the handle sets the shim's `Popen.returncode` to a sentinel
+  (`_HandleOwnsStatus`). `Popen.poll()`, `wait()`, `send_signal()`/`kill()`, `__del__` and subprocess's `_cleanup` of
+  collected Popens all act only while `returncode` is None, so none of them ever waits on or signals the shim. The
+  handle keeps it privately (`_popen`), for its stdio pipes only; `proc` is no longer exposed. Tests signal the shim
+  through `_kill_shim()` (test-only), which signals only while the handle has not reaped it.
+- **The SIGCHLD guard is dropped:** with SIGCHLD ignored the kernel reaps the shim, the handle's `waitpid` gets ECHILD,
+  and the status is UNKNOWN, which proves nothing (and this also covers `SA_NOCLDWAIT` and other waiters).
+- **UNKNOWN answers:** `empty()` False, `refused()` False, `lost()` True (held, for a human or a later proof),
+  `poll()` the `LEADER_EXIT` code if that event was read, else None (never a code from the marker).
+
+| `LEADER_EXIT` seen | shim | authentic marker | `poll()` | `empty()` | `lost()` | `refused()` |
+| --- | --- | --- | --- | --- | --- | --- |
+| yes / no | status UNKNOWN (reaped by another waiter, or by the kernel) | any or none | the event's code / None | False | **True** | False |
+
+  (Added to the C3-2a table above; every other row stands, with "exited N" meaning a status the handle observed.)
+- **Tests** (real): `test_rr3_a_shim_reaped_by_another_waiter_has_an_unknown_status_and_proves_nothing[proved|refused]`
+  (this test process reaps the shim first: UNKNOWN, `empty()` and `refused()` False, `lost()`): `proved` fails on
+  7047f3a (`empty()` True), `refused` fails there on the missing `STATUS_UNKNOWN`.
+  `test_rr3_popen_cannot_reap_the_shim_behind_the_handle` (the shim exited; its Popen's `poll()`, `wait()` and
+  `kill()` leave it this process's unreaped child; the handle then observes 0): fails on 7047f3a (Popen reaped it).
+  `test_c6_signal_dispositions_...` (the node stand-in ignores SIGCHLD): both shims' status is now `unknown`; fails on
+  7047f3a (`[0, 0]`).
+
+#### R4 [should]: the stricter spawn pin is NOT built: two existing call sites do not fit
+
+The rule (only direct calls `subprocess.<spawn>(argv, ...)` or a name imported from subprocess unrenamed; one
+positional argument; `close_fds` absent or the literal True by keyword; no `*args`/`**kwargs`; no assignment, alias,
+attribute lookup or `getattr` that hands a spawn function on) was checked against `agent_comms/` with a scratch scan
+before any change. Type annotations (`proc: subprocess.Popen` in dispatch.py and shimchild.py) hand nothing on and
+would be exempt. Two sites do not fit, both in modules this PR may not change:
+- `agent_comms/notify.py:99`: `popen: Callable[..., Any] = subprocess.Popen` (a default argument; called as
+  `self.popen(...)` with `close_fds=True` at line 109);
+- `agent_comms/waiter.py:491`: `run = run or subprocess.run` (called as `run([...], stdin=DEVNULL, ...)`, no
+  `close_fds`, so subprocess's default True).
+
+As ruled, the rule was not loosened, and R4 stopped for a decision.
+
+**The owner's decision, built:** the strict rule, with an explicit allow-list of EXACTLY those two sites, and neither
+module changed in this PR. `tests/test_spawn_discipline.py` now requires:
+- a spawn function (`Popen`, `run`, `call`, `check_call`, `check_output`, `getoutput`, `getstatusoutput`) used only as
+  the callee of a direct call, on `subprocess` imported under its own name or a name imported from it unrenamed; at
+  that call exactly one positional argument, no `*args`, no `**kwargs`, and `close_fds` absent or the literal `True`
+  by keyword; any call anywhere that passes `close_fds` passes the literal `True`;
+- no other reference that hands a spawn function on (an assignment, an alias, a default, a container, `getattr` or
+  `vars` of `subprocess`, `subprocess.__dict__`, a renamed import, `from subprocess import *`, `import subprocess as`
+  another name), except the two allow-listed sites;
+- **annotations are exempt:** a reference is in an annotation when it lies in the subtree of a parameter's
+  `annotation`, a function's `returns` or an annotated assignment's `annotation` (`proc: subprocess.Popen`). A
+  parameter's default is not an annotation.
+- **The allow-list** is by file AND the exact statement text (`ast.unparse`; for a parameter default,
+  `<parameter> = <default>`), each seen exactly once:
+  - `agent_comms/notify.py`, `popen: Callable[..., Any] = subprocess.Popen`: an injectable default for tests;
+  - `agent_comms/waiter.py`, `run = run or subprocess.run`: an injectable runner for tests.
+  The one call that spawns through each alias is pinned by its exact text too: `self.popen(...)` must pass
+  `close_fds=True` by keyword, and the `run(...)` in `codex_queue` must not pass `close_fds` at all (subprocess's
+  default True). A changed statement, a changed call, or a third hand-off fails the test.
+- Fixtures refuse each bypass (a positional `close_fds=False`, `*args`, `**kwargs`, an alias not on the list, a class
+  attribute, a list, a default argument, `getattr(subprocess, "Popen")`, `vars(subprocess)`, `subprocess.__dict__`,
+  `from subprocess import Popen as P`, `from subprocess import *`, `import subprocess as sp`) and each allow-listed
+  statement or pinned call differing by one token (and the same text in another file).
+- **Removing the two allow-listed sites** (making those spawns direct calls, with their test seams elsewhere) is a
+  later cleanup; nothing else may join the list.
+
+#### Mutation check (review round 1)
+
+The GS and SC rows are now 72; every anchor occurs exactly once (the scratch check). The script was not run here; the
+R1 "no replace", R2 and R3 "unknown" mutants were applied by hand and each was caught by its test.
+- **New (5):** "C3-2a R1 publishing never replaces a file"; "C3-2a R1 only a temp file this publisher created is
+  unlinked"; "C3-2a R2 nothing runs between a post-fork crash and the degraded stop"; "C3-2a R3 a status nobody
+  observed is UNKNOWN, never a status"; "C3-2a R3 Popen never reaps the shim behind the handle".
+- **Re-anchored (4):** "C3-1R4 a temp-file sync failure publishes nothing (re-anchored: C3-2a review round 1)"; "C3-2a
+  the release needs the shim's own terminal status (the pair's first half; re-anchored: review round 1)"; "C3-2a the
+  release needs the authenticated marker (the pair's second half; re-anchored: review round 1)"; "C3-2a a crash after
+  the fork goes to the degraded stop (re-anchored: review round 1)".
+- **Removed (1):** "C3-2a no release pair while this process ignores SIGCHLD" (its guard is dropped; R3's rows
+  replace it).
+
+### Ownership C3-2a: review round 2 (Sol on 1a23236: R2, R3 and R4 resolved; one blocker on R1)
+
+#### R5 [blocker]: the marker is published with NO staging file
+
+- **The defect.** Round 1's publish created a temp file, then `os.link`ed it to the marker path and unlinked the temp
+  name. A same-user process can enter any directory the shim can: after the create it could rename the shim's temp
+  file away and put another file at that name; `link` then published the substitute and `unlink` deleted it (the
+  error path had the same deletion race). No staging name can be protected.
+- **Now** (`write_marker`): the shim creates the marker path ITSELF with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+  O_CLOEXEC`, mode 0600; writes the whole record (at most `MARKER_MAX` = 4096 bytes, now one constant shared with the
+  reader) through that descriptor with a loop that completes a short write; full-syncs the DESCRIPTOR; closes it; then
+  syncs the directory. No temp file, no `link`, no `rename`. The shim never unlinks any path, on success or on any
+  error.
+
+| What happens | Event | Exit | What is left at the path |
+| --- | --- | --- | --- |
+| anything already at the path (a dangling symlink included) | `MARKER_FAILED 17` | 4 | that thing, untouched |
+| the write or the file's sync fails after the create | `MARKER_FAILED <errno>` | 4 | the shim's file, as it is (possibly partial; possibly complete and authentic) |
+| the directory's sync fails after a good file sync | `UNSYNCED <errno>`, `EMPTY` | 6 | the complete, valid, visible marker |
+| all synced | `EMPTY` | 0 (or 3) | the marker |
+
+- **Atomicity for the reader comes from the release pair and the MAC, not from the filesystem** (said in
+  `write_marker`'s and `read_marker`'s docstrings too). A reader accepts a marker only with the shim's own observed
+  terminal status in a proof-bearing pair AND a MAC that verifies over the complete record. A partial file fails the
+  parse or the MAC; a substituted one fails the MAC; a complete, authentic file left after a failed file sync fails the
+  pair (exit 4 is in none). Each is held.
+- **What still applies of the substitution attack:** a process can rename the shim's freshly created file away and put
+  another at the path while the shim writes. The shim writes into its own (renamed) file, replaces and deletes nothing,
+  and may even exit 0; the substitute fails the MAC, so `empty()` is False: held.
+- **Test-only hooks** (test gate dir): `fail-file-sync` (the descriptor's sync fails with EIO after the whole record was
+  written) and `pause-after-create` (the shim announces `marker-created.at`, created exclusively, and waits, bounded,
+  for `marker-created.go`).
+- **Proof after a restart:** Sol's point for C3-3 is added to "what is not decided" above.
+- **Tests:**
+  - `test_rr5_a_file_swapped_in_while_the_shim_writes_is_neither_replaced_nor_deleted` (real): held after the create,
+    the shim's file is renamed away and a substitute put in its place; afterwards the substitute is there byte for byte,
+    the shim's complete record is in the moved file, `empty()` False, `lost()`. Fails on 1a23236 (no pause there: the
+    path is never seen created).
+  - `test_rr5_a_file_sync_failure_after_the_whole_record_is_no_proof[empty|never_started]` (real, Sol's): the file on
+    disk is complete and HMAC-valid (`read_marker` accepts it), yet `MARKER_FAILED 5`, exit 4, `empty()` False,
+    `lost()`. Both fail on 1a23236 (exit 0 / 3).
+  - `test_rr5_a_short_write_is_completed_by_the_loop` (in process, every `os.write` capped at 5 bytes): passes on
+    1a23236 too (that loop was already there): a pin.
+  - `test_rr5_write_marker_and_all_it_calls_never_unlink_rename_link_or_stage` (AST): `write_marker` and every
+    groupshim function it calls (transitively: `_fullsync`, `_close`) name none of `os.unlink`, `os.remove`,
+    `os.rename`, `os.replace`, `os.link`, `os.symlink`, `os.rmdir`, `os.removedirs`, `os.renames`, `os.truncate`,
+    `os.ftruncate`, `shutil`, `tempfile`; the one open of `path` has `O_CREAT`, `O_EXCL` and `O_NOFOLLOW`, and the only
+    other open is the directory's, read-only. Module-wide, groupshim never unlinks, removes or replaces, and renames
+    only in its two test-gate announcers (`Shim._gate`, `_child_gate`). Fails on 1a23236 (`os.link`).
+  - Changed: `test_r4_..._said_as_unsynced[file]` (the file's own sync fails: exit 4, the complete file left, no temp
+    file) fails on 1a23236. Removed: round 1's `test_rr1_a_temp_name_the_shim_did_not_create_is_never_unlinked` (there
+    is no temp name any more). Round 1's `test_rr1_publishing_never_replaces_a_file_at_the_marker_path` stands as the
+    "already there" case.
+
+#### Mutation check (review round 2)
+
+The GS and SC rows stay 72; every anchor occurs exactly once (the scratch check). The script was not run here; each
+new row was applied by hand and caught: the exclusive create by both `test_rr1_publishing_...` cases, the file-sync row
+by both `test_rr5_a_file_sync_...` cases, the unlink row by those and the AST pin.
+- **New (3):** "C3-2a R5 the marker is created exclusively"; "C3-2a R5 the shim never unlinks"; "C3-2a R5 a
+  file-sync failure is not a proof-bearing exit".
+- **Removed (3):** "C3-2a R1 publishing never replaces a file" and "C3-2a R1 only a temp file this publisher created is
+  unlinked" (no link, no temp file); "C3-1R4 a temp-file sync failure publishes nothing (re-anchored: C3-2a review round
+  1)" (replaced by the file-sync row).
