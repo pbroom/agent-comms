@@ -2,7 +2,7 @@
 (never a working tree), the steering tests run first and, only if they did not catch it, the wider tests; the file
 restored after each. The rows are review rounds 2 to 10's (DESIGN_NOTES "Mid-turn steering, step 3", each round's
 "Mutation check") and the enabling PR's ("Enabling Claude steering"): each is (file, name, the exact text, what replaces it); a row whose text is no longer there once
-is reported STALE.
+is reported STALE. (Ownership C3-1) Rows on the shim (GS, SC) run only tests/test_groupshim.py (`ONLY`).
 
     git archive HEAD | tar -x -C /tmp/export
     python scripts/steering-mutation-check.py /tmp/export [ROW|ROW...] > results.txt
@@ -15,7 +15,8 @@ from pathlib import Path
 
 FILES = {"A": "agent_comms/providers/claude.py", "H": "agent_comms/session_host.py", "ST": "agent_comms/hosted_steer.py",
          "HS": "agent_comms/hosted.py", "NS": "agent_comms/node_sessions.py", "API": "agent_comms/api.py",
-         "G": "agent_comms/node_groups.py", "D": "agent_comms/dispatch.py", "N": "agent_comms/node.py"}
+         "G": "agent_comms/node_groups.py", "D": "agent_comms/dispatch.py", "N": "agent_comms/node.py",
+         "GS": "agent_comms/groupshim.py", "SC": "agent_comms/shimchild.py"}
 ROWS = [('A', "F init naming S in N's bracket is a contradiction", '                if names_s:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")', '                if False:\n                    self._contradict("an init naming the steer inside the turn\'s own bracket")'),
     ('A', "F S's init: no origin", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and scalar is None'),
     ('A', "F S's init: no scalar", 'exact = shaped and listed == [s_] and scalar is None and quiet', 'exact = shaped and listed == [s_] and quiet'),
@@ -254,7 +255,41 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('G', 'C1R6 the rule releases only on proof (re-anchored)', '                proved = proof() is True', '                proved = True'),
     ('N', 'C1R6 the deadline ends the watch (re-anchored)', '            left = deadline - self.clock()\n            if left <= 0:\n                break\n            self.sleep(min(POST_KILL_STEP, left))', '            left = deadline - self.clock()\n            self.sleep(min(POST_KILL_STEP, max(left, POST_KILL_STEP)))'),
     ('N', "C1R6 the node's watch covers the sessions (re-anchored)", '            if not waiting and not (others is not None and others(max(left, 0.0))):', '            if not waiting:'),
-    ('H', 'C1R6 R7-2 the replay after the last SIGKILL, not before (re-anchored)', '            undivert()      # (ruling R7-2) the last SIGKILL attempt is made: the deferred lines are written now\n            # (C1, review rounds 4 and 5', '            # (C1, review rounds 4 and 5')]
+    ('H', 'C1R6 R7-2 the replay after the last SIGKILL, not before (re-anchored)', '            undivert()      # (ruling R7-2) the last SIGKILL attempt is made: the deferred lines are written now\n            # (C1, review rounds 4 and 5', '            # (C1, review rounds 4 and 5'),
+    ('GS', 'C3-1 the latch comes before the reap', '        self.latched = True             # signalling OFF, for good, BEFORE the anchor goes\n        self._reap()', '        self._reap()\n        self.latched = True'),
+    ('GS', 'C3-1 every signal asks the anchor first', '        if not self.anchored():\n            self.emit(f"REFUSED {name}")\n            return False', '        if False:\n            self.emit(f"REFUSED {name}")\n            return False'),
+    ('GS', 'C3-1 the anchor needs the CLI unreaped', '        return self.pgid is not None and not self.reaped and not self.latched', '        return self.pgid is not None and not self.latched'),
+    ('GS', 'C3-1 the anchor needs signalling not latched off', '        return self.pgid is not None and not self.reaped and not self.latched', '        return self.pgid is not None and not self.reaped'),
+    ('GS', 'C3-1 a KILL request waits for the first TERM attempt + the grace', '        if self.clock() >= due:\n            self._kill_now()', '        if True:\n            self._kill_now()'),
+    ('GS', 'C3-1 the one KILL sender refuses before the grace', '        if self.first_term_at is None or now < self.first_term_at + self.grace:', '        if self.first_term_at is None:'),
+    ('GS', 'C3-1 an early KILL is remembered', '            self.kill_due = due if self.kill_due is None else min(self.kill_due, due)', '            pass'),
+    ('GS', 'C3-1 the grace runs from the TERM attempt, sent or failed', '        if sig == signal.SIGTERM and self.first_term_at is None:\n            self.first_term_at = self.clock()       # the ATTEMPT starts the grace, whatever it answers\n        try:\n            self.killpg(self.pgid, sig)\n', '        try:\n            self.killpg(self.pgid, sig)\n            if sig == signal.SIGTERM and self.first_term_at is None:\n                self.first_term_at = self.clock()\n'),
+    ('GS', 'C3-1 KILL repeated every grace after EOF', '        if self._signal(signal.SIGKILL) and self.eof:', '        if self._signal(signal.SIGKILL) and False:'),
+    ('GS', 'C3-1 EOF stops the group', '        self.diag("EOF on the command pipe: stopping the group (TERM now, KILL after the grace, repeated)")\n        self._kill_request()', '        self.diag("EOF on the command pipe: stopping the group (TERM now, KILL after the grace, repeated)")'),
+    ('GS', 'C3-1 a failed listing is never empty', '        if members is None or not set(members) <= {self.pgid} or self.waitid(self.pgid) is None:', '        if members is not None and (not set(members) <= {self.pgid} or self.waitid(self.pgid) is None):'),
+    ('GS', 'C3-1 a listed member is never empty', '        if members is None or not set(members) <= {self.pgid} or self.waitid(self.pgid) is None:', '        if members is None or self.waitid(self.pgid) is None:'),
+    ('GS', 'C3-1 the leader is a confirmed zombie', '        if members is None or not set(members) <= {self.pgid} or self.waitid(self.pgid) is None:', '        if members is None or not set(members) <= {self.pgid}:'),
+    ('GS', 'C3-1 absence is required after the reap', '        if after is None or after != ():', '        if False:'),
+    ('GS', 'C3-1 a failed post-reap listing is unproved', '        if after is None or after != ():', '        if after is not None and after != ():'),
+    ('GS', "C3-1 the marker carries this launch's nonce", '        record = {"v": PROTOCOL, "nonce": self.nonce, "boot": self.boot,', '        record = {"v": PROTOCOL, "nonce": "0" * 32, "boot": self.boot,'),
+    ('GS', 'C3-1 the marker carries this boot', '        record = {"v": PROTOCOL, "nonce": self.nonce, "boot": self.boot,', '        record = {"v": PROTOCOL, "nonce": self.nonce, "boot": "1.000000",'),
+    ('GS', 'C3-1 never started publishes the bound marker', '        self.emit(f"NOGO {reason}")\n        if not self.publish("never_started"):\n            return EXIT_MARKER_FAILED', '        self.emit(f"NOGO {reason}")'),
+    ('GS', 'C3-1 a partial GO never starts', '                    raise NoGo("partial" if self.buf else "eof")', '                    if self.buf:\n                        return parse_go(self.buf)\n                    raise NoGo("eof")'),
+    ('GS', 'C3-1 the event pipe is non-blocking', '        for fd in (shim.cmd_fd, shim.event_fd):\n            os.fstat(fd)\n            os.set_inheritable(fd, False)\n            os.set_blocking(fd, False)', '        for fd in (shim.cmd_fd, shim.event_fd):\n            os.fstat(fd)\n            os.set_inheritable(fd, False)\n            os.set_blocking(fd, fd != shim.event_fd)'),
+    ('GS', "C3-1 the shim drops its copies of the CLI's stdio", "            os.close(fd)        # the CLI's stdio is the CLI's alone now", '            pass'),
+    ('GS', 'C3-1 the CLI leads its own session', '        os.setsid()\n        os.write(hs_w, b"S")', '        os.write(hs_w, b"S")'),
+    ('GS', "C3-1 a direct child's SIGPIPE and SIGXFSZ", '        for s in (signal.SIGPIPE, signal.SIGXFSZ):      # what', '        for s in ():      # what'),
+    ('GS', "C3-1 the node's ignored signals, ignored for the CLI", '        for s in ignored:                               # ignored', '        for s in ():                               # ignored'),
+    ('GS', 'C3-1 the shim keeps SIGCHLD at its default', '    if signal.SIGCHLD in ignored:\n        signal.signal(signal.SIGCHLD, signal.SIG_DFL)', '    if False:\n        signal.signal(signal.SIGCHLD, signal.SIG_DFL)'),
+    ('SC', 'C3-1 the proof checks the nonce', '            and rec.get("nonce") == nonce and', '            and'),
+    ('SC', 'C3-1 the proof checks the boot', 'and rec.get("boot") == boot\n', '\n'),
+    ('SC', 'C3-1 the EMPTY event is no proof', '            self._proved = marker_proves(self.marker, self.nonce, self.boot)', '            self._proved = ("EMPTY",) in self.events or marker_proves(self.marker, self.nonce, self.boot)'),
+    ('SC', "C3-1 the events are drained before the shim's exit is said", '        for _ in range(1024):\n            if self._pump():', '        for _ in range(0):\n            if self._pump():'),
+    ('SC', 'C3-1 lost only once the shim has exited', '        if self._drained_exit() is None:\n            return False', '        if self._drained_exit() is None and False:\n            return False'),
+    ('SC', 'C3-1 a stop before GO is never-start', '            if not self._went:\n                self._close_cmd()', '            if False:\n                self._close_cmd()'),
+    ('SC', 'C3-1 the command write is pinned under the lock', '    def _command(self, word: bytes) -> None:\n        with self._wlock:', '    def _command(self, word: bytes) -> None:\n        if True:')]
+# (Ownership C3-1) The shim's rows run only its own tests: nothing else imports groupshim or shimchild yet.
+ONLY = {"GS": ["tests/test_groupshim.py"], "SC": ["tests/test_groupshim.py"]}
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py", "tests/test_ownership_c1.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",
         "tests/test_session_restart_hub.py", "tests/test_structured_results.py", "tests/test_hosted_sessions.py",
@@ -277,7 +312,7 @@ def main() -> int:
         path.write_text(text.replace(old, new, 1))
         try:
             failed = []
-            for sel in (FIRST, REST):
+            for sel in ((ONLY[key],) if key in ONLY else (FIRST, REST)):
                 r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-x", *sel],
                                    cwd=root, capture_output=True, text=True, timeout=1800)
                 failed = sorted(set(re.findall(r"^FAILED (\S+)", r.stdout, re.M)))
