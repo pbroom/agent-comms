@@ -233,7 +233,7 @@ def test_launch_no_registry_entry_exists_before_the_durable_commit(env):
     def pause(name, launch):
         at[name] = (env.ids(), env.groups.state(launch.token))
     launch = env.launch(["/bin/sh", "-c", "exit 0"], pause=pause)
-    assert launch.outcome == shimlaunch.STARTED and env.owners.parked() == []
+    assert launch.outcome == shimlaunch.STARTED and env.owners.parked() == [launch], "(C3-2b-2 Part 0.1) parked"
     lid = launch.launch_id
     assert at["started"] == ([], None)
     assert at["committed"] == ([lid], None), "the durable record, and no registry entry yet"
@@ -241,6 +241,7 @@ def test_launch_no_registry_entry_exists_before_the_durable_commit(env):
     assert at["went"] == at["handed"] == ([lid], PROVISIONAL)
     assert env.groups.state(launch.token) == PROVISIONAL, "returned still fencing"
     assert launch.accept(env.groups) is True and env.groups.state(launch.token) == LIVE
+    assert env.owners.parked() == [], "(Part 0.1) the receiver's own once accepted"
     assert shim_exit(launch.handle) == groupshim.EXIT_EMPTY
     assert env.release(launch) == RELEASED and env.ids() == [] and env.groups.entries == {}
 
@@ -593,20 +594,22 @@ def test_a_failed_record_removal_keeps_the_fence_and_reports_failure(env, monkey
 
 
 def test_release_takes_the_record_then_the_reservation_and_only_on_the_proof(env):
-    """While the CLI runs there is no evidence: nothing is released (the entry becomes HELD; the record stays). After
-    its whole life the release pair holds: at an injected pause between the two steps the record is already removed
-    while the reservation is still installed (fenced); then the reservation is gone and the checkout admits again."""
+    """While the CLI runs there is no evidence: nothing is released (C3-2b-2 Part 0.3: the shim runs, so the registry
+    is not even touched: the accepted entry stays LIVE; the record stays). After its whole life the release pair
+    holds: at an injected pause between the two steps the record is already removed while the reservation is still
+    installed (fenced by the release rule's admission fence); then the reservation is gone and the checkout admits
+    again."""
     go_on = env.kit.path("go-on")
     launch = env.launch(env.kit.argv(until=go_on))
-    assert wait_event(launch.handle, "STARTED")
+    assert launch.accept(env.groups) and wait_event(launch.handle, "STARTED")
     assert env.release(launch) == KEPT
-    assert env.groups.state(launch.token) == HELD and env.ids() == [launch.launch_id]
+    assert env.groups.state(launch.token) == LIVE and env.ids() == [launch.launch_id]
     Path(go_on).write_text("")
     assert shim_exit(launch.handle) == groupshim.EXIT_EMPTY
     between = []
-    assert env.release(launch, pause=lambda name, la: between.append((name, env.ids(), env.groups.state(la.token)))) \
-        == RELEASED
-    assert between == [("record-removed", [], HELD)], between
+    assert env.release(launch, pause=lambda name, la: between.append((name, env.ids(), env.groups.state(la.token),
+                                                                      env.fenced()))) == RELEASED
+    assert between == [("record-removed", [], FENCED, True)], between
     assert env.groups.entries == {} and not env.groups.blocked(env.cwd)
 
 
@@ -644,11 +647,15 @@ def test_nothing_is_released_on_lost_or_unknown(env, how):
 
 def test_a_cli_that_exits_while_a_member_of_its_group_survives_is_not_released_until_the_member_is_gone(env):
     member_go = env.kit.path("member-go")
+    """The CLI exited; a member of its group lives, so the shim waits (it runs): no evidence, KEPT, and (C3-2b-2 Part
+    0.3) the registry is not touched by `release` (fencing that checkout is the session host's own step, its reap);
+    released once the member is gone and the shim proved it."""
     launch = env.launch(env.kit.argv(member={"until": member_go}))
+    assert launch.accept(env.groups)
     assert wait_for(lambda: launch.handle.poll() is not None), "the CLI exited"
     for _ in range(3):
         assert env.release(launch) == KEPT, "a member survives: no proof"
-        assert env.groups.state(launch.token) == HELD and env.ids() == [launch.launch_id]
+        assert env.groups.state(launch.token) == LIVE and env.ids() == [launch.launch_id]
     Path(member_go).write_text("")
     assert shim_exit(launch.handle) == groupshim.EXIT_EMPTY
     assert env.release(launch) == RELEASED and env.ids() == [] and env.groups.entries == {}
@@ -682,8 +689,9 @@ def test_r5_launch_returns_with_the_entry_still_provisional_and_only_accept_make
     launch = env.launch(env.kit.argv(wait_abort=True))
     assert launch.outcome == shimlaunch.STARTED and launch.handle.went
     assert env.groups.state(launch.token) == PROVISIONAL and env.fenced(), env.groups.state(launch.token)
-    assert launch.lifecycle == shimlaunch.Launch.HANDED_OFF and env.owners.parked() == []
+    assert launch.lifecycle == shimlaunch.Launch.HANDED_OFF and env.owners.parked() == [launch]
     assert launch.accept(env.groups) is True and env.groups.state(launch.token) == LIVE
+    assert env.owners.parked() == []
     assert env.groups.start(env.cwd, ("run", "sibling"), lambda: "spawned") == (True, "spawned"), "C1's sharing"
     env.groups._gone(("run", "sibling"))
     assert launch.accept(env.groups) is False and env.groups.state(launch.token) == LIVE
@@ -914,3 +922,113 @@ def test_a_launch_into_a_blocked_checkout_starts_nothing(env):
     launch = env.launch(["/bin/sh", "-c", "exit 0"])
     assert launch.outcome == shimlaunch.NOT_ADMITTED and launch.handle is None and env.ids() == []
     assert env.owners.parked() == []
+
+
+# ---------------------------------------------------------------- C3-2b-2, Part 0: the independent review's findings
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "refused", "raised"])
+def test_part0_1_a_started_launch_stays_parked_until_accept_answers(env, outcome):
+    """(Part 0.1) Between `launch()` returning STARTED and the receiver storing it, the launch had no owner: it was
+    unparked before its return. Now it stays parked in `Owners` (findable: a shutdown can stop and await it) while
+    HANDED_OFF, and the abandoned-only sweep still SKIPS it and changes nothing. `accept()` unparks it, whatever it
+    answers (True; False, the entry fenced meanwhile; or raised): from then on the receiver owns it."""
+    launch = env.launch(env.kit.argv(wait_abort=True))
+    assert launch.outcome == shimlaunch.STARTED and launch.lifecycle == shimlaunch.Launch.HANDED_OFF
+    assert env.owners.parked() == [launch], "findable from the return until the receiver accepts it"
+    assert shimlaunch.sweep_abandoned(env.groups, env.journal, env.owners) == {launch.launch_id: shimlaunch.SKIPPED}
+    assert env.groups.state(launch.token) == PROVISIONAL and launch.token not in env.groups.held
+    if outcome == "accepted":
+        assert launch.accept(env.groups) is True and env.groups.state(launch.token) == LIVE
+    elif outcome == "refused":
+        env.groups.stopping(launch.token)
+        assert launch.accept(env.groups) is False
+    else:
+        def pause(name, la):
+            if name == "accepting":
+                raise Crash()
+        with pytest.raises(Crash):
+            launch.accept(env.groups, pause=pause)
+        assert not launch.is_live(env.groups)
+    assert env.owners.parked() == [], "the receiver owns it now"
+    stop_and_release(env, launch)
+
+
+def test_part0_1_a_parked_handed_off_launch_released_by_its_receiver_is_unparked(env):
+    """(Part 0.1) A receiver that releases its own launch without ever accepting it (it stopped it first) unparks it
+    with the release, as before."""
+    launch = env.launch(env.kit.argv(wait_abort=True))
+    assert env.owners.parked() == [launch]
+    stop_and_release(env, launch)
+    assert env.owners.parked() == []
+
+
+def test_part0_2_an_uncommitted_launch_whose_shim_was_not_reaped_is_released_without_a_record(env, monkeypatch):
+    """(Part 0.2) The commit raised before it created anything (the journal directory never made), and the shim
+    could not be reaped within the bound before `launch` raised: the owner stays parked, ABANDONED, with no record.
+    Once the shim exits on its EOF, its release must NOT go through the record's path (there is no record): it was
+    decided from `record is None`, but the record object is built before the commit, so the release asked for the
+    proof, tried to remove a record from a directory that does not exist, failed, and left the checkout HELD for
+    good. Now `committed` decides, the release reaps the shim and answers RELEASED, and no registry entry ever
+    exists."""
+    removes = []
+    real_remove = env.journal.remove
+    monkeypatch.setattr(env.journal, "remove", lambda lid: (removes.append(lid), real_remove(lid)))
+
+    def commit(record):
+        raise OSError(28, "injected ENOSPC before anything is created")
+    monkeypatch.setattr(env.journal, "commit", commit)
+
+    def abandon(self, timeout):
+        self.close_commands()           # (EOF: the shim exits by itself; but not within the bound, as injected)
+        return None
+    monkeypatch.setattr(ShimChild, "abandon_before_go", abandon)
+    got = []
+    with pytest.raises(OSError):
+        env.launch(env.kit.argv(wait_abort=True), pause=lambda name, la: got.append(la))
+    launch = got[0]
+    assert launch.record is not None and not launch.committed
+    assert env.owners.parked() == [launch] and launch.lifecycle == shimlaunch.Launch.ABANDONED
+    assert not os.path.exists(env.journal.directory) and env.groups.entries == {}
+    assert shim_exit(launch.handle) == groupshim.EXIT_NOGO
+    assert shimlaunch.sweep_abandoned(env.groups, env.journal, env.owners) == {launch.launch_id: RELEASED}
+    assert env.groups.entries == {} and env.groups.held == set() and not env.groups.blocked(env.cwd)
+    assert removes == [], "no record was ever committed: none is removed"
+    assert env.owners.parked() == [] and env.release(launch) == ALREADY
+
+
+def test_part0_3_releasing_an_accepted_launch_whose_shim_runs_keeps_it_and_leaves_the_registry_alone(env):
+    """(Part 0.3) While the shim runs there can be no evidence (both `empty()` and `refused()` need its terminal
+    status): `release()` answers KEPT and does not touch the registry. Before, it went through the release rule,
+    fenced the healthy LIVE group and left it HELD (proof-only: never stopped by its normal path, a sibling refused)."""
+    launch = env.launch(env.kit.argv(wait_abort=True))
+    assert launch.accept(env.groups) is True and wait_event(launch.handle, "STARTED")
+    for _ in range(3):
+        assert env.release(launch) == KEPT
+        assert env.groups.state(launch.token) == LIVE and launch.token not in env.groups.held
+    assert env.groups.start(env.cwd, ("run", "sibling"), lambda: "spawned") == (True, "spawned"), "nothing fenced"
+    env.groups._gone(("run", "sibling"))
+    assert env.ids() == [launch.launch_id]
+    stop_and_release(env, launch)
+
+
+@pytest.mark.parametrize("word", ["TERM", "KILL"])
+@pytest.mark.parametrize("error", [OSError(9, "injected EBADF"), RuntimeError("injected")])
+def test_part0_4_a_command_never_raises_before_go(kit, word, error):
+    """(Part 0.4) Before GO a command closes the command pipe ("never start"); that close was outside the `try`, so a
+    failing close raised out of `request_term`/`request_kill`. Now it answers CLOSED (classify through the handle)."""
+    c = kit.start()
+    assert not c.went
+    real_close = c.close_commands
+
+    def close():
+        real_close()
+        raise error
+    c.close_commands = close
+    ask = shimlaunch.request_term if word == "TERM" else shimlaunch.request_kill
+    try:
+        got = ask(c)
+    finally:
+        del c.close_commands            # (the kit's cleanup uses the real one)
+    assert got == shimlaunch.CLOSED
+    assert shim_exit(c) == groupshim.EXIT_NOGO, c.events

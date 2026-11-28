@@ -145,6 +145,25 @@ def test_an_unreadable_journal_closes_admission_for_the_whole_node_and_says_so_o
     assert len([rec for rec in caplog.records if "journal" in rec.getMessage()]) == 1, "said once"
 
 
+@pytest.mark.parametrize("stray", [".DS_Store", "notes.txt"])
+def test_part0_5_a_ds_store_does_not_close_admission_and_any_other_stray_file_does(nenv, stray):
+    """(C3-2b-2, Part 0.5) A Finder `.DS_Store` in the journal directory (a person looked at it) is ignored: the node
+    restores the record beside it HELD and admits work elsewhere. Any other stray file still closes admission for the
+    whole node, as before."""
+    other = Path(nenv.node_dir).parent / "another-checkout"
+    other.mkdir()
+    j = journal_of(nenv.node.log_dir)
+    r = record_for(nenv.node_dir)
+    j.commit(r)
+    (Path(j.directory) / stray).write_bytes(b"\x00\x00\x00\x01Bud1")
+    node = fresh_node(nenv)
+    if stray == ".DS_Store":
+        assert node.groups.closed is None and not node.groups.blocked(str(other))
+        assert node.groups.state(r.token) == node.groups.HELD
+    else:
+        assert node.groups.closed is not None and node.groups.blocked(str(other))
+
+
 # ---------------------------------------------------------------- the legacy numeric recovery never sees them
 
 

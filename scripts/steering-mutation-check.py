@@ -411,7 +411,7 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('GR', 'C3-2b-1 closed admission blocks every directory', '            if self.closed is not None:     # (C3-2b-1: admission closed: every directory)\n                return True', '            if False:     # (C3-2b-1: admission closed: every directory)\n                return True'),
     ('GR', 'C3-2b-1 a restored reservation is HELD', '                self.entries.setdefault(k, {})[token] = [self.HELD, cwd]\n            self.held.add(token)', '                self.entries.setdefault(k, {})[token] = [self.LIVE, cwd]'),
     ('NR', 'C3-2b-1 restore precedes admission (the restore at node start)', '        closed = shimjournal.restore(self.groups, log_dir)\n', '        closed = None\n'),
-    ('SL', 'C3-2b-1 the record is committed before GO (re-anchored: C3-2b-1 r1)', '        journal.commit(out.record)\n        step = _COMMITTED', '        pass\n        step = _COMMITTED'),
+    ('SL', 'C3-2b-1 the record is committed before GO (re-anchored: C3-2b-1 r1, C3-2b-2)', '        journal.commit(out.record)\n        out.committed = True', '        pass\n        out.committed = True'),
     ('SL', 'C3-2b-1 no registry entry before the commit (re-anchored: C3-2b-1 r2)', '    if groups.blocked(cwd):\n        out.outcome = NOT_ADMITTED\n', '    if not groups.start(cwd, out.token, lambda: None, k=k)[0]:\n        out.outcome = NOT_ADMITTED\n'),
     ('SL', 'C3-2b-1 a failure before the commit reaps the shim (re-anchored: C3-2b-1 r1)', '        if handle is None or handle.abandon_before_go(ABANDON_SECONDS) is not None:\n            owners.unpark(out)', '        if True:\n            owners.unpark(out)'),
     ('SL', 'C3-2b-1 a failed or ambiguous GO keeps the reservation, fenced (re-anchored: C3-2b-1 r1)', '            out.handle.close_commands()\n            groups.stopping(out.token)', '            out.handle.close_commands()'),
@@ -454,7 +454,17 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('N', 'LATCH the latch is not cleared before the final wait', '        latch.latch()\n        latch.say()\n        _exit_if_stalled(0)', '        latch.latched = False\n        latch.say()\n        _exit_if_stalled(0)'),
     ('N', 'LATCH SIGINT is covered (re-anchored: R1)', '        signal.signal(signal.SIGINT, latch.on_signal)', '        pass'),
     ('N', 'an inherited ignored SIGINT stays ignored', '    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:\n', '    if True:\n'),
-    ('N', 'LATCH the further signals are said', '            if self.further:\n', '            if False:\n')]
+    ('N', 'LATCH the further signals are said', '            if self.further:\n', '            if False:\n'),
+    # (Ownership C3-2b-2, Part 0: the independent review's findings on the helpers)
+    ('SL', 'C3-2b-2 P0.1 a STARTED launch stays parked until accept', '        _move(out, Launch.HANDED_OFF, (Launch.ACTIVE,))\n        _pause(pause, "handed", out)', '        owners.unpark(out)\n        _move(out, Launch.HANDED_OFF, (Launch.ACTIVE,))\n        _pause(pause, "handed", out)'),
+    ('SL', 'C3-2b-2 P0.1 accept unparks whatever it answers', '                    self.owners.unpark(self)    # (Part 0.1', '                    pass    # (Part 0.1'),
+    ('SL', 'C3-2b-2 P0.2 release decides "has a record" from committed', '        if not launch.committed:\n            # (Part 0.2)', '        if launch.record is None:\n            # (Part 0.2)'),
+    ('SL', 'C3-2b-2 P0.2 a commit that raised with its file left counts as committed', '    out.committed = True    # (Part 0.2: a record is, or may be, at its path', '    pass    # (Part 0.2: a record is, or may be, at its path'),
+    ('SJ', 'C3-2b-2 P0.2 a missing journal directory is already gone', '        except FileNotFoundError:\n            # (C3-2b-2, Part 0.2) No journal directory', '        except NotADirectoryError:\n            # (C3-2b-2, Part 0.2) No journal directory'),
+    ('SL', 'C3-2b-2 P0.3 a running shim is KEPT with the registry untouched', '        if handle is not None and handle.shim_poll() is None:\n            # (C3-2b-2, Part 0.3)', '        if False:\n            # (C3-2b-2, Part 0.3)'),
+    ('SL', 'C3-2b-2 P0.4 a command before GO never raises', '    except Exception:\n        return CLOSED                       # (C3-2b-2, Part 0.4', '    except ZeroDivisionError:\n        return CLOSED                       # (C3-2b-2, Part 0.4'),
+    ('SJ', "C3-2b-2 P0.5 Finder's .DS_Store is ignored", '            if name == FINDER_FILE:', '            if False:'),
+    ('SJ', 'C3-2b-2 P0.5 only that exact name is ignored', '            if name == FINDER_FILE:', '            if name.startswith(".") or "DS_Store" in name:')]
 # (Ownership C3-1) The shim's rows run only its own tests: nothing else imports groupshim or shimchild yet.
 ONLY = {"GS": ["tests/test_groupshim.py"], "SC": ["tests/test_groupshim.py"],
         # (Ownership C3-2b-1) the journal, the restore and the helpers have their own tests; the handle's host locks

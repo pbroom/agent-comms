@@ -68,6 +68,13 @@ class Launch:
     outcome: str | None = None
     error: BaseException | None = None      # GO's failure (GO_FAILED), or what `launch` raised (FAILED)
     lifecycle: str = "active"               # (R6) ACTIVE, HANDED_OFF, ABANDONED, RELEASED: under `state_lock` only
+    # (C3-2b-2, Part 0.2) Whether a record of this launch is, or may be, on disk: set when `journal.commit` RETURNED,
+    # or when a commit that raised left something at the record's path (`_settle`'s (b)). `release` decides "has a
+    # record" from this, never from `record` (which is built before the commit is entered).
+    committed: bool = False
+    # (C3-2b-2, Part 0.1) The table this launch is parked in (`launch` sets it): `accept` unparks it there, whatever it
+    # answers, so a STARTED launch stays findable from `launch`'s return until its receiver has taken it.
+    owners: Any = field(default=None, repr=False, compare=False)
     # (Review rounds 1 and 2, R4.2 and R6) This launch's own lock: its lifecycle, its release and its `accept`. A host
     # lock (a native RLock, entered only as `with hostlog.BOUNDARY, launch.state_lock:`); I/O (the proof's reads, the
     # record's removal) runs under it, never under the registry's; the registry's lock is taken inside it, never the
@@ -93,6 +100,9 @@ class Launch:
         its NORMAL stop and shutdown paths, as any LIVE group (the exception is usually the node's own shutdown); False,
         it is fenced (HELD), and is stopped and released on its proof like a launch whose `accept` answered False.
 
+        (C3-2b-2, Part 0.1) A STARTED launch stays parked in its `Owners` from `launch`'s return until here: `accept`
+        unparks it whatever it answers (True, False, or raised), since the receiver stored it before calling.
+
         `pause(step, launch)`: TEST-ONLY, at "accepting" (before `confirm_live`) and "accepted" (its result
         recorded)."""
         with hostlog.BOUNDARY, self.state_lock:
@@ -106,6 +116,9 @@ class Launch:
             except BaseException:
                 groups.hold_if_provisional(self.token)
                 raise
+            finally:
+                if self.owners is not None:
+                    self.owners.unpark(self)    # (Part 0.1: the receiver, which stored it first, owns it now)
 
     def is_live(self, groups: node_groups.Groups) -> bool:
         """(Review round 3, R7) Whether this launch's entry is LIVE in the registry (a query under its lock): what the
@@ -125,8 +138,9 @@ def _move(launch: Launch, to: str, frm: tuple[str, ...]) -> bool:
 class Owners:
     """(Review round 1, R4) Where the node finds every launch it must still ask for proof: each `Launch` is parked
     here BEFORE its shim can exist, and stays while it is in state (b) (committed and fenced) or while its shim,
-    abandoned before GO, could not be reaped; it leaves when `launch` hands it to its caller (STARTED, (c)) or reaches
-    state (a) (nothing exists), or when `release` lets it go. One dict keyed by launch id: one store, one pop, one
+    abandoned before GO, could not be reaped; (C3-2b-2, Part 0.1) a STARTED launch, (c), stays too, until its
+    receiver's `accept()` (whatever it answers); it leaves then, or when `launch` reaches state (a) (nothing exists),
+    or when `release` lets it go. One dict keyed by launch id: one store, one pop, one
     copy each (atomic under the GIL), no lock and no I/O. The node keeps ONE `Owners`, beside its journal (the wiring
     PR), and sweeps it with `sweep_abandoned` on its passes (review round 3, R8: ABANDONED launches only).
 
@@ -168,7 +182,8 @@ def launch(*, groups: node_groups.Groups, journal: Journal, owners: Owners, mark
        the checkout; no I/O. Refused: REFUSED_AFTER_COMMIT (no GO; the writer closed; a HELD reservation for the
        record; the owner parked).
     5. GO, OUTSIDE the registry lock (bounded by `go_timeout`). When GO is CONFIRMED whole the launch is STARTED and
-       handed to the caller (unparked, HANDED_OFF) with its entry STILL PROVISIONAL: nothing in `launch` makes it
+       handed to the caller (HANDED_OFF; still parked until its `accept()`, C3-2b-2 Part 0.1) with its entry STILL
+       PROVISIONAL: nothing in `launch` makes it
        LIVE (review round 2, R5). The receiver stores it where its own stop and shutdown paths will find it, THEN
        calls `Launch.accept()`, the last transition (LIVE); an `accept()` that answers False means "stopping". A GO
        that failed or is ambiguous: GO_FAILED (the entry STOPPING, the record kept, the writer closed so the shim
@@ -178,7 +193,7 @@ def launch(*, groups: node_groups.Groups, journal: Journal, owners: Owners, mark
     rounds 1 and 2, the launch-state table): (a) nothing exists (no unreaped shim, no record, no entry; the owner
     unparked; ABANDONED); (b) committed and fenced (the record, a fencing entry: PROVISIONAL, STOPPING or HELD; the
     writer closed; the owner parked in `owners`, ABANDONED, and returned when `launch` returns); (c) GO confirmed,
-    PROVISIONAL, HANDED_OFF and returned. Raised before the commit was entered: the shim abandoned before GO and
+    PROVISIONAL, HANDED_OFF, parked until `accept()`, and returned. Raised before the commit was entered: the shim abandoned before GO and
     reaped by its handle, (a). Raised by the commit: (b) if anything may be at the record's path (`Journal.exists`: a
     failed commit removes nothing, R3), else (a). Raised after the commit: the entry is made HELD (or installed HELD)
     under the registry lock, never dropped, the writer closed, (b). While `launch` runs the launch is ACTIVE: a
@@ -190,7 +205,7 @@ def launch(*, groups: node_groups.Groups, journal: Journal, owners: Owners, mark
     and "handed"."""
     k = node_groups.key(cwd)
     lid = shimjournal.new_launch_id()
-    out = Launch(launch_id=lid, token=shimjournal.token_of(lid), key=k, cwd=cwd)
+    out = Launch(launch_id=lid, token=shimjournal.token_of(lid), key=k, cwd=cwd, owners=owners)
     if groups.blocked(cwd):
         out.outcome = NOT_ADMITTED
         _move(out, Launch.ABANDONED, (Launch.ACTIVE,))     # (nothing exists: a release finds nothing to remove)
@@ -209,6 +224,7 @@ def launch(*, groups: node_groups.Groups, journal: Journal, owners: Owners, mark
                             shim_pid=out.handle.pid, shim_start=start if isinstance(start, str) else None)
         step = _COMMITTING
         journal.commit(out.record)
+        out.committed = True    # (Part 0.2: the one fact `release` reads for "has a record")
         step = _COMMITTED
         # ---- after the commit: the record is retained whatever happens, and the entry is never dropped
         _pause(pause, "committed", out)
@@ -230,7 +246,8 @@ def launch(*, groups: node_groups.Groups, journal: Journal, owners: Owners, mark
             return out
         _pause(pause, "went", out)
         out.outcome = STARTED   # (R5: the entry stays PROVISIONAL; the receiver's `accept()` makes it LIVE)
-        owners.unpark(out)      # (c): unparked while still ACTIVE, so no sweep can take it as it is handed off
+        # (c), (C3-2b-2, Part 0.1) It stays PARKED: findable (a shutdown stops and awaits it) from here until the
+        # receiver's `accept()`, which unparks it; HANDED_OFF, it is never eligible for the abandoned-only sweep.
         _move(out, Launch.HANDED_OFF, (Launch.ACTIVE,))
         _pause(pause, "handed", out)
         return out
@@ -263,6 +280,7 @@ def _settle(groups: node_groups.Groups, journal: Journal, owners: Owners, out: L
     # (b): a record is (or may be) durable. FIRST the fence (in memory, under the registry lock: an existing entry,
     # PROVISIONAL, LIVE or STOPPING, becomes HELD; with none, one is installed), THEN the writer closed (the shim
     # cleans up on EOF: never started, or its CLI stopped); the owner stays parked for the proof (`release`)
+    out.committed = True    # (Part 0.2: a record is, or may be, at its path: `release` takes the record's path)
     groups.restore_held(out.token, [out.key], out.cwd)
     if handle is not None:
         handle.close_commands()
@@ -286,8 +304,11 @@ def release(groups: node_groups.Groups, journal: Journal, owners: Owners, launch
     FIRST (`journal.remove`, inside the proof: a removal that fails is no proof, and the caller asks again), THEN the
     in-memory reservation is lifted. `lost()`, an UNKNOWN shim status, or no evidence yet (the shim still running, a
     member of its group still alive): nothing is released, the registry entry is HELD (fenced, proof-only), and the
-    caller keeps asking. A launch with no record (NOT_ADMITTED, or one whose abandoned shim was not yet reaped) is
-    released once its shim, if any, is reaped by its handle. The released owner is unparked.
+    caller keeps asking. (C3-2b-2, Part 0.3) While the shim still RUNS there can be no evidence: KEPT, and the
+    registry is not touched at all (a healthy LIVE group is never fenced here). A launch that never committed
+    (`committed` False, Part 0.2: NOT_ADMITTED, or one that failed before its commit created anything, whose
+    abandoned shim was not yet reaped) is released once its shim, if any, is reaped by its handle: no record is
+    removed and no registry entry is touched. The released owner is unparked.
 
     `pause(step, launch)`: TEST-ONLY, at "record-removed" (the record gone, the reservation still installed)."""
     with hostlog.BOUNDARY, launch.state_lock:
@@ -296,12 +317,20 @@ def release(groups: node_groups.Groups, journal: Journal, owners: Owners, launch
         if launch.lifecycle == Launch.ACTIVE:
             return KEPT
         handle = launch.handle
-        if launch.record is None:
+        if not launch.committed:
+            # (Part 0.2) No record was ever made durable (nothing was committed, and nothing a failed commit left):
+            # there is no record to remove and no entry was ever installed; released once its shim, if any, is reaped
             if handle is not None and handle.shim_poll() is None:
                 return KEPT
             launch.lifecycle = Launch.RELEASED
             owners.unpark(launch)
             return RELEASED
+        if handle is not None and handle.shim_poll() is None:
+            # (C3-2b-2, Part 0.3) The shim runs: no evidence can exist (both `empty()` and `refused()` need its own
+            # terminal status), so nothing is asked of the release rule, and the registry is NOT touched: a healthy
+            # LIVE group is never fenced or made HELD here. (Whoever must fence a checkout whose CLI ended while its
+            # group is unproved does it itself: the session host's reap.)
+            return KEPT
 
         def proof() -> bool:
             if not (handle.empty() or handle.refused()):
@@ -338,9 +367,12 @@ def sweep_abandoned(groups: node_groups.Groups, journal: Journal, owners: Owners
 
 
 def _command(handle: ShimChild, word: str) -> str:
-    if not handle.went:
-        handle.close_commands()             # (before GO a stop is "never start")
-        return CLOSED
+    try:
+        if not handle.went:
+            handle.close_commands()         # (before GO a stop is "never start")
+            return CLOSED
+    except Exception:
+        return CLOSED                       # (C3-2b-2, Part 0.4: never raised; the caller classifies)
     try:
         if word == "TERM":
             handle.terminate()
