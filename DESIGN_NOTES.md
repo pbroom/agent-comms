@@ -17811,3 +17811,43 @@ file the cleanup writes, or after 60 s. Every wait is bounded (20 s each).
 - RSS: 18.0 MiB while waiting for `GO`, and 18.1 MiB while its CLI runs. That is above the design's 10 to 15 MB
   estimate.
 
+### Mutation check (C3-1)
+
+There are 33 rows on the shim (GS) and the handle (SC). They run tests/test_groupshim.py only (the script's new
+`ONLY`), because nothing else imports these modules yet. The rows cover:
+- the latch before the reap;
+- the anchor checks before every signal (3);
+- the KILL gate: the request, the one sender, the remembered early KILL, the grace from the attempt, and the repeat
+  after EOF;
+- EOF's stop;
+- "never empty" for a failed listing, a listed member and an unconfirmed zombie;
+- the post-reap absence check and the failed post-reap listing;
+- the marker's nonce and boot, on both sides;
+- `NOGO`'s marker and a partial `GO`;
+- the non-blocking event pipe;
+- the stdio copies, the CLI's session, and the dispositions (3);
+- `EMPTY` is no proof, the drain before the exit, `lost()` only after the exit, a stop before `GO`, the pinned write,
+  and `poll` instead of `select`.
+
+**On 5f402fe** (its code is 3ecb22c's; load averages 24 to 36): 32 of 33 are caught.
+- **Missed, and equivalent:** "the shim keeps SIGCHLD at its default" (see the limits above).
+- **One row was written backwards at first.** "The event pipe is non-blocking" made the COMMAND fd blocking instead.
+  Corrected, it was re-run alone and is caught by the full-event-pipe test, as intended.
+
+The results are in scripts/steering-mutation-results.txt.
+
+### Runs (C3-1)
+
+- **The new tests alone, on 5f402fe:** 48 passed in 69 s, at a load average of about 25. A scratch pytest plugin
+  checked, after each test, the 102 pids the tests created (and anything in the process groups they lead, by
+  `group_members`): none was left. It only lists; it signals nothing.
+- **Interrupted by a reboot of the main laptop (about 20:23):** the rows' first run on 3ecb22c.
+- **Earlier, on 7efd2ac** (before the `poll` fix):
+  - the parallel suite: 5501 passed, 10 skipped, 2 failed, at a load average of about 8. Both failures were timing
+    under load, in modules that do not import the new code. `test_output_schema`'s worst-case verdict took 67 ms per
+    call against 50 ms; it passes alone. The in-suite stand-in e2e test hit its 300 s limit; alone it failed the same
+    way at load averages of 13 to 22, as C1 round 1 recorded.
+  - one serial suite: 5501 passed, 10 skipped, 2 failed. One was that same e2e timeout; the other was
+    `test_c4_...[overlong]`, which found the `select` bug fixed in 3ecb22c.
+- The parallel run on the final head is in the hand-back.
+
