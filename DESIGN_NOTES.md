@@ -19469,3 +19469,17 @@ The C3-1 rows are now 52:
   - R5: the best-effort diagnostics start, RELEASE before `chdir`, the child closing the shim's ends first, the
     contained kqueue wait;
   - R6: the watch installed before RELEASE is written.
+
+**On ff6bf5c** (round 2, merged with origin/main 9388477, which is #123; load averages about 7): 51 of 52 are caught.
+The one missed is "the shim keeps SIGCHLD at its default", equivalent as before. The results are in
+scripts/steering-mutation-results.txt.
+
+#### After the merge of #123 (host-side logging)
+
+- **The shim's imports.** `node_groups` now imports `hostlog`, so the shim imports `agent_comms.hostlog` (and
+  `logging`) too.
+  - Importing it starts no thread. Its `atexit` hook never runs in the shim, which ends with `os._exit`.
+  - The shim never logs through it: it calls only `group_members`, which does not log.
+  - Measured again (20 shims, load average 6.1): `start()` to "ready", median 56.2 ms; to `STARTED`, median 76.6 ms;
+    the publish, median 9.5 ms; RSS 18.9 MiB waiting and 19.0 MiB running; 79 modules.
+- **The handle.** It does not log, and its locks are plain `with` locks (see "What C3-2 must replace").
