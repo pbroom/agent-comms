@@ -837,3 +837,13 @@ rows: 52
 stale or broken: []
 missed: ['C3-1 the shim keeps SIGCHLD at its default']
 exit 0
+
+# Ownership C3-1, after Sol's approval of 05fbde5 (START_UNKNOWN): the one new row, on d371c4f. Caught first, in file
+# order, by an R1 node-death test (it expects START_UNKNOWN); run against the two new unit tests alone, it is caught by
+# test_unit_an_exec_whose_outcome_was_not_observed_is_unknown_not_failed.
+
+commit d371c4f
+CAUGHT  C3-1 an unobserved exec is unknown, not failed  test_r1_the_node_dies_while_its_child_is_paused_in_the_launch_and_the_shim_still_stops_it[after-setsid]
+rows: 1
+stale or broken: []
+missed: []

@@ -19516,3 +19516,8 @@ scripts/steering-mutation-results.txt.
   The real positive cases also still say `START_FAILED <errno>`: the exec failure gives 2, and the child that exits
   before its registration (RELEASE never written) gives 0.
 - **One row:** "C3-1 an unobserved exec is unknown, not failed" (the branch removed).
+- **The row, on d371c4f:** caught. It is caught first, in file order, by an R1 node-death test, which expects
+  `START_UNKNOWN`. Run against the new unit tests alone, it is caught by
+  `test_unit_an_exec_whose_outcome_was_not_observed_is_unknown_not_failed`.
+- **tests/test_groupshim.py alone, on d371c4f:** 68 passed. The scratch leftover check tracked 150 pids, and none was
+  left.
