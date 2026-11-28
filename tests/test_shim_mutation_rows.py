@@ -16,8 +16,10 @@ check = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(check)
 
 MINE = [r for r in check.ROWS if "C3-2b-1" in r[1]]
-# Rows anchored on text in the files this PR changes: they must not have gone stale with it
-TOUCHED = [r for r in check.ROWS if r[0] in ("G", "N", "GS", "SC") and r not in MINE]
+# (Ownership C3-2b-2) This PR's own rows: Part 0 ("P0.") and the wiring
+NEXT = [r for r in check.ROWS if "C3-2b-2" in r[1] and r not in MINE]
+# Rows anchored on text in the files these PRs change: they must not have gone stale with them
+TOUCHED = [r for r in check.ROWS if r[0] in ("G", "N", "GS", "SC", "H", "NS", "D") and r not in MINE and r not in NEXT]
 
 
 def test_this_prs_rows_exist():
@@ -32,7 +34,14 @@ def test_this_prs_rows_exist():
         assert key in check.FILES and key in check.ONLY and all((ROOT / t).exists() for t in check.ONLY[key])
 
 
-@pytest.mark.parametrize("row", MINE + TOUCHED, ids=[r[1] for r in MINE + TOUCHED])
+def test_the_next_prs_rows_exist():
+    """(C3-2b-2) Part 0's rows: one per decision (0.1 twice, 0.2 three times, 0.3, 0.4, 0.5 twice)."""
+    names = {r[1] for r in NEXT}
+    assert len(NEXT) == len(names), sorted(names)
+    assert len([r for r in NEXT if "C3-2b-2 P0." in r[1]]) == 9, sorted(names)
+
+
+@pytest.mark.parametrize("row", MINE + NEXT + TOUCHED, ids=[r[1] for r in MINE + NEXT + TOUCHED])
 def test_each_anchor_occurs_once_and_its_mutant_parses(row):
     key, name, old, new = row
     text = (ROOT / check.FILES[key]).read_text()

@@ -45,6 +45,10 @@ from .node_groups import SUPERVISED
 RECORD_VERSION = 1
 JOURNAL_DIR = "shim-journal"        # under the node's data directory (its log directory), beside node-sessions.json
 RECORD_MAX = 64 * 1024              # bytes a record may have (they are about 400)
+# (C3-2b-2, Part 0.5) macOS Finder writes this file into any directory a person merely looked at: `load` ignores
+# EXACTLY this name (never opens it, never removes it), so it cannot close admission for the whole node. Every other
+# entry that is not a record still makes the journal unreadable.
+FINDER_FILE = ".DS_Store"
 _ID = re.compile(r"[0-9a-f]{32}")
 _NAME = re.compile(r"([0-9a-f]{32})\.json")
 _KEYS = frozenset({"v", "launch_id", "token", "checkout_key", "cwd", "boot", "marker", "shim_pid", "shim_start"})
@@ -255,18 +259,25 @@ class Journal:
 
     def remove(self, launch_id: str) -> None:
         """Remove a record: unlink, then sync the directory. A record already gone is no error (the directory is
-        synced all the same, so a removal whose sync failed is completed by a retry). Raises OSError otherwise. Called
+        synced all the same, so a removal whose sync failed is completed by a retry), and so is one whose journal
+        directory does not exist (C3-2b-2, Part 0.2: nothing to sync). Raises OSError otherwise. Called
         only after the launch's proof (shimlaunch.release): the only unlink in this module."""
         path = self._path(launch_id)
         try:
             os.unlink(path)
         except FileNotFoundError:
             pass
-        _sync_dir(self.directory)
+        try:
+            _sync_dir(self.directory)
+        except FileNotFoundError:
+            # (C3-2b-2, Part 0.2) No journal directory at all: no record of it was ever made durable (a commit that
+            # failed before it created anything), so it is already gone, and there is nothing to sync.
+            return
 
     def load(self) -> list[Record]:
         """Every record, or JournalUnreadable. Absent directory: []. The directory must be this user's private one,
-        and EVERY entry in it a regular file named `<launch id>.json` holding one valid record line (no symlink, FIFO,
+        and EVERY entry in it but Finder's `.DS_Store` (FINDER_FILE, exactly that name: Part 0.5 of C3-2b-2) a
+        regular file named `<launch id>.json` holding one valid record line (no symlink, FIFO,
         subdirectory, stray or temporary name, partial or empty file is skipped: any of them makes the whole journal
         unreadable). (Review round 1, R3) A partial record, which a commit that failed leaves in place, is
         indistinguishable from damage to a committed one: it too is unreadable, and the reason names the file's full
@@ -287,6 +298,8 @@ class Journal:
                                     f"(errno {e.errno})") from None
         out = []
         for name in names:
+            if name == FINDER_FILE:
+                continue        # (C3-2b-2, Part 0.5: exactly this name, never opened; any other stray name is unreadable)
             try:
                 out.append(self._read(name))
             except (OSError, ValueError, UnicodeDecodeError, RecursionError) as e:

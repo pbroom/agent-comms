@@ -212,6 +212,45 @@ def test_remove_unlinks_and_syncs_the_directory_and_is_idempotent(journal, tmp_p
         journal.remove("../escape")
 
 
+def test_part0_2_remove_with_no_journal_directory_is_already_gone(tmp_path):
+    """(C3-2b-2, Part 0.2) A record whose journal directory does not exist (a launch whose commit never created
+    anything) is already gone: `remove` returns, creates nothing and raises nothing. A launch's release on its proof
+    must never be refused (and its checkout left HELD for good) because there was no directory to sync."""
+    j = Journal(tmp_path / "node-logs" / shimjournal.JOURNAL_DIR)
+    j.remove(shimjournal.new_launch_id())
+    assert not (tmp_path / "node-logs").exists()
+
+
+DS_STORE = ".DS_Store"
+
+
+def test_part0_5_a_finder_ds_store_in_the_journal_is_ignored(journal, tmp_path):
+    """(C3-2b-2, Part 0.5) macOS Finder writes `.DS_Store` into a directory a person merely looked at: exactly that
+    name is ignored by `load` (never opened), so it cannot close admission for the whole node; the records beside it
+    load as before. It is not removed (the journal never unlinks what is not a record)."""
+    r = a_record(tmp_path)
+    journal.commit(r)
+    ds = Path(journal.directory) / DS_STORE
+    ds.write_bytes(b"\x00\x00\x00\x01Bud1 not a record")
+    assert journal.load() == [r]
+    assert ds.exists()
+
+
+@pytest.mark.parametrize("name", [".DS_Store.json", "DS_Store", ".ds_store", "._.DS_Store", ".DS_Store~", " .DS_Store",
+                                  ".DS_Store/"])
+def test_part0_5_only_that_exact_name_is_ignored(journal, tmp_path, name):
+    """(Part 0.5) Any other stray name, however close to it, still makes the whole journal unreadable."""
+    journal.commit(a_record(tmp_path))
+    p = Path(journal.directory) / name.rstrip("/")
+    if name.endswith("/"):
+        p = Path(journal.directory) / (DS_STORE + "x")
+        p.mkdir()
+    else:
+        p.write_text("x\n")
+    with pytest.raises(JournalUnreadable):
+        journal.load()
+
+
 def test_an_absent_journal_is_empty_and_nothing_is_created(tmp_path):
     j = Journal(tmp_path / "node-logs" / shimjournal.JOURNAL_DIR)
     assert j.load() == []
