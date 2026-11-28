@@ -24,11 +24,12 @@ from pathlib import Path
 
 import pytest
 
-from agent_comms import groupshim, node_groups, shimchild
-from agent_comms.dispatch import spawn_piped
-from agent_comms.shimchild import ShimChild, marker_proves
+if sys.platform != "darwin":    # (before anything macOS-only is touched: a skip mark cannot stop an import-time failure)
+    pytest.skip("the shim is macOS-only (kqueue, libproc)", allow_module_level=True)
 
-pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="the shim is macOS-only (kqueue, libproc)")
+from agent_comms import groupshim, node_groups, shimchild   # noqa: E402
+from agent_comms.dispatch import spawn_piped   # noqa: E402
+from agent_comms.shimchild import ShimChild, marker_proves   # noqa: E402
 
 PY = sys.executable
 ROOT = str(Path(groupshim.__file__).resolve().parent.parent)

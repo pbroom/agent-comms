@@ -58,8 +58,14 @@ PROTOCOL = 1
 # (measured on this Mac: fflags 0x84000000), and the decoded status is cross-checked against `waitid(WNOWAIT)` at every
 # leader exit (`Shim._leader_exit`), which wins on any disagreement.
 NOTE_EXITSTATUS = 0x04000000
-assert NOTE_EXITSTATUS & select.KQ_NOTE_EXIT == 0 and NOTE_EXITSTATUS == 1 << 26
-PROC_FFLAGS = select.KQ_NOTE_EXIT | NOTE_EXITSTATUS | select.KQ_NOTE_EXEC
+# The module must IMPORT on any platform (the node-side handle imports it, and a test run off macOS collects it): the
+# kqueue names exist only where the OS has kqueue, so the two read at import fall back to macOS's own values
+# (<sys/event.h>: NOTE_EXIT 0x80000000, NOTE_EXEC 0x20000000). Everything else that touches kqueue is inside the shim's
+# functions, which run on macOS only.
+_KQ_NOTE_EXIT = getattr(select, "KQ_NOTE_EXIT", 0x80000000)
+_KQ_NOTE_EXEC = getattr(select, "KQ_NOTE_EXEC", 0x20000000)
+assert NOTE_EXITSTATUS & _KQ_NOTE_EXIT == 0 and NOTE_EXITSTATUS == 1 << 26
+PROC_FFLAGS = _KQ_NOTE_EXIT | NOTE_EXITSTATUS | _KQ_NOTE_EXEC
 
 MAX_GO = 4 * 1024 * 1024        # bytes of the GO frame, newline included (macOS ARG_MAX is 1 MiB; JSON escapes grow it)
 MAX_COMMAND = 256               # a longer command line is answered UNKNOWN and dropped
