@@ -37,6 +37,7 @@ FAILED = "failed"                           # raised (an interrupt included): (a
 RELEASED = "released"                       # THIS call removed the record and lifted the entry (exactly one call does)
 ALREADY_RELEASED = "already_released"       # an earlier (or a concurrent, waited-for) call released it
 KEPT = "kept"                               # no evidence yet, or the record's removal failed: nothing lifted, HELD
+SKIPPED = "skipped"                         # (R8, the sweep) not ABANDONED at that moment: nothing done, nothing changed
 # command results
 QUEUED, PENDING, CLOSED = "queued", "pending", "closed"
 # `classify`
@@ -73,22 +74,43 @@ class Launch:
     # reverse.
     state_lock: Any = field(default_factory=lambda: threading.RLock(), repr=False, compare=False)
 
-    def accept(self, groups: node_groups.Groups) -> bool:
-        """(Review round 2, R5) The RECEIVER's last step, after it has stored this launch where its own stop and
-        shutdown paths will find it: the entry, PROVISIONAL since the admission (the checkout fenced, while the CLI may
-        already run), becomes LIVE (`Groups.confirm_live`), and from then on C1's sharing rule applies as for a direct
-        start. True only when that took effect. False, with nothing changed, when the launch is not HANDED_OFF or its
-        entry is no longer PROVISIONAL (made STOPPING or HELD meanwhile, or gone): the caller then treats the launch
-        as STOPPING, never as started. An exception or an interrupt inside makes the entry HELD again before it is
-        raised: until `accept` has returned True, the checkout is never admissible beside this launch's CLI."""
+    def accept(self, groups: node_groups.Groups, pause: Callable[[str, "Launch"], None] | None = None) -> bool:
+        """(Review rounds 2 and 3, R5 and R7) The RECEIVER's last step, after it has stored this launch where its own
+        stop and shutdown paths will find it: the entry, PROVISIONAL since the admission (the checkout fenced, while
+        the CLI may already run), becomes LIVE (`Groups.confirm_live`), and from then on C1's sharing rule applies as
+        for a direct start. True only when that took effect. False, with nothing changed, when the launch is not
+        HANDED_OFF or its entry is no longer PROVISIONAL (made STOPPING or HELD meanwhile, or gone): the caller then
+        treats the launch as STOPPING, never as started.
+
+        Exactly two outcomes for the registry (R7): the LIVE transition did not commit (nothing is changed by
+        `accept`; an exception or interrupt before the commit turns a still-PROVISIONAL entry HELD, so the checkout
+        stays fenced), or it committed and STAYS LIVE: nothing here fences, holds or changes the entry after that,
+        whatever is raised. The handler decides from the REGISTRY's state, in one step under its lock
+        (`Groups.hold_if_provisional`), never from a local that an interrupt between the registry's unlock and its
+        assignment could leave unset.
+
+        When `accept` RAISES, the receiver asks `is_live(groups)`: True, the launch is started and must be stopped by
+        its NORMAL stop and shutdown paths, as any LIVE group (the exception is usually the node's own shutdown); False,
+        it is fenced (HELD), and is stopped and released on its proof like a launch whose `accept` answered False.
+
+        `pause(step, launch)`: TEST-ONLY, at "accepting" (before `confirm_live`) and "accepted" (its result
+        recorded)."""
         with hostlog.BOUNDARY, self.state_lock:
             if self.lifecycle != Launch.HANDED_OFF:
                 return False
             try:
-                return groups.confirm_live(self.token)
+                _pause(pause, "accepting", self)
+                done = groups.confirm_live(self.token)
+                _pause(pause, "accepted", self)
+                return done
             except BaseException:
-                groups.restore_held(self.token, [self.key], self.cwd)
+                groups.hold_if_provisional(self.token)
                 raise
+
+    def is_live(self, groups: node_groups.Groups) -> bool:
+        """(Review round 3, R7) Whether this launch's entry is LIVE in the registry (a query under its lock): what the
+        receiver asks when `accept` raised."""
+        return groups.state(self.token) == node_groups.Groups.LIVE
 
 
 def _move(launch: Launch, to: str, frm: tuple[str, ...]) -> bool:
@@ -106,7 +128,7 @@ class Owners:
     abandoned before GO, could not be reaped; it leaves when `launch` hands it to its caller (STARTED, (c)) or reaches
     state (a) (nothing exists), or when `release` lets it go. One dict keyed by launch id: one store, one pop, one
     copy each (atomic under the GIL), no lock and no I/O. The node keeps ONE `Owners`, beside its journal (the wiring
-    PR), and asks `release` for each parked launch on its passes.
+    PR), and sweeps it with `sweep_abandoned` on its passes (review round 3, R8: ABANDONED launches only).
 
     (Review round 2, R6) This table only STORES: being parked makes a launch FINDABLE, not eligible. A launch's
     lifecycle (ACTIVE, HANDED_OFF, ABANDONED, RELEASED) is serialised by each launch's own lock (`Launch.state_lock`),
@@ -294,6 +316,25 @@ def release(groups: node_groups.Groups, journal: Journal, owners: Owners, launch
         launch.lifecycle = Launch.RELEASED     # (R6: only here, by the call that retired the record and the entry)
         owners.unpark(launch)
         return RELEASED
+
+
+def release_if_abandoned(groups: node_groups.Groups, journal: Journal, owners: Owners, launch: Launch,
+                         pause: Callable[[str, Launch], None] | None = None) -> str:
+    """(Review round 3, R8) The SWEEP's release: under the launch's own lock, it proceeds (as `release`, in the same
+    hold of that lock) only if the launch is ABANDONED at that moment; RELEASED ones answer ALREADY_RELEASED; ACTIVE
+    and HANDED_OFF ones answer SKIPPED, and nothing is done or changed (no fence, no HELD). So a sweep acting on a
+    stale list can never fence a launch that was handed off (and perhaps accepted) since. A receiver releases its OWN
+    launch with `release`."""
+    with hostlog.BOUNDARY, launch.state_lock:   # (an RLock: `release` re-enters it, in this same hold)
+        if launch.lifecycle == Launch.ABANDONED:
+            return release(groups, journal, owners, launch, pause=pause)
+        return ALREADY_RELEASED if launch.lifecycle == Launch.RELEASED else SKIPPED
+
+
+def sweep_abandoned(groups: node_groups.Groups, journal: Journal, owners: Owners) -> dict[str, str]:
+    """(Review round 3, R8) The node's periodic cleanup pass: `release_if_abandoned` for each launch parked in
+    `owners` now; {launch id: its answer}. Call it with no host lock held (proof reads, journal syncs)."""
+    return {la.launch_id: release_if_abandoned(groups, journal, owners, la) for la in owners.parked()}
 
 
 def _command(handle: ShimChild, word: str) -> str:

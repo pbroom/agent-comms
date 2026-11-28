@@ -20762,3 +20762,67 @@ Tests (tests/test_shim_launch.py):
 test_shim_mutation_rows, test_groupshim, test_nodes, test_ownership_c1, test_hostlog): 666 passed. No parallel suite
 (as asked). The two race tests also ran three more times outside the full runs (once with the R5 tests, twice on
 their own): passed each time.
+
+### Ownership C3-2b-1: review round 3 (Sol on d24fa2a: R6 protects ACTIVE launches; 1 blocker, 1 should)
+
+**R7 [blocker]. Once LIVE is committed it is irrevocable inside `accept()`.** Was: `accept`'s handler called
+`restore_held` on ANY exception; an interrupt landing after `confirm_live` released the registry lock (LIVE committed,
+a sibling possibly admitted under C1's sharing rule) then slammed HELD onto a state others already relied on. Now:
+- `Groups.hold_if_provisional(token)` (node_groups.py): under the registry lock, in one step, a PROVISIONAL entry
+  becomes HELD (with the HELD index); every other state (LIVE, HELD, STOPPING, none) is left exactly as it is.
+- `accept`'s handler calls only that. So the handler decides from the REGISTRY's state, not from a local an interrupt
+  could leave unset: before the commit the entry is still PROVISIONAL and becomes HELD (the checkout stays fenced);
+  from the commit on it is LIVE and nothing in `accept` touches it. The exception propagates.
+- `Launch.is_live(groups)`: what the receiver asks when `accept` RAISES. True: the launch is started; its NORMAL stop
+  and shutdown paths stop it as any LIVE group. False: it is fenced (HELD) and is stopped and released on its proof,
+  like a refused `accept`.
+- `accept(groups, pause=)` gained test-only points "accepting" (before `confirm_live`) and "accepted" (its result
+  recorded).
+
+**R8 [should, fixed]. The sweep takes ABANDONED launches only.** Now: `release_if_abandoned(groups, journal, owners,
+launch)` proceeds, as `release` and in the same hold of the launch's own lock, only if the launch is ABANDONED at that
+moment; RELEASED answers ALREADY_RELEASED; ACTIVE and HANDED_OFF answer SKIPPED (new) and nothing is done or changed.
+`sweep_abandoned(groups, journal, owners)` runs it over every parked launch ({launch id: answer}). `release` stays the
+receiver's own call for its own launch. Round 2's stale-snapshot case is closed: a stale sweep no longer fences a
+handed-off or accepted launch.
+
+The launch-state table, updated (round 2's rows stand; these replace its `accept` rows):
+
+| Exit | State | Registry | Lifecycle | Owner |
+| --- | --- | --- | --- | --- |
+| STARTED | (c) GO confirmed, PROVISIONAL, returned | PROVISIONAL (fences) | HANDED_OFF | the caller's |
+| `accept()` True | (d) accepted | LIVE | HANDED_OFF | the caller's |
+| `accept()` False | stopping | as it was (STOPPING, HELD, none) | HANDED_OFF | the caller's: stop, release on proof |
+| `accept()` raised before the LIVE commit | fenced | HELD (`is_live` False) | HANDED_OFF | the caller's: stop, release on proof |
+| `accept()` raised after the LIVE commit | started, stopping | LIVE, stays LIVE (`is_live` True) | HANDED_OFF | the caller's NORMAL stop and shutdown paths |
+| a sweep meets a HANDED_OFF or ACTIVE launch | unchanged | unchanged | unchanged (SKIPPED) | unchanged |
+
+**The wiring PR's obligations** (replacing round 2's): at each supervised spawn site, on STARTED, STORE the launch where
+that site's stop, reap and shutdown paths find it, THEN `accept()`. True: started. False: stopping (stop it through
+`request_term`/`request_kill`, then `release` on proof). It RAISES: ask `is_live`; True, started, and its normal stop
+and shutdown paths stop it; False, as a refused `accept`. The periodic cleanup pass calls `sweep_abandoned` only, never
+`release` on parked launches; a receiver calls `release` for its own launch.
+
+Tests (tests/test_shim_launch.py):
+- `test_r7_accept_has_two_outcomes_fenced_before_the_commit_and_live_for_good_after[returned|accepting|live-before|live-inside|live-after|accepted]`
+  (replaces round 2's `test_r5_until_accept_returns_success_the_checkout_stays_fenced`): before the commit the
+  checkout is fenced at the point and HELD after; from the commit a sibling admitted at the point is undisturbed, the
+  entry stays LIVE, never HELD, `is_live` True. On d24fa2a: `live-after` failed with the entry `held`; the other
+  points failed only on the new API (`pause`, `is_live`).
+- `test_r8_a_stale_sweep_crossing_acceptance_touches_nothing`: a real sweeper thread with a list taken while the
+  launch was ACTIVE calls `release_if_abandoned` on it over 1000 times through its hand-off and `accept`: all SKIPPED,
+  `accept` True, LIVE, nothing fenced. On d24fa2a: the operation did not exist.
+- `test_r8_the_sweep_releases_abandoned_launches_only`: `sweep_abandoned` releases a GO_FAILED launch on its proof, a
+  HANDED_OFF accepted one is SKIPPED and stays LIVE. On d24fa2a: did not exist.
+
+**Mutation check (review round 3).** Not run here; tests/test_shim_mutation_rows.py passes (47 C3-2b-1 rows, 5 named
+"C3-2b-1 r3"). Applied by hand, each alone, and caught: the three new rows and the re-anchored "fences again".
+- **New (3):** "C3-2b-1 r3 R7 accept never fences after LIVE is committed" (in `hold_if_provisional`); "C3-2b-1 r3 R7
+  accept decides from the registry's state" (the handler deciding from a local instead); "C3-2b-1 r3 R8 the sweep
+  takes ABANDONED launches only".
+- **Re-anchored (2):** "C3-2b-1 r2 R5 accept checks confirm_live's result (re-anchored: C3-2b-1 r3)"; "C3-2b-1 r2 R5
+  an interrupt inside accept fences again (re-anchored: C3-2b-1 r3)".
+- Removed: none.
+
+**Runs (review round 3).** Targeted (test_shim_launch, test_shim_journal, test_shim_restore, test_shim_static,
+test_shim_mutation_rows, test_groupshim, test_nodes, test_ownership_c1, test_hostlog): 674 passed.

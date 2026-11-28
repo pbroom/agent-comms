@@ -407,8 +407,13 @@ class CutRegistry(node_groups.Groups):
         if self.at == "live-before":
             self.probe()
             raise Crash()
+        if self.at == "live-inside":            # (under the registry lock, before the change)
+            with self.lock:
+                self.probe()
+                raise Crash()
         got = super().confirm_live(*a, **k)
-        if self.at == "live-after":
+        if self.at == "live-after":             # (the registry's lock released, the LIVE transition committed)
+            self.probe()
             raise Crash()
         return got
 
@@ -685,27 +690,54 @@ def test_r5_launch_returns_with_the_entry_still_provisional_and_only_accept_make
     stop_and_release(env, launch)
 
 
-@pytest.mark.parametrize("point", ["returned", "accept-before", "accept-after"])
-def test_r5_until_accept_returns_success_the_checkout_stays_fenced(kit, point):
-    """R5.3: between GO's confirmation and a successful `accept()`, at every point the checkout is fenced (a sibling
-    start refused): after `launch` returned and before `accept` is called (the receiver interrupted there: it never
-    accepts), and an interrupt inside `accept` before and after the registry's change (the entry is then made HELD,
-    never left LIVE). (The points inside `launch`, `went` and `handed`, are
-    `test_r1_an_interrupt_at_every_step_...`.) Then the receiver's stop and the release on the proof."""
+BEFORE_COMMIT = ["returned", "accepting", "live-before", "live-inside"]
+AFTER_COMMIT = ["live-after", "accepted"]
+
+
+@pytest.mark.parametrize("point", BEFORE_COMMIT + AFTER_COMMIT)
+def test_r7_accept_has_two_outcomes_fenced_before_the_commit_and_live_for_good_after(kit, point):
+    """R5.3 and R7: an interrupt at each point from `launch`'s return through `accept`: after the return, before
+    `accept` is called (the receiver never accepts); in `accept` before `confirm_live` (`accepting`); inside it before
+    the registry lock and under the lock before the change; right after the registry's unlock (the LIVE transition
+    committed, `accept` has not recorded it); and after `accept` recorded the result (`accepted`). BEFORE the commit
+    the checkout is fenced at the point and stays fenced (HELD after the interrupt: not LIVE, `is_live` False). FROM
+    the commit on the entry is LIVE and STAYS LIVE: a sibling admitted at the point (C1's sharing) is not disturbed,
+    no HELD appears, `is_live` is True; the receiver's normal stop path then stops it. (The points inside `launch`
+    are `test_r1_an_interrupt_at_every_step_...`.)"""
     groups = CutRegistry()
     env = Env(kit, groups)
-    probed = []
-    groups.probe = lambda: probed.append(env.fenced())
+    probed, sibling = [], ("run", "sibling")
+
+    def probe():
+        if point in AFTER_COMMIT:
+            probed.append(env.groups.start(env.cwd, sibling, lambda: "spawned") == (True, "spawned"))
+        else:
+            probed.append(env.fenced())
+    groups.probe = probe
     launch = env.launch(env.kit.argv(wait_abort=True))
     assert launch.outcome == shimlaunch.STARTED
-    probed.append(env.fenced())                 # (returned to its receiver, not yet accepted)
-    if point != "returned":
-        groups.at = "live-before" if point == "accept-before" else "live-after"
+    if point == "returned":
+        probe()
+    else:
+        if point in ("live-before", "live-inside", "live-after"):
+            groups.at = point
+
+        def pause(name, la):
+            if name == point:
+                probe()
+                raise Crash()
         with pytest.raises(Crash):
-            launch.accept(groups)
-        assert env.groups.state(launch.token) == HELD, env.groups.state(launch.token)
-    assert all(probed) and probed, probed
-    assert env.fenced() and env.groups.state(launch.token) in (PROVISIONAL, HELD)
+            launch.accept(groups, **({"pause": pause} if point in ("accepting", "accepted") else {}))
+    assert probed == [True], probed
+    if point in AFTER_COMMIT:
+        assert env.groups.state(launch.token) == LIVE and launch.token not in env.groups.held, \
+            env.groups.state(launch.token)
+        assert env.groups.state(sibling) == LIVE and launch.is_live(env.groups), "the sibling is not disturbed"
+        env.groups._gone(sibling)
+    else:
+        assert env.groups.state(launch.token) in (PROVISIONAL, HELD) and env.fenced()
+        assert env.groups.state(launch.token) == (PROVISIONAL if point == "returned" else HELD)
+        assert not launch.is_live(env.groups)
     stop_and_release(env, launch)
 
 
@@ -725,6 +757,60 @@ def test_r5_accept_reports_a_refusal_when_the_entry_is_no_longer_provisional(env
     if how == "gone":
         env.groups.restore_held(launch.token, [launch.key], env.cwd)    # (the test's own: so release has its entry)
     stop_and_release(env, launch)
+
+
+def test_r8_a_stale_sweep_crossing_acceptance_touches_nothing(env):
+    """R8, real threads and a real shim: a sweeper takes its list while the launch is ACTIVE and parked (at the
+    `started` pause) and then calls the abandoned-only operation on it in a loop, through the launch's hand-off and
+    its `accept()`. Every answer is SKIPPED; `accept()` answers True; the entry is LIVE and stays LIVE, not HELD, and
+    nothing is fenced (a sibling is admitted beside it). The receiver's own `release` then retires it on its proof."""
+    stale, stop, answers, errors = [], threading.Event(), [], []
+
+    def sweep():
+        try:
+            while not stop.is_set():
+                for la in stale:
+                    answers.append(shimlaunch.release_if_abandoned(env.groups, env.journal, env.owners, la))
+        except BaseException as e:      # (reported below)
+            errors.append(e)
+    t = threading.Thread(target=sweep, daemon=True)
+
+    def pause(name, la):
+        if name == "started":
+            stale.extend(env.owners.parked())
+            t.start()
+    try:
+        launch = env.launch(env.kit.argv(wait_abort=True), pause=pause)
+        assert stale == [launch] and launch.lifecycle == shimlaunch.Launch.HANDED_OFF
+        assert launch.accept(env.groups) is True
+        assert wait_for(lambda: len(answers) > 1000 or errors, WAIT)
+    finally:
+        stop.set()
+        t.join(WAIT)
+    assert errors == [] and answers and set(answers) == {shimlaunch.SKIPPED}, (errors, set(answers))
+    assert env.groups.state(launch.token) == LIVE and launch.token not in env.groups.held
+    assert env.groups.start(env.cwd, ("run", "sibling"), lambda: "spawned") == (True, "spawned"), "nothing fenced"
+    env.groups._gone(("run", "sibling"))
+    stop_and_release(env, launch)
+
+
+def test_r8_the_sweep_releases_abandoned_launches_only(env):
+    """R8: `sweep_abandoned` (the periodic sweep) releases each parked ABANDONED launch on its proof and touches
+    nothing else; `release_if_abandoned` on a HANDED_OFF launch (accepted, LIVE) answers SKIPPED and changes nothing.
+    The receiver's own `release` is the separate call for its own launch."""
+    other = env.kit.tmp / "other-checkout"
+    other.mkdir()
+    failed = env.launch(env.kit.argv(wait_abort=True), go_timeout=0)            # GO_FAILED: ABANDONED, parked
+    live = env.launch(env.kit.argv(wait_abort=True), cwd=str(other))
+    assert failed.lifecycle == shimlaunch.Launch.ABANDONED and live.accept(env.groups)
+    assert shim_exit(failed.handle) == groupshim.EXIT_NOGO
+    assert shimlaunch.release_if_abandoned(env.groups, env.journal, env.owners, live) == shimlaunch.SKIPPED
+    assert env.groups.state(live.token) == LIVE and live.token not in env.groups.held
+    assert shimlaunch.sweep_abandoned(env.groups, env.journal, env.owners) == {failed.launch_id: RELEASED}
+    assert released_means_gone(env, failed, RELEASED) and env.owners.parked() == []
+    assert shimlaunch.sweep_abandoned(env.groups, env.journal, env.owners) == {}
+    assert shimlaunch.release_if_abandoned(env.groups, env.journal, env.owners, failed) == ALREADY
+    stop_and_release(env, live)
 
 
 def sweeper(env, stop, seen):

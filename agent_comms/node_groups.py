@@ -242,6 +242,20 @@ class Groups:
                     groups[token][0], done = self.LIVE, True
             return done
 
+    def hold_if_provisional(self, token: Hashable) -> bool:
+        """(Ownership C3-2b-1, review round 3, R7) An `accept` that an exception or interrupt cut short: decided from
+        the REGISTRY's state, under its lock, in one step: a PROVISIONAL entry (the LIVE transition did not commit)
+        becomes HELD, with the HELD index (True). Any other state is left exactly as it is (False): a LIVE one stays
+        LIVE (the transition committed, and others may already share it), and HELD, STOPPING or none is unchanged."""
+        with hostlog.BOUNDARY, self.lock:
+            done = False
+            for groups in self.entries.values():
+                if token in groups and groups[token][0] == self.PROVISIONAL:
+                    groups[token][0], done = self.HELD, True
+            if done:
+                self.held.add(token)
+            return done
+
     def stopping(self, token: Hashable) -> None:
         """The group is being stopped (signalled, or its leader went on its own and members are left)."""
         with hostlog.BOUNDARY, self.lock:
