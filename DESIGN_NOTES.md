@@ -17781,6 +17781,11 @@ file the cleanup writes, or after 60 s. Every wait is bounded (20 s each).
 - **The shim's own death.** If the shim is killed, launchd reaps the CLI's zombie and the anchor is lost. Nothing is
   published, the handle answers `lost()`, and it is held for a human (by design).
 - **Descendants that leave the group** (`setsid`/`setpgid`) are outside group-based ownership: the inherited limit.
+  - **Observed live on 2026-11-27:** Claude Code runs each Bash-tool command in its OWN session and process group. The
+    tool's `zsh -c` is a session leader, with a pgid different from the CLI's.
+  - So "the group is empty" says nothing about a tool command that outlives the CLI. Such a command can still be
+    working in the checkout when the marker says the group is gone.
+  - This is the inherited limit, not solved here. Excluding it would need containment beyond process groups.
 - **No live watch during the handshake read.** The shim does not watch its command pipe while it reads the handshake,
   that is, while its child is between `fork` and `exec` (a `chdir` that hangs, for example). EOF is acted on once it
   returns.
