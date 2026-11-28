@@ -35,8 +35,9 @@ patched: `logging` is used as it is, through its loggers' own level checks and h
   recovered), the session loop, the deadline watchdog, the checkpoint sender, and the writer itself (a handler that
   logs, or calls back into the host, enqueues and returns). A STANDALONE caller (a test, a command calling the host
   directly) waits, when it leaves its outermost boundary at depth 0 (never while it holds a lock of the host-side
-  modules: every such lock is entered as `with hostlog.BOUNDARY, lock:`, so an interrupt cannot leave it held; the
-  two inherited exceptions are named in the R18 comment above `_Record`), for the writer to have attempted
+  modules: every such lock is entered inside a `hostlog.BOUNDARY`, by `with` or by one of three explicit
+  `acquire()`/`try` pairs; what can and cannot leave one held after an interrupt, and what protects the three
+  pairs, is in the R18 comment above `_Record`), for the writer to have attempted
   ITS OWN last record, for at most ACK_SECONDS (`_acknowledge`): a public call returns with its lines with the handlers (caplog) in the
   uncontended case. Best effort by statement: a stall latch (a wait that times out marks the writer stalled at the
   completion sequence it saw; nobody waits again until a LATER completion), and a record the bound evicted is
@@ -180,7 +181,14 @@ def may_wait() -> bool:
 # inside the boundary, so the release always comes before the boundary's exit, and no acknowledgement is ever made
 # while the lock is held). The few explicit `acquire()`/`release()` pairs are the native methods, inside a
 # `with hostlog.BOUNDARY:`, in main's own shape. No Python wrapper and no generator holds one of these locks.
-# So these converted locks, and hostlog's own `_LOCK`, cannot be left held by an interrupt. NOT converted, inherited
+# So where these converted locks, and hostlog's own `_LOCK`, are entered by `with`, an interrupt cannot leave them
+# held. The three explicit pairs (`Groups.try_stopping`, `SessionRunner.unproved`, the report lock's timed acquire in
+# `SessionRunner.shutdown`) keep main's window between a successful acquire and the `try`: an interrupt there DOES
+# leave the lock held. What protects them (only the main thread takes signals): `unproved` and the report lock's
+# acquire run on the main thread only inside the node's shutdown, after its latch is set (node.ShutdownLatch: from
+# then on a signal is counted, never raised); `try_stopping` runs only on the session loop and the deadline watchdog,
+# which take no signals (on the main thread, from `stopping` on, `_reserved_stop` returns before it). NOT
+# converted, inherited
 # from main and still entered through Python code (an interrupt there could strand their own lock, as on main):
 # the stdlib's `Event` internals, which `_Stopping.set()` enters on the main thread at shutdown, and
 # `checkpoint_cond`, a `threading.Condition` entered through stdlib Python code on the session loop and checkpoint

@@ -572,6 +572,16 @@ poll. Lines worth looking for: `started <agent> for thread <n> (run <id>)` and `
 Claude process); and the WARNINGs `hub unreachable: ...`, `... is attributed by order from now on: ...` and
 `session <id>: message <n> made no progress for ...`.
 
+Stopping the node: SIGTERM (launchd, `kill`) or Ctrl-C. The first one starts its cleanup: every run and session
+process is signalled, given its grace, killed if still there, and reported, and the node's state is saved. A second
+Ctrl-C or SIGTERM does NOT cut that cleanup short (it did before: it jumped to the fallback). The node only counts
+it, and the count is logged near the end as `N further signal(s) arrived during shutdown and were not acted on`. So
+in a terminal, pressing Ctrl-C twice now waits for the cleanup to finish; to end the node at once, use `kill -9`
+(whatever was not cleaned up is then left to the next node process's recovery). A node started with SIGINT
+ignored (a background job, a nohup-style launcher) ignores Ctrl-C, as before: stop it with SIGTERM. No overall time limit on the
+cleanup is promised: under launchd, its SIGKILL is the backstop. See DESIGN_NOTES "Shutdown: a repeated signal is
+recorded, not raised".
+
 ### Hosted sessions (`board session`)
 
 A dispatched run is one process per prompt: once it is going you cannot tell it anything. A hosted session is one

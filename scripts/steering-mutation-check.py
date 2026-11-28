@@ -374,11 +374,20 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('GS', "C3-1R5 the child closes the shim's ends first", '    for fd in shims_ends:\n        _close(fd)', '    for fd in ():\n        _close(fd)'),
     ('GS', 'C3-1R5 the kqueue wait is contained', '            except OSError as e:\n                if not self.degraded:', '            except ZeroDivisionError as e:\n                if not self.degraded:'),
     ('GS', 'C3-1R6 the watch is installed before RELEASE is written', '        self.gate("register", str(pid))\n        try:\n            self.kq.control([select.kevent(pid,', '        os.write(rel_w, b"G")\n        self.gate("register", str(pid))\n        try:\n            self.kq.control([select.kevent(pid,'),
-    ('GS', 'C3-1 an unobserved exec is unknown, not failed', '        elif self.hs_eof and self.leader_exited and not self.released:\n', '        elif self.hs_eof and self.leader_exited:\n')]
+    ('GS', 'C3-1 an unobserved exec is unknown, not failed', '        elif self.hs_eof and self.leader_exited and not self.released:\n', '        elif self.hs_eof and self.leader_exited:\n'),
+    ('N', 'LATCH the first signal latches before it raises', '        self.latched = True\n        raise KeyboardInterrupt', '        raise KeyboardInterrupt\n        self.latched = True'),
+    ('N', 'LATCH a later signal only counts: it does not raise', '            self.further += 1\n            return\n', '            self.further += 1\n'),
+    ('N', 'LATCH the exception route out of the loop latches', '        except BaseException:\n            latch.latch()', '        except BaseException:\n            pass'),
+    ('N', 'LATCH an interrupt raised directly latches', '        except KeyboardInterrupt:\n            latch.latch()', '        except KeyboardInterrupt:\n            pass'),
+    ('N', "LATCH run's exception exit latches", '        except BaseException as e:\n            latch.latch()', '        except BaseException as e:\n            pass'),
+    ('N', 'LATCH the latch is not cleared before the final wait', '        latch.latch()\n        latch.say()\n        _exit_if_stalled(0)', '        latch.latched = False\n        latch.say()\n        _exit_if_stalled(0)'),
+    ('N', 'LATCH SIGINT is covered (re-anchored: R1)', '        signal.signal(signal.SIGINT, latch.on_signal)', '        pass'),
+    ('N', 'an inherited ignored SIGINT stays ignored', '    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:\n', '    if True:\n'),
+    ('N', 'LATCH the further signals are said', '            if self.further:\n', '            if False:\n')]
 # (Ownership C3-1) The shim's rows run only its own tests: nothing else imports groupshim or shimchild yet.
 ONLY = {"GS": ["tests/test_groupshim.py"], "SC": ["tests/test_groupshim.py"]}
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
-         "tests/test_ownership_c1.py", "tests/test_hostlog.py"]
+         "tests/test_ownership_c1.py", "tests/test_hostlog.py", "tests/test_shutdown_latch.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",
         "tests/test_session_restart_hub.py", "tests/test_structured_results.py", "tests/test_hosted_sessions.py",
         "tests/test_session_host.py", "tests/test_nodes.py", "tests/test_dispatch.py"]
