@@ -320,9 +320,17 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('N', 'C1R6 the deadline ends the watch (re-anchored)', '            left = deadline - self.clock()\n            if left <= 0:\n                break\n            self.sleep(min(POST_KILL_STEP, left))', '            left = deadline - self.clock()\n            self.sleep(min(POST_KILL_STEP, max(left, POST_KILL_STEP)))'),
     ('N', "C1R6 the node's watch covers the sessions (re-anchored)", '            if not waiting and not (others is not None and others(max(left, 0.0))):', '            if not waiting:'),
     ('L', 'R20 the cut is said only when something was left out', '    return frames, tb is not None', '    return frames, len(frames) >= room'),
-    ('L', "R20 the cut's label is rendered by the writer, not at the call", '            cut.append(CUT_FRAMES)', '            cut.append(f"more than {FRAMES_MAX} frames")')]
+    ('L', "R20 the cut's label is rendered by the writer, not at the call", '            cut.append(CUT_FRAMES)', '            cut.append(f"more than {FRAMES_MAX} frames")'),
+    ('N', 'LATCH the first signal latches before it raises', '        self.latched = True\n        raise KeyboardInterrupt', '        raise KeyboardInterrupt\n        self.latched = True'),
+    ('N', 'LATCH a later signal only counts: it does not raise', '            self.further += 1\n            return\n', '            self.further += 1\n'),
+    ('N', 'LATCH the exception route out of the loop latches', '        except BaseException:\n            latch.latch()', '        except BaseException:\n            pass'),
+    ('N', 'LATCH an interrupt raised directly latches', '        except KeyboardInterrupt:\n            latch.latch()', '        except KeyboardInterrupt:\n            pass'),
+    ('N', "LATCH run's exception exit latches", '        except BaseException as e:\n            latch.latch()', '        except BaseException as e:\n            pass'),
+    ('N', 'LATCH the latch is not cleared before the final wait', '        latch.latch()\n        latch.say()\n        _exit_if_stalled(0)', '        latch.latched = False\n        latch.say()\n        _exit_if_stalled(0)'),
+    ('N', 'LATCH SIGINT is covered', '    signal.signal(signal.SIGINT, latch.on_signal)', '    pass'),
+    ('N', 'LATCH the further signals are said', '            if self.further:\n', '            if False:\n')]
 FIRST = ["tests/test_claude_steering.py", "tests/test_claude_steering_enable.py", "tests/test_steering_followups.py",
-         "tests/test_ownership_c1.py", "tests/test_hostlog.py"]
+         "tests/test_ownership_c1.py", "tests/test_hostlog.py", "tests/test_shutdown_latch.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_steering_off_tripwire.py", "tests/test_session_restart.py",
         "tests/test_session_restart_hub.py", "tests/test_structured_results.py", "tests/test_hosted_sessions.py",
         "tests/test_session_host.py", "tests/test_nodes.py", "tests/test_dispatch.py"]

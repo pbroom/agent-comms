@@ -1463,15 +1463,17 @@ def test_w7_4_a_sigterm_that_ends_the_nodes_loop_starts_its_shutdown(senv, monke
 
 
 def _second_sigterm(senv, monkeypatch, blocked_mode):
-    """A first SIGTERM at a pass's hub call, a second one during the shutdown's grace wait: what is signalled, and
-    when (the node's clock), with the writer blocked or free."""
+    """A first SIGTERM at a pass's hub call, a second interrupt during the shutdown's grace wait: what is signalled,
+    and when (the node's clock), with the writer blocked or free. (Since the shutdown latch, DESIGN_NOTES "Shutdown: a
+    repeated signal is recorded, not raised", a REAL second signal no longer raises: tests/test_shutdown_latch.py.
+    This keeps the case of a KeyboardInterrupt raised directly, which the latch does not stop.)"""
     node, session_child, run_child, kills = _stubborn_pair(senv)
     real_sleep, slept = node.sleep, []
 
     def sleep(s):
         slept.append(s)
         if len(slept) == 3:
-            raise KeyboardInterrupt         # (the second SIGTERM, during the grace wait)
+            raise KeyboardInterrupt         # (a second interrupt, raised directly, during the grace wait)
         return real_sleep(s)
     node.sleep = sleep
 
@@ -1490,8 +1492,9 @@ def _second_sigterm(senv, monkeypatch, blocked_mode):
 
 
 def test_w7_4_a_second_sigterm_during_cleanup_behaves_the_same_with_a_blocked_writer(senv, monkeypatch, tmp_path):
-    """W7.4 and C6: a second SIGTERM during the shutdown's grace wait: what is signalled, when, and what escapes
-    `run` are the same with the writer blocked in a handler as with it free (no more than main asks)."""
+    """W7.4 and C6: a second interrupt (raised directly) during the shutdown's grace wait: what is signalled, when,
+    and what escapes `run` are the same with the writer blocked in a handler as with it free (no more than main
+    asks)."""
     blocked = _second_sigterm(senv, monkeypatch, True)
     from test_hosted_sessions import session_env
     from agent_comms import hostlog
@@ -2430,7 +2433,7 @@ from pathlib import Path
 from agent_comms import hostlog
 
 def on_term(signum, frame):
-    raise KeyboardInterrupt         # as node._run's on_term does
+    raise KeyboardInterrupt         # as the node's handler does for its FIRST signal (node.ShutdownLatch)
 signal.signal(signal.SIGTERM, on_term)
 kind = sys.argv[1]
 if kind == "rlock":                 # the registry's lock, as production builds it
@@ -2575,7 +2578,10 @@ print("returned", flush=True)
 def test_r21_an_interrupt_during_the_final_wait_takes_the_stalled_exit(tmp_path):
     """R21 (A3, A7b): a real SIGTERM lands during the node's final wait (the writer is stuck in a handler holding its
     lock): the interrupt is treated as stalled, so the process ends at once with the status already selected (3)
-    instead of escaping into the interpreter's `logging.shutdown()`, which would block on the stuck handler."""
+    instead of escaping into the interpreter's `logging.shutdown()`, which would block on the stuck handler. (The
+    child installs a raising handler of its own: since the shutdown latch the node's own handler never raises once
+    the node is shutting down, so this pins R21's `except KeyboardInterrupt`, kept as defence for an interrupt
+    raised some other way.)"""
     status, out, err = _signalled_child(tmp_path, _FINAL_WAIT_SCRIPT, ready="waiting", wait=20)
     assert status == 3, (status, out, err)
     assert out == ["waiting"], (out, err)
