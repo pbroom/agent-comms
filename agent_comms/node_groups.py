@@ -24,6 +24,10 @@ import sys
 import threading
 from typing import Any, Callable, Hashable
 
+from . import hostlog
+
+log = hostlog.get("agent_comms.node_groups")     # (host-side logging: every line a deferred record, hostlog)
+
 PROC_PGRP_ONLY = 2      # libproc's `proc_listpids` type: the processes of one process group (sys/proc_info.h)
 _LISTING_ROOM = (64, 1024, 16384)   # slots added to the kernel's estimate, tried in turn until a listing is complete
 _LIBPROC: list = []
@@ -134,8 +138,7 @@ def group_absent(pgid: int) -> bool:
     if _libproc() is None:
         if not _LOAD_FAILED_SAID:
             _LOAD_FAILED_SAID.append(True)
-            import logging
-            logging.getLogger(__name__).warning(
+            log.warning(
                 "macOS libproc could not be loaded: no process group can be proved gone, so every group this node "
                 "stops is kept and its checkout stays held")
         return False
@@ -167,6 +170,9 @@ class Groups:
     _FENCE = ("stopping", "held", "fenced")     # the states that admit nothing beside them
 
     def __init__(self) -> None:
+        # THE registry lock, a host lock (a native RLock, entered as `with hostlog.BOUNDARY, self.lock:`, R18): a spawn
+        # callback runs under it (`start`), and no log handler runs on a thread that holds it (what is logged
+        # meanwhile is written by the writer)
         self.lock = threading.RLock()
         self.entries: dict[Hashable, dict[Hashable, list]] = {}     # dir key -> group token -> [state, cwd]
         # (C1, review round 1) the HELD tokens, the same set as the HELD entries: written under the lock, at the
@@ -183,7 +189,7 @@ class Groups:
         raises records nothing. `k`: the directory's key, computed once by the caller (who keeps it with the process:
         session_host `_spawn`, review round 1 of the enabling PR, A3); else computed here."""
         k = key(cwd) if k is None else k
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             if any(state in self._FENCE for state, _ in self.entries.get(k, {}).values()):
                 return False, None
             self.entries.setdefault(k, {})[token] = [self.LIVE, cwd]
@@ -195,7 +201,7 @@ class Groups:
 
     def stopping(self, token: Hashable) -> None:
         """The group is being stopped (signalled, or its leader went on its own and members are left)."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             for groups in self.entries.values():
                 if token in groups and groups[token][0] != self.HELD:      # (C1: HELD never goes back)
                     groups[token][0] = self.STOPPING
@@ -212,22 +218,23 @@ class Groups:
         STOPPING entry is inserted for `token` under that key (RESERVED: this call made it), so nothing is admitted on
         that checkout until the verified reap removes it (`gone`). Nothing is ever undone here: once reserved, the
         caller arms the stop's escalation before anything else (session_host `_reserved_stop`)."""
-        if not self.lock.acquire(blocking=False):
-            return self.BUSY
-        try:
-            for groups in self.entries.values():
-                if token in groups:
-                    if groups[token][0] in (self.STOPPING, self.HELD):     # (C1: a HELD one too, unchanged)
-                        return self.ALREADY     # (R10/A3: a FENCED one is the LIVE one it was: reserved below)
-                    groups[token][0] = self.STOPPING
+        with hostlog.BOUNDARY:      # (R18.2: the native acquire and release, in main's own shape, inside a boundary)
+            if not self.lock.acquire(blocking=False):
+                return self.BUSY
+            try:
+                for groups in self.entries.values():
+                    if token in groups:
+                        if groups[token][0] in (self.STOPPING, self.HELD):     # (C1: a HELD one too, unchanged)
+                            return self.ALREADY     # (R10/A3: a FENCED one is the LIVE one it was: reserved below)
+                        groups[token][0] = self.STOPPING
+                        return self.RESERVED
+                if barrier is not None:
+                    k, cwd = barrier
+                    self.entries.setdefault(k, {})[token] = [self.STOPPING, cwd]
                     return self.RESERVED
-            if barrier is not None:
-                k, cwd = barrier
-                self.entries.setdefault(k, {})[token] = [self.STOPPING, cwd]
-                return self.RESERVED
-            return self.MISSING
-        finally:
-            self.lock.release()
+                return self.MISSING
+            finally:
+                self.lock.release()
 
     def veto(self, token: Hashable) -> None:
         """(C1, review round 2, R5 and A2) THE one place that makes a token proof-only after a KILL: called by every
@@ -305,7 +312,7 @@ class Groups:
         so the process is then on its way out and the entry goes with it."""
         proved = begun = False
         try:
-            with self.lock:
+            with hostlog.BOUNDARY, self.lock:
                 self._admit_fence(token, fence)
             begun = True
             if prepare is not None:
@@ -320,7 +327,7 @@ class Groups:
             if proved:
                 self._gone(token)       # (also when `forget()` raised, or an interrupt came after it: see above)
             else:
-                with self.lock:
+                with hostlog.BOUNDARY, self.lock:
                     if begun:
                         self._fence(token, fence)   # (refused, or the final reads or the proof raised: HELD)
                     else:
@@ -340,7 +347,7 @@ class Groups:
 
     def _gone(self, token: Hashable) -> None:
         """The whole group is gone: leader reaped, no member left (only `release` says so)."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             for k in list(self.entries):
                 self._drop(k, token)
             self.held.discard(token)
@@ -353,7 +360,7 @@ class Groups:
         keeps it past the post-KILL wait). A group that is merely still exiting (its leader reaped, zombie members for
         an instant) is released by a later pass within that time and says nothing, as on main. HELD and the fence are
         not delayed by this: only the line is."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             rec = self.refused.setdefault(token, [now, False])
             if rec[1] or not (final or now - rec[0] >= after):
                 return False
@@ -369,7 +376,7 @@ class Groups:
 
     def state(self, token: Hashable) -> str | None:
         """The token's registry state (LIVE, STOPPING, HELD, FENCED), or None."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             for groups in self.entries.values():
                 if token in groups:
                     return groups[token][0]
@@ -385,10 +392,10 @@ class Groups:
 
     def blocked(self, cwd: Any) -> bool:
         """A group being stopped, HELD, or FENCED (a release under way) is in this directory."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             return any(state in self._FENCE for state, _ in self.entries.get(key(cwd), {}).values())
 
     def stopping_dirs(self) -> set[str]:
         """The directories (as recorded) that hold a group being stopped, HELD, or FENCED."""
-        with self.lock:
+        with hostlog.BOUNDARY, self.lock:
             return {cwd for groups in self.entries.values() for state, cwd in groups.values() if state in self._FENCE}

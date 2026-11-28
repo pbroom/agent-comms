@@ -227,3 +227,390 @@ rows: 24
 stale or broken: []
 missed: []
 exit 0
+
+# Host-side logging (PR-B; DESIGN_NOTES "Host-side logging"): the rows re-anchored on the code it changed, the
+# successors of the rows on code it deleted (3 rows of the deleted logging code had none and are gone: their
+# behaviour is pinned by the successors), and the rows for the new drain and boundary code (hostlog, key L) and
+# B8. 32 rows ran on 8a9ea35 (the code of this PR's head), in two parts: the first run was stopped at its 21st row
+# because that row's mutant deadlocks (below), and the rest ran in a second. ffb483c, earlier, MISSED
+# "L the drain runs only at depth 0" (every drain then came from a boundary's own depth-0 exit); the pin
+# test_no_drain_inside_a_boundary_even_when_asked was added and it is CAUGHT on 8a9ea35. A row on the
+# boundary's own depth-0 test was dropped as equivalent: the drain refuses inside a boundary itself.
+
+commit 8a9ea35 (part 1)
+CAUGHT  M the held end before its log line  test_r3_m_a_raising_log_handler_loses_no_held_end
+CAUGHT  T the claim checks the latch (re-anchored)  test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[cancel]
+CAUGHT  T no log handler under the cutoff lock (successor: a host lock)  test_each_host_lock_is_a_boundary_of_its_own[cutoff]
+CAUGHT  T nothing saved under the cutoff lock (re-anchored)  test_r5_small_emit_hold_saves_nothing_under_a_claim
+CAUGHT  N3 a watchdog thread never drains (successor)  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+CAUGHT  R7-2 stop_all is an entry point (successor)  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[held]
+CAUGHT  A3 the exception's type only (successor)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  T stop_all's final save in a finally (re-anchored)  test_r7_2_a_stop_all_that_raises_still_saves_for_real
+CAUGHT  E2 a registry miss is not a refusal (re-anchored)  test_r9_e2_a_registry_miss_is_not_a_verified_exit[gone]
+CAUGHT  C1 registry busy: no stop committed (re-anchored)  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  S2 busy commits nothing (re-anchored)  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  S2 escalation armed before the commit (re-anchored)  test_r8_c1_once_free_reservation_claim_sigterm_publication_in_order
+CAUGHT  S3 a live child with no token gets one (re-anchored)  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[none]
+CAUGHT  R1 the claim runs the route's own stop  test_the_queued_s_close_finalizer_n_end_then_ended
+CAUGHT  A1 the stop runs whatever the decision raised  test_r1_a1_a_decision_that_raises_after_the_latch_still_reaches_the_stop
+CAUGHT  A1 the first exception propagates (re-anchored)  test_r1_a1_the_first_exception_propagates_when_the_stop_raises_too
+CAUGHT  A2 the runner lock is a host lock (successor)  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+CAUGHT  A2 the registry lock is a host lock (successor)  test_a_registry_callback_line_is_written_after_the_registry_is_let_go
+CAUGHT  A2 the host's public methods are entry points (successor)  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  L the drain runs only at depth 0  test_no_drain_inside_a_boundary_even_when_asked
+STOPPED  L a nested drain leaves its records to the active drainer  (the mutant deadlocks the drainer on itself: the suite hung at 0% CPU in test_claude_steering.py; run alone below)
+
+commit 8a9ea35 (part 2)
+CAUGHT  L a waiting drain waits for its own records  test_a_drain_with_another_drainer_stalled_is_bounded_when_asked
+CAUGHT  L one handler's failure never stops the others  test_a_handler_that_raises_is_caught_and_the_drain_goes_on
+CAUGHT  L the level is checked at the call  test_a_line_the_logger_would_not_emit_is_not_kept
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's caller is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's time is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  B8 the promoted event is taken from where it is  test_a1_the_promoted_event_is_taken_from_where_it_is_in_watched
+CAUGHT  B8 only an ended promotes  test_a1_only_an_ended_promotes_the_sessions_watched_events
+CAUGHT  L an exit with nothing of its own writes nothing  test_the_watchdogs_lines_are_written_at_the_runner_locks_release_not_by_an_entry_that_logged_nothing
+CAUGHT  L a host lock's release writes everything  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+
+commit 8a9ea35 (the nested-drain row alone, each pin bounded at 120 s)
+HUNG    L a nested drain leaves its records to the active drainer  test_a_handler_that_logs_and_calls_back_into_the_host_does_not_deadlock (120 s: the deadlock the row is about)
+
+commit ffb483c (before the pin; superseded above)
+MISSED  L the drain runs only at depth 0  
+rows: 32, caught: 31, hung (the predicted deadlock): 1, missed: 0
+
+# Host-side logging, review round 1 (DESIGN_NOTES "Host-side logging: review round 1"): every hostlog row (key
+# L), the rows on code this round changed or added (R1 to R4, A2's fixed deadline, N3/R2 re-anchored), and the
+# runner, registry and entry-point successors; on 7f9e3f2 (this round's code). The nested-drain row, which
+# hung the suite on 8a9ea35, now FAILS its pin (bounded below WAIT_SECONDS) and is caught. (Two rows of earlier
+# rounds matched the selection by prefix: "R1 the claim runs the route's own stop", "R2 the barrier is under
+# the cached key".)
+
+commit 7f9e3f2
+CAUGHT  N3/R2 a background thread never drains (re-anchored)  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+CAUGHT  R7-2 stop_all is an entry point (successor)  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[held]
+CAUGHT  A3 the exception's type only (successor)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  R1 the claim runs the route's own stop  test_the_queued_s_close_finalizer_n_end_then_ended
+CAUGHT  A2 the runner lock is a host lock (successor)  test_a2_under_the_node_a_claims_lines_are_written_outside_the_runner_lock
+CAUGHT  A2 the registry lock is a host lock (successor)  test_a_registry_callback_line_is_written_after_the_registry_is_let_go
+CAUGHT  A2 the host's public methods are entry points (successor)  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  R2 the barrier is under the cached key  test_r2_a_reserved_watchdog_cut_makes_no_filesystem_call[token]
+CAUGHT  L the drain runs only at depth 0 (re-anchored)  test_no_drain_inside_a_boundary_even_when_asked
+CAUGHT  L a nested drain leaves its records to the active drainer  test_a_handler_that_logs_and_calls_back_into_the_host_does_not_deadlock
+CAUGHT  L a waiting drain waits for its own records  test_a_drain_with_another_drainer_stalled_is_bounded_when_asked
+CAUGHT  L one handler's failure never stops the others  test_a_handler_that_raises_is_caught_and_the_drain_goes_on
+CAUGHT  L the level is checked at the call  test_a_line_the_logger_would_not_emit_is_not_kept
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's caller is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's time is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  L an exit with nothing of its own writes nothing (re-anchored)  test_the_watchdogs_lines_are_written_at_the_runner_locks_release_not_by_an_entry_that_logged_nothing
+CAUGHT  L a host lock's release writes everything  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+CAUGHT  R1 the report lock is a boundary  test_a_refused_reports_fallback_writes_its_line_after_the_report_lock[ordinary-400-blocks]
+CAUGHT  R1 the ack lock is a boundary  test_every_lock_of_the_host_side_modules_is_a_boundary_or_reviewed
+CAUGHT  R1 a steer attempt's record lock is a boundary  test_every_lock_of_the_host_side_modules_is_a_boundary_or_reviewed
+CAUGHT  R2 the checkpoint sender is enqueue-only  test_a_failed_checkpoint_is_written_by_the_loop_and_never_holds_it
+CAUGHT  R2 the watchdog is enqueue-only  test_every_thread_the_host_side_modules_start_is_reviewed_and_every_background_one_is_enqueue_only
+CAUGHT  A2 a fixed deadline behind another drainer  test_a_drain_with_another_drainer_stalled_is_bounded_when_asked
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R3 an errno is read with no code of the exception's  test_facts_never_call_a_hostile_exceptions_own_code
+CAUGHT  R4 the version is rendered by the writer  test_nothing_is_formatted_at_a_log_call
+rows: 28
+stale or broken: []
+missed: []
+exit 0
+
+# Host-side logging, review round 2 (DESIGN_NOTES "Host-side logging: review round 2"): the 7 new rows (R5's
+# four boundaries, R6's import alias, R7's two exact-type reads), and the rows on code round 2 touched or relies
+# on (facts; the runner and registry locks); on 493bcde (this round's code).
+
+commit 493bcde
+CAUGHT  A2 the runner lock is a host lock (successor)  test_a2_under_the_node_a_claims_lines_are_written_outside_the_runner_lock
+CAUGHT  A2 the registry lock is a host lock (successor)  test_a_registry_callback_line_is_written_after_the_registry_is_let_go
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R3 an errno is read with no code of the exception's  test_facts_never_call_a_hostile_exceptions_own_code
+CAUGHT  R5 shutdown is one signal sequence  test_a_line_queued_before_shutdown_is_written_after_its_last_signal[normal-blocks]
+CAUGHT  R5 the sessions' signal part inside the sequence  test_a_line_queued_before_shutdown_is_written_after_its_last_signal[fallback-blocks]
+CAUGHT  R5 the node's stop_all is one signal sequence  test_the_nodes_own_stop_all_writes_no_line_between_its_signals
+CAUGHT  R5 a node pass is one boundary  test_a_node_pass_writes_no_line_between_the_runs_it_signals
+CAUGHT  R7 a CalledProcessError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  R7 an HTTPStatusError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  R6 no lock through an import alias  test_locks_are_built_only_in_the_reviewed_forms
+rows: 11
+stale or broken: []
+missed: []
+exit 0
+
+# Host-side logging: one writer (DESIGN_NOTES "Host-side logging: one writer"). The 10 drain and round-2
+# boundary rows are gone with their code; 10 new rows (the writer, its restart and per-handler skip, the
+# acknowledgement's eviction release, latch and clearing, the bounded flush, the bounded exit, the main thread's
+# and the session loop's registration); the two predicate rows renamed. On 8228afa, 32 rows (every hostlog row and
+# every row the writer relies on): 31 caught, "W3 nobody waits inside a boundary" missed (the depth part of the
+# predicate was only reached through a depth-0 exit); a direct pin was added (7a6a5f5) and it is caught there.
+
+commit 8228afa
+CAUGHT  W2 a lifecycle thread never waits (the predicate)  test_r6_n3_no_handler_runs_for_a_provider_logger_on_the_watchdogs_thread
+CAUGHT  R7-2 stop_all is an entry point (successor)  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[s_turn]
+CAUGHT  A3 the exception's type only (successor)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  C1 registry busy: no stop committed (re-anchored)  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  A2 the runner lock is a host lock (successor)  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  A2 the registry lock is a host lock (successor)  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  A2 the host's public methods are entry points (successor)  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+MISSED  W3 nobody waits inside a boundary (the predicate)  
+CAUGHT  L the level is checked at the call  test_a_line_the_logger_would_not_emit_is_not_kept
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's caller is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's time is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  R1 the report lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R1 the ack lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R1 a steer attempt's record lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R2 the checkpoint sender is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R2 the watchdog is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R3 an errno is read with no code of the exception's  test_facts_never_call_a_hostile_exceptions_own_code
+CAUGHT  R7 a CalledProcessError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  R7 an HTTPStatusError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  W1 the writer is a lifecycle thread (a handler that logs never waits)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  W1 a dead writer is replaced  test_a_dead_writer_is_restarted_and_there_is_only_ever_one
+CAUGHT  W1 a handler raising anything is skipped per handler  test_a_handler_that_raises_anything_is_skipped_and_the_writer_goes_on
+CAUGHT  C3 a waiter on an evicted record is released  test_a_waiter_on_a_record_the_bound_evicted_is_released_at_once
+CAUGHT  C3 the stall latch  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  C3 the latch clears on a later completion  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  W5 flush is bounded  test_flush_is_bounded_with_a_blocked_writer
+CAUGHT  C4 a stalled writer does not hold the exit  test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock[stalled]
+CAUGHT  C1 the node's main thread is a lifecycle thread  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  W2 the session loop is a lifecycle thread  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+rows: 32
+stale or broken: []
+missed: ['W3 nobody waits inside a boundary (the predicate)']
+exit 0
+
+commit 7a6a5f5
+CAUGHT  W3 nobody waits inside a boundary (the predicate)  test_a_thread_holding_a_host_lock_never_waits
+
+# Host-side logging: one writer, review round 1 (DESIGN_NOTES "Host-side logging: one writer, review round 1").
+# 9 new rows (R11 x2, R12 x3, A4 x2, A5 x2) and 4 re-anchored (W1, W5, C1 after the eager start; the R11 seal
+# row after 0b59440); 197 rows, none stale. On bed5cf7, 39 rows (every hostlog row, the writer, lock and
+# registration rows, and this round's): all caught ("R12 a failed start is contained" by the exit status only,
+# a teardown error). On 1cecd77, the 4 rows changed since: the R11 seal row MISSED (the atomicity test was racy).
+# On e9a145c (the test made deterministic, the R12 start points pinned) those rows are caught, each by a named test.
+
+commit bed5cf7
+CAUGHT  W2 a lifecycle thread never waits (the predicate)  test_r6_n3_no_handler_runs_for_a_provider_logger_on_the_watchdogs_thread
+CAUGHT  R7-2 stop_all is an entry point (successor)  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[s_turn]
+CAUGHT  A3 the exception's type only (successor)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  C1 registry busy: no stop committed (re-anchored)  test_r7_a1_a_held_deadline_on_the_watchdog_never_waits_on_the_registry
+CAUGHT  A2 the runner lock is a host lock (successor)  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  A2 the registry lock is a host lock (successor)  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  A2 the host's public methods are entry points (successor)  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  W3 nobody waits inside a boundary (the predicate)  test_a_thread_holding_a_host_lock_never_waits
+CAUGHT  L the level is checked at the call  test_a_line_the_logger_would_not_emit_is_not_kept
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's caller is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's time is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  R1 the report lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R1 the ack lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R1 a steer attempt's record lock is a boundary  test_the_locks_a_line_can_be_logged_under_are_boundaries_at_run_time
+CAUGHT  R2 the checkpoint sender is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R2 the watchdog is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R3 an errno is read with no code of the exception's  test_facts_never_call_a_hostile_exceptions_own_code
+CAUGHT  R7 a CalledProcessError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  R7 an HTTPStatusError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  W1 the writer is a lifecycle thread (a handler that logs never waits)  test_handlers_are_entered_only_on_the_writer_thread_at_depth_0
+CAUGHT  W1 a dead writer is replaced (re-anchored)  test_a_dead_writer_is_restarted_and_there_is_only_ever_one
+CAUGHT  W1 a handler raising anything is skipped per handler  test_a_handler_that_raises_anything_is_skipped_and_the_writer_goes_on
+CAUGHT  C3 a waiter on an evicted record is released  test_a_waiter_on_a_record_the_bound_evicted_is_released_at_once
+CAUGHT  C3 the stall latch  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  C3 the latch clears on a later completion  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  W5 flush is bounded (re-anchored)  test_flush_is_bounded_with_a_blocked_writer
+CAUGHT  C4 a stalled writer does not hold the exit  test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock[stalled]
+CAUGHT  C1 the node's main thread is a lifecycle thread (re-anchored)  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  W2 the session loop is a lifecycle thread  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  R11 the seal is one step with the idle decision  test_r11_the_seal_and_the_idle_decision_are_one_step
+CAUGHT  R11 a record after the seal is rejected  test_r11_a_line_queued_after_the_final_wait_is_rejected_and_the_exit_is_normal
+CAUGHT  R12 a failed start is contained  (exit 1)
+CAUGHT  R12 nobody waits for a writer that is not running  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  A4 the writer is started eagerly by node.run  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  A4 an enqueue never starts the writer  test_a4_no_enqueue_under_a_host_lock_or_on_a_lifecycle_thread_starts_the_writer
+CAUGHT  A5 the start claim is let go however it ends  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+rows: 39
+stale or broken: []
+missed: []
+exit 0
+
+commit 1cecd77
+CAUGHT  W5 flush is bounded (re-anchored)  test_flush_is_bounded_with_a_blocked_writer
+MISSED  R11 the seal is one step with the idle decision  
+CAUGHT  R12 the final wait does not wait for a writer that cannot start  test_r12_the_final_wait_does_not_wait_for_a_writer_that_cannot_start
+CAUGHT  A5 an interrupt in the snapshot propagates  test_a5_an_interrupt_inside_the_snapshot_propagates_and_leaves_nothing_held
+rows: 4
+stale or broken: []
+missed: ['R11 the seal is one step with the idle decision']
+exit 0
+
+commit e9a145c
+CAUGHT  R11 the seal is one step with the idle decision  test_r11_the_seal_and_the_idle_decision_are_one_step
+CAUGHT  R12 a failed start is contained  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  R12 nobody waits for a writer that is not running  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  A5 the start claim is let go however it ends  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+rows: 4
+stale or broken: []
+missed: []
+exit 0
+
+# Host-side logging: one writer, review round 2 (DESIGN_NOTES "Host-side logging: one writer, review round 2").
+# The writer's start is carried by a start-attempt token and the worker registers itself; the final wait starts
+# nothing and seals first; one production start. 11 new rows (R14 x5, A3 x4, R15 x2) and 8 re-anchored or
+# replaced; 208 rows, none stale. On 11c7717, 44 rows (every hostlog row, C1, A4 and the lifecycle registration
+# rows): 43 caught, "R14 registration consumes the token" MISSED (the death test caught it only when run alone).
+# On 6c510b3 (the token asserted directly) it was still MISSED in the full-file run: the reset clears the token and
+# a writer that persists across tests is not re-registered. On 91c71b6 (the death test starts its own writer) it
+# is caught, with the two death rows its test also covers.
+
+commit 11c7717
+CAUGHT  W2 a lifecycle thread never waits (the predicate)  test_r6_n3_no_handler_runs_for_a_provider_logger_on_the_watchdogs_thread
+CAUGHT  R7-2 stop_all is an entry point (successor)  test_r7_2_a_held_end_at_shutdown_runs_no_handler_before_the_signals[held]
+CAUGHT  A3 the exception's type only (successor)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  W3 nobody waits inside a boundary (the predicate)  test_a_thread_holding_a_host_lock_never_waits
+CAUGHT  L the level is checked at the call  test_a_line_the_logger_would_not_emit_is_not_kept
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's caller is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L the record's time is the call's  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary  test_r5_a_raising_log_handler_after_a_claim_changes_nothing_of_its_stop
+CAUGHT  R2 the checkpoint sender is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R2 the watchdog is enqueue-only  test_the_background_threads_register_as_enqueue_only_when_they_run
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R3 an errno is read with no code of the exception's  test_facts_never_call_a_hostile_exceptions_own_code
+CAUGHT  R7 a CalledProcessError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  R7 an HTTPStatusError subclass runs no code  test_facts_run_no_code_of_a_subclass_of_a_reviewed_class
+CAUGHT  W1 the writer is a lifecycle thread (a handler that logs never waits)  test_handlers_are_entered_only_on_the_writer_thread_at_depth_0
+CAUGHT  W1 a dead writer is replaced (re-anchored)  test_a_dead_writer_is_restarted_and_there_is_only_ever_one
+CAUGHT  W1 a handler raising anything is skipped per handler  test_a_handler_that_raises_anything_is_skipped_and_the_writer_goes_on
+CAUGHT  C3 a waiter on an evicted record is released  test_a_waiter_on_a_record_the_bound_evicted_is_released_at_once
+CAUGHT  C3 the stall latch  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  C3 the latch clears on a later completion  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  W5 flush is bounded (re-anchored)  test_flush_is_bounded_with_a_blocked_writer
+CAUGHT  C1 the node's main thread is a lifecycle thread (re-anchored)  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  W2 the session loop is a lifecycle thread  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  R11 the final wait seals first  test_r11_a_line_logged_during_the_final_wait_is_rejected
+CAUGHT  R11 a record after the seal is rejected  test_r11_a_line_queued_after_the_final_wait_is_rejected_and_the_exit_is_normal
+CAUGHT  R12 a failed start is contained (the making and the start)  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  R12 nobody waits for a writer that is not running  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  A4 the writer is started eagerly by node.run  test_every_thread_the_host_side_modules_start_is_a_lifecycle_thread
+CAUGHT  A4 an enqueue never starts the writer  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  R14 a failed or interrupted start cancels its token  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  R12 the final wait does not wait for a writer that cannot start  test_r12_the_final_wait_does_not_wait_for_a_writer_that_cannot_start
+CAUGHT  A5 an interrupt in the snapshot propagates  test_a5_an_interrupt_inside_the_snapshot_propagates_and_leaves_nothing_held
+CAUGHT  R14 the worker registers itself  test_r5_w_no_log_handler_runs_on_the_watchdogs_thread
+CAUGHT  R14 a worker never registers after the seal  test_r14_a_worker_that_registers_after_the_seal_touches_nothing
+CAUGHT  R14 a worker whose token was cancelled never registers  test_r14_an_interrupt_after_the_launch_cancels_the_start_and_the_late_worker_touches_nothing
+MISSED  R14 registration consumes the token  
+CAUGHT  R14 the cancellation never undoes a registration  test_r14_a_registration_the_worker_won_is_never_undone_by_the_starters_cleanup
+CAUGHT  A3 concurrent claimants return while a start is pending  test_r14_a_worker_that_registers_after_the_seal_touches_nothing
+CAUGHT  A3 the seal cancels every pending start  test_r14_a_worker_that_registers_after_the_seal_touches_nothing
+CAUGHT  A3 a dead writer deregisters  test_a3_a_registered_writer_that_dies_releases_every_waiter
+CAUGHT  A3 a dead writer wakes every waiter  test_a3_a_registered_writer_that_dies_releases_every_waiter
+CAUGHT  R15 the final wait starts nothing  test_r12_the_final_wait_does_not_wait_for_a_writer_that_cannot_start
+CAUGHT  R15 no start claim after the seal  test_r15_no_start_after_the_seal
+rows: 44
+stale or broken: []
+missed: ['R14 registration consumes the token']
+exit 0
+
+commit 6c510b3
+MISSED  R14 registration consumes the token  (the same 3 rows: the 2 death rows caught; not kept)
+
+commit 91c71b6
+CAUGHT  R14 registration consumes the token  test_a3_a_registered_writer_that_dies_releases_every_waiter
+CAUGHT  A3 a dead writer deregisters  test_a3_a_registered_writer_that_dies_releases_every_waiter
+CAUGHT  A3 a dead writer wakes every waiter  test_a3_a_registered_writer_that_dies_releases_every_waiter
+rows: 3
+stale or broken: []
+missed: []
+exit 0
+
+# Host-side logging, review round 3 (the PR's reviews), with R17 (the PR's automated review) and the merge of
+# origin/main (C1, #122): DESIGN_NOTES "Host-side logging: one writer, review round 3 (the PR's reviews)", its
+# "Runs and mutation results". 304 rows, none stale. On 7989c28: round 3's 13 new and 19 re-anchored rows, the 9
+# rows the merge re-anchored, and R17's 3 (re-run here): 44, all caught; each failing test checked to be the one
+# that pins the mutated behaviour. Four rows were run again alone (their failure timing-shaped, or not the direct
+# pin): caught again, by the same tests. On 4f57589 (Sol's should: the chain's cut a reason, labelled by the
+# writer): R20's rows (one re-anchored, two new) and the chain's A3 successor: 8, all caught.
+
+commit 7989c28
+CAUGHT  T no log handler under the cutoff lock (R18: a native lock)  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  N1 the self-stop and kills under main's unbounded lock  test_r6_n1_the_kill_step_waits_for_the_loops_lock_as_main
+CAUGHT  N2 the bulk signal pass before any transcript (re-anchored: C1)  test_r6_n2_a_stalled_transcript_write_at_shutdown_holds_up_no_kill
+CAUGHT  A3 the exception's type only (successor: the chain)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  E2 a registry miss is not a refusal (re-anchored)  test_r9_e2_a_registry_miss_is_not_a_verified_exit[gone]
+CAUGHT  D3 a barrier there before is ALREADY (re-anchored: C1)  test_r9_d3_try_stopping_says_what_happened
+CAUGHT  S3 the registry inserts the barrier on a miss  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[kept]
+CAUGHT  A2 the runner lock is a host lock (R18: a native Lock)  test_no_handler_is_entered_under_a_host_lock_on_the_nodes_routes[n_start-blocks]
+CAUGHT  A2 the registry lock is a host lock (R18: a native RLock)  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary (R18: first, at the call site)  test_r18_every_host_lock_and_hostlogs_own_lock_is_entered_by_c_code
+CAUGHT  R1 the report lock is a boundary (R18: a native Lock)  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  R1 the ack lock is a boundary (R18: a native RLock)  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  R1 a steer attempt's record lock is a boundary (R18: a native RLock)  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R6 no lock through an import alias (re-anchored: C1)  test_every_lock_of_the_host_side_modules_is_built_as_reviewed
+CAUGHT  C3 a waiter on an evicted record is released  test_a_waiter_on_a_record_the_bound_evicted_is_released_at_once
+CAUGHT  C3 the stall latch  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  W5 flush is bounded (the main thread's poll)  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  C4 a stalled writer does not hold the exit  test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock[stalled]
+CAUGHT  R11 the final wait seals first  test_r11_the_seal_comes_before_the_final_waits_first_look
+CAUGHT  R12 nobody waits for a writer that is not running  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  R14 a failed or interrupted start cancels its token  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  PR a mapping is handed to makeRecord as logging does (a one-element tuple)  test_pr_a_single_key_mapping_line_is_written_with_its_value
+CAUGHT  PR a record lost before any handler is counted and said  test_pr_a_record_that_cannot_be_made_is_counted_not_lost_silently
+CAUGHT  R18 hostlog's own lock is a raw lock entered by C code  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  R18 an explicit acquire is inside a boundary  test_r18_every_host_lock_and_hostlogs_own_lock_is_entered_by_c_code
+CAUGHT  R19 the node hands its hostlog logger to with_managed_env  test_r19_the_node_passes_its_hostlog_logger_at_every_call_of_the_two_helpers
+CAUGHT  R19 with_managed_env logs through the logger it is given  test_r19_the_nodes_dispatch_helpers_log_through_hostlog
+CAUGHT  R20 the chain follows the cause  test_r20_a_chained_exception_keeps_every_type_and_frame_and_no_text
+CAUGHT  R20 the chain is read through BaseException's own descriptors  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 a cycle is cut by identity  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 the chain's depth is capped  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 the chain's frames are capped  test_r20_the_frames_of_a_chain_are_capped_and_the_cut_is_said
+CAUGHT  R21 an interrupt during the final wait counts as stalled  test_r21_an_interrupt_during_the_final_wait_takes_the_stalled_exit
+CAUGHT  A3 the main thread polls outside the lock  test_r21_the_main_threads_final_wait_holds_the_queues_lock_only_briefly
+CAUGHT  A4 the reset clears a stale registration  test_a4_stale_bookkeeping_fails_closed_and_only_the_reset_clears_it
+CAUGHT  R22 only later() and facts() make a rendered value  test_r22_only_later_and_facts_make_a_value_the_writer_renders
+CAUGHT  C1R5A5 a libproc load failure is no proof (re-anchored: hostlog)  test_c1_no_libproc_is_not_proof
+CAUGHT  C1R5A5 a load failure is said once (re-anchored: hostlog)  test_r12_on_macos_a_libproc_load_failure_retains_and_says_so_once
+CAUGHT  C1R6 R14 contention counts as still unproved (re-anchored: R18)  test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock
+CAUGHT  C1R6 R15 the installation is inside the protected region (re-anchored: R18)  test_r15_an_interrupt_after_the_fence_is_installed_never_leaves_it_fenced[inside-the-installation]
+CAUGHT  C1R6 the release fence is not HELD (re-anchored: R18)  test_r10_a_start_failed_read_at_the_reap_fails_only_its_own_message
+CAUGHT  C1R6 the rule fences admission before the final reads (re-anchored: R18)  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+rows: 44
+stale or broken: []
+missed: []
+exit 0
+
+commit 7989c28 (again, alone)
+CAUGHT  A2 the runner lock is a host lock (R18: a native Lock)  test_no_handler_is_entered_under_a_host_lock_on_the_nodes_routes[n_start-blocks]
+CAUGHT  W5 flush is bounded (the main thread's poll)  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  C4 a stalled writer does not hold the exit  test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock[stalled]
+CAUGHT  R21 an interrupt during the final wait counts as stalled  test_r21_an_interrupt_during_the_final_wait_takes_the_stalled_exit
+rows: 4
+stale or broken: []
+missed: []
+exit 0
+
+commit 4f57589
+CAUGHT  A3 the exception's type only (successor: the chain)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  R20 the chain follows the cause  test_r20_a_chained_exception_keeps_every_type_and_frame_and_no_text
+CAUGHT  R20 the chain is read through BaseException's own descriptors  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 a cycle is cut by identity  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 the chain's depth is capped  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 the chain's frames are capped  test_r20_the_frames_of_a_chain_are_capped_and_the_cut_is_said
+CAUGHT  R20 the cut is said only when something was left out  test_r20_the_cut_is_said_only_when_frames_or_exceptions_were_left_out
+CAUGHT  R20 the cut's label is rendered by the writer, not at the call  test_r20_the_frames_of_a_chain_are_capped_and_the_cut_is_said
+rows: 8
+stale or broken: []
+missed: []
+exit 0

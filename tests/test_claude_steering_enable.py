@@ -494,9 +494,12 @@ class _Sink:
     """A log handler on the package's logger that blocks (until released) or raises on a steer diagnostic, and says
     what it saw when it was entered."""
 
-    def __init__(self, s, child, mode):
+    def __init__(self, s, child, mode, host=None):
         import logging
+        from hostlog_guard import own
         self.s, self.child, self.mode = s, child, mode
+        self.locks = [] if host is None else [("cutoff", own(host, "_steer_stop_lock")),
+                                              ("registry", own(host.groups, "lock"))]
         self.entered, self.release, self.seen = threading.Event(), threading.Event(), []
         self.h = logging.Handler(logging.DEBUG)
         self.h.emit = self.emit
@@ -505,7 +508,7 @@ class _Sink:
     def emit(self, rec):
         if "the steer into message" not in rec.getMessage():
             return
-        self.seen.append((self.child.terminated, self.s.stopping_since))
+        self.seen.append((self.child.terminated, self.s.stopping_since, [n for n, lk in self.locks if lk.mine()]))
         self.entered.set()
         if self.mode == "raises":
             raise RuntimeError("a log handler failed")
@@ -525,33 +528,31 @@ class _Sink:
 
 @pytest.mark.parametrize("mode", ["blocks", "raises"])
 @pytest.mark.parametrize("route", CLAIMED, ids=lambda f: f.__name__)
-def test_r1_a_claimed_main_route_signals_before_any_handler_and_writes_its_lines_at_the_flush(henv, monkeypatch,
-                                                                                                route, mode):
-    """Review round 1, R1 and A2: on a claimed main route the claim makes the decision (memory only), the route's own
-    main stop runs next, and the claim's lines go to the deferred queue: no log handler is entered by the call
-    (under the runner lock); the group is signalled and its kill clock armed before any is; the lines are written at
-    the loop's flush (`flush_watch_logs`), a handler that blocks or raises there changing nothing of the stop. A
-    sibling's due SIGKILL goes from another thread meanwhile (the host takes no lock for it); under the node the
-    watchdog's kill waits for the runner lock as for any loop work, which no claim line now holds."""
-    from agent_comms import session_host
+def test_r1_a_claimed_main_route_signals_before_any_handler_and_writes_its_lines_at_the_calls_drain(
+        henv, monkeypatch, route, mode):
+    """Review round 1, R1 and A2, as host-side logging has them (successor of "... writes its lines at the flush"):
+    on a claimed main route the claim makes the decision (memory only), the route's own main stop runs next, and the
+    claim's lines are deferred records: a handler is entered only by the call's own drain as it returns, after the
+    group was signalled and its kill clock armed, with no host lock held; a handler that blocks there holds only that
+    drain (a sibling's due SIGKILL goes from another thread meanwhile: the host takes no lock for it), and one that
+    raises is caught there and changes nothing of the stop."""
     s, child, arm, act = route(henv, monkeypatch)
     child.exits_on_terminate = False
     sb, cb = _sibling_kill_due(henv)
     arm()
     henv.clock.advance(henv.host.kill_grace + 1)
-    with _Sink(s, child, mode) as sink:
+    with _Sink(s, child, mode, host=henv.host) as sink:
         out, err, done = _run(act)
-        assert done.wait(5), "the call returned: no handler held it"
-        assert not sink.entered.is_set(), "no log handler entered by the call"
+        assert sink.entered.wait(5), "the line, at the call's own drain"
+        terminated, since, held = sink.seen[0]
+        assert terminated >= 1 and since is not None, "entered only after the signal and the clock"
+        assert held == [], "with no host lock held"
+        henv.host.kill_due()
+        assert cb.killed, "the sibling's due SIGKILL, whatever the handler does"
+        sink.release.set()
+        assert done.wait(5), "the call returned"
         assert not err, err
         assert child.terminated >= 1 and s.stopping_since is not None, "signalled, its kill clock armed"
-        henv.host.kill_due()
-        assert cb.killed, "the sibling's due SIGKILL"
-        flushed, ferr, fdone = _run(lambda: session_host.flush_watch_logs())
-        assert sink.entered.wait(3), "the line, at the loop's flush"
-        assert sink.seen[0][0] >= 1 and sink.seen[0][1] is not None, "entered only after the signal and the clock"
-        sink.release.set()
-        assert fdone.wait(5) and not ferr, ferr
 
 
 def test_r1_a1_a_decision_that_raises_after_the_latch_still_reaches_the_stop(henv, monkeypatch):
@@ -692,22 +693,23 @@ def test_a3_a_live_child_with_no_key_takes_mains_path_without_a_filesystem_call(
 
 
 def test_a2_under_the_node_a_claims_lines_are_written_outside_the_runner_lock(env):
-    """Review round 1, A2: under the node, a claimed main route's lines (N's timeout with a live attempt, before its
-    native end) are written by the loop's flush at the start of a pass, BEFORE it takes the runner lock
-    (node_sessions `pass_once`); a node's host writes none at its tick (`keep_outbox`): no handler is entered while
-    the runner lock is held, and the group was signalled before."""
+    """Review round 1, A2, as host-side logging has it: under the node, a claimed main route's lines (N's timeout with
+    a live attempt, before its native end) are written by the node's drain right after it lets go of the runner lock,
+    in that same pass: no handler is entered while the runner lock is held, and the group was signalled before."""
     import logging
+    from hostlog_guard import own
     from test_claude_steering import claude_steered
     a, ca, n, s_uuid = claude_steered(env)
     runner = env.node.sessions
     host = runner.host
     sa = host.sessions[a]
     seen = []
+    lock = own(runner, "lock")
 
     class H(logging.Handler):
         def emit(self, rec):
             if "the steer into message" in rec.getMessage():
-                seen.append((runner.lock.locked(), ca.terminated))
+                seen.append((lock.mine(), ca.terminated))
     h, lg = H(logging.DEBUG), logging.getLogger("agent_comms")
     level = lg.level
     lg.addHandler(h)
@@ -717,8 +719,7 @@ def test_a2_under_the_node_a_claims_lines_are_written_outside_the_runner_lock(en
         runner._renew_contact(env.clock())
         runner.pass_once()
         assert ca.terminated >= 1 and sa.in_flight is None, "the timeout failed N and stopped its process"
-        runner.pass_once()
-        assert seen, "the line, at the loop's flush"
+        assert seen, "the line, in that same pass"
         assert all(not locked for locked, _ in seen), "never written under the runner lock"
         assert all(term >= 1 for _, term in seen), "only after the signal"
     finally:
@@ -728,20 +729,56 @@ def test_a2_under_the_node_a_claims_lines_are_written_outside_the_runner_lock(en
 
 @pytest.mark.parametrize("mode", ["blocks", "raises"])
 @pytest.mark.parametrize("route", [r_partial_write, r_steer_pipe], ids=lambda f: f.__name__)
-def test_a2_a_reserved_stops_lines_go_to_the_deferred_queue_too(henv, monkeypatch, route, mode):
-    """Review round 1, A2 (the same order for the reserved stop): its commit's lines (N's steer outcome) are handed to
-    the deferred queue; no log handler is entered by the call; the group is signalled first; the loop's flush writes
-    them."""
-    from agent_comms import session_host
+def test_a2_a_reserved_stops_lines_are_written_by_the_calls_drain_too(henv, monkeypatch, route, mode):
+    """Review round 1, A2 (the same order for the reserved stop), as host-side logging has it (successor of "... go
+    to the deferred queue too"): its commit's lines (N's steer outcome) are deferred records; a handler is entered
+    only by the call's own drain, after the group was signalled, with no host lock held; one that blocks holds only
+    that drain, one that raises is caught there."""
     s, child, arm, act, retry = route(henv, monkeypatch)
     child.exits_on_terminate = False
     arm()
-    with _Sink(s, child, mode) as sink:
+    with _Sink(s, child, mode, host=henv.host) as sink:
         out, err, done = _run(act)
-        assert done.wait(5) and not err, err
-        assert not sink.entered.is_set(), "no log handler entered by the call"
-        assert child.terminated == 1 and s.stopping_since is not None
-        flushed, ferr, fdone = _run(lambda: session_host.flush_watch_logs())
-        assert sink.entered.wait(3), "the line, at the loop's flush"
+        assert sink.entered.wait(5), "the line, at the call's own drain"
+        terminated, since, held = sink.seen[0]
+        assert terminated == 1 and since is not None and held == []
         sink.release.set()
-        assert fdone.wait(5) and not ferr, ferr
+        assert done.wait(5) and not err, err
+        assert child.terminated == 1 and s.stopping_since is not None
+
+
+# ---------------------------------------------------------------- host-side logging: no handler under a host lock
+
+
+def _route_parts(r):
+    s, child, arm, act = r[:4]
+    return s, child, arm, act, (r[4] if len(r) > 4 else None)
+
+
+@pytest.mark.parametrize("mode", ["blocks", "raises"])
+@pytest.mark.parametrize("under", ["host", "node"])
+@pytest.mark.parametrize("route", RESERVED + MAINS, ids=lambda f: f.__name__)
+def test_hostlog_no_handler_is_entered_under_a_host_lock_on_any_route(henv, monkeypatch, route, under, mode):
+    """Host-side logging (DESIGN_NOTES "Host-side logging"): on every route of the two matrices, a handler that blocks
+    or raises is never entered while the calling thread holds the cutoff lock or the registry lock, nor (`node`: the
+    route run as the node runs it, under its runner lock) the runner lock; a sibling's SIGKILL is due meanwhile."""
+    from hostlog_guard import Guard, runner_lock
+    s, child, arm, act, retry = _route_parts(route(henv, monkeypatch))
+    child.exits_on_terminate = False
+    sb, cb = _sibling_kill_due(henv)
+    lock, inner = runner_lock()
+
+    def call(fn):
+        if under == "node":
+            with lock:
+                return fn()
+        return fn()
+    with Guard(henv.host, mode=mode, extra=[("runner", inner)]) as g:
+        call(arm)
+        henv.clock.advance(henv.host.kill_grace + 1)
+        call(lambda: act() + henv.host.tick())
+        if retry is not None:
+            call(retry)
+        call(henv.host.tick)
+    assert not g.violations, g.violations
+    assert cb.killed, "the sibling's SIGKILL"

@@ -43,6 +43,19 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(autouse=True)
+def _hostlog_fresh(monkeypatch):
+    """Host-side logging's one writer (agent_comms.hostlog), between tests: before and after each, the writer idle
+    (bounded) and the queue empty, so no record crosses into the next test's handlers (`caplog`); a generous
+    acknowledgement bound for the suite, so machine load never turns a late handoff into a failed `caplog` assertion
+    (tests of blocked handlers set it small themselves)."""
+    from agent_comms import hostlog
+    monkeypatch.setattr(hostlog, "ACK_SECONDS", 30.0)
+    hostlog._reset()
+    yield
+    hostlog._reset()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_notifications(monkeypatch):
     """Tests never spawn osascript; tests that exercise delivery inject their own deliverer."""
     monkeypatch.setattr(notify.MacOSDeliverer, "available", lambda self: False)

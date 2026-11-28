@@ -647,11 +647,12 @@ def make_browser_output(config: "DispatchConfig", path: Path | str) -> Path:
     return path
 
 
-def remove_browser_output(record: dict) -> None:
+def remove_browser_output(record: dict, logger: Any = None) -> None:
     """Delete a finished run's browser output directory, only when it is exactly one of its attempts' own
     (`<log dir>/<run id>-browser[-<n>]`). Called only once the run's process is gone (exit, spawn failure, or an
     orphan found dead), never while the agent may still be copying evidence out of it. Never through a symlink on
-    the way to it: such a directory is left where it is, and said once in the log."""
+    the way to it: such a directory is left where it is, and said once in the log (through `logger`, or this
+    module's own logger: the node passes its hostlog one, review round 3, R19)."""
     hb = (record.get("headless_browser") or record.get("signed_in_browser")) if isinstance(record, dict) else None
     out, run_id, log = (hb or {}).get("output_dir"), record.get("run_id"), record.get("log")
     if not (isinstance(out, str) and isinstance(run_id, str) and isinstance(log, str)):
@@ -662,8 +663,8 @@ def remove_browser_output(record: dict) -> None:
     if os.path.realpath(path.parent) != os.path.abspath(path.parent):
         if str(path) not in _LEFT_UNDER_SYMLINK and os.path.lexists(path):
             _LEFT_UNDER_SYMLINK.add(str(path))
-            log_ = logging.getLogger("agent_comms.dispatch")
-            log_.warning("left the browser output %s where it is: its folder is reached through a symlink", path)
+            log_ = logger if logger is not None else logging.getLogger("agent_comms.dispatch")
+            log_.warning("left the browser output %s where it is: its folder is reached through a symlink", str(path))
         return
     shutil.rmtree(path, ignore_errors=True)
 
@@ -674,7 +675,7 @@ def with_headless_browser(template: list[str], overrides: list[str]) -> list[str
     return template[:i] + overrides + template[i:]
 
 
-def with_managed_env(template: list[str], env: dict[str, str]) -> list[str]:
+def with_managed_env(template: list[str], env: dict[str, str], logger: Any = None) -> list[str]:
     """A dispatched Codex run: Codex starts an MCP server with a small fixed environment, not its own, so the board
     server is given AGENT_COMMS_MANAGED, with the value child_env put in the run's `env`, as a literal of its own
     (`-c mcp_servers.agent-comms.env.AGENT_COMMS_MANAGED=...`), as Claude's board server inherits it; the spawn tools
@@ -695,8 +696,9 @@ def with_managed_env(template: list[str], env: dict[str, str]) -> list[str]:
         return template
     entry = codex_board_server(template, env)
     if entry is None or not isinstance(entry.get("command"), str) or not entry["command"].strip() or "url" in entry:
-        log.warning("a Codex run without a stdio %s server the dispatcher can see: AGENT_COMMS_MANAGED is not "
-                    "passed to its board server", CODEX_SERVER)
+        (logger if logger is not None else log).warning(       # (the node passes its hostlog logger: R19)
+            "a Codex run without a stdio %s server the dispatcher can see: AGENT_COMMS_MANAGED is not "
+            "passed to its board server", CODEX_SERVER)
         return template
     if "--" in template:
         at = template.index("--")
