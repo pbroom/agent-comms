@@ -20465,3 +20465,203 @@ is main's own code, which the two KILL tests fail on.
 ### Runs (C3-2b-1)
 
 In the hand-back (the targeted runs and one parallel suite on the final head).
+
+### Ownership C3-2b-1: review round 1 (Sol on 959a09e: 3 blockers, 1 should)
+
+Each ruling had a reproduction test first, run against 959a09e (the failure it showed there is given with the test).
+Parts A and C above are SUPERSEDED where they say otherwise: a failed commit no longer removes its file, GO is no
+longer written under the registry lock, the crash-window table is the one below, and `launch`/`release` take an
+`owners` argument.
+
+**R1 [blocker]. A supervised launch is admitted through a PROVISIONAL fence, and GO is written outside the registry
+lock.** Was: `launch` wrote GO inside `Groups.start`'s spawn callback, under the registry lock (a shim that does not
+read held that lock for the GO timeout, and a sibling's `stopping()` waited behind it); `Groups.start` returned with
+the entry LIVE before `launch` marked a failed GO STOPPING; and an interrupt after GO's last byte, inside the
+callback but outside its `try`, made `Groups.start` drop the entry before the outer handler restored it.
+Now (`node_groups.py`, `shimlaunch.py`):
+- `Groups.admit_provisional(cwd, token, k)` (a supervised token only): under the registry lock, the same check `start`
+  makes (closed admission, a fenced checkout), then a PROVISIONAL entry for the token. PROVISIONAL is in `_FENCE`: it
+  fences the checkout (`start`, `blocked`, `stopping_dirs` and another `admit_provisional` all see it). No I/O and no
+  spawn under the lock. It is called only after the journal commit returned.
+- GO is written after `admit_provisional` returns, OUTSIDE the lock (`ShimChild.go`, bounded by `go_timeout`).
+- `Groups.confirm_live(token)` makes only a PROVISIONAL entry LIVE, and only once `go()` RETURNED (GO confirmed whole).
+  From then on C1's sharing rule applies, as for a direct start's entry. A STOPPING or HELD entry is never revived.
+- A GO that failed or is ambiguous (an `Exception` from `go`): the writer is closed, `stopping()` turns the entry
+  STOPPING, and GO_FAILED is returned with the owner parked. ANY exception or interrupt from the provisional install
+  on (`_unwind`): `restore_held` turns the entry HELD (PROVISIONAL, LIVE or STOPPING; with no entry, one is installed),
+  THEN the writer is closed. The entry is never dropped, and while the handler has not yet run, PROVISIONAL itself
+  fences.
+- Refused at the admission after the commit: unchanged in kind (no GO, a HELD reservation, the writer closed), and the
+  owner is parked (R4).
+- The rest of the registry and PROVISIONAL: `stopping`/`try_stopping` move it to STOPPING; C1's `release` keeps it as
+  it is at the fence (`_admit_fence` changes only LIVE), makes it HELD on a refused proof and removes it on a proof;
+  `_held_if_fenced` does not touch it.
+
+Tests (tests/test_shim_launch.py):
+- `test_r1_nothing_holds_the_registry_lock_while_go_is_written_and_the_checkout_is_fenced_meanwhile`: the real shim is
+  SIGSTOPped through its own handle right after the commit, and GO carries a 256 KiB argument, so it cannot complete.
+  While GO is being written: another checkout's `stopping()` and a start there return within 1 s; a start in this
+  checkout is refused; the state is PROVISIONAL. After SIGCONT: STARTED, LIVE. On 959a09e: "another checkout's
+  stopping() returned at once" failed (it waited for the registry lock).
+- `test_r1_an_interrupt_at_every_step_from_the_provisional_install_to_live_keeps_the_entry_fencing[...]`, 10 points:
+  inside `admit_provisional` before and after the install, `admitted`, `go`, after GO's last byte (`last-byte`),
+  `went`, inside `confirm_live` before and after the change, `live`, and `handed` (after the owner was handed over).
+  At every point up to the LIVE transition a probe on the launching thread finds the checkout fenced (`blocked`, and a
+  direct start refused with nothing spawned). After the interrupt: HELD, fenced, record kept, writer closed, owner
+  parked; the shim exits on EOF; `release` gives RELEASED once and ALREADY_RELEASED after. On 959a09e: at `go` and at
+  `last-byte` the probe found the checkout NOT fenced (`[('go', False)]`, `[('last-byte', False)]`); the other points
+  do not exist there.
+- `test_r1_the_registrys_provisional_entry`: the registry alone (refusals, the fence, LIVE only from PROVISIONAL, a
+  STOPPING one kept, closed admission, a supervised token only). New API: it cannot run on 959a09e.
+- `test_launch_no_registry_entry_exists_before_the_durable_commit` (changed): PROVISIONAL at `admitted`, `go` and
+  `went`; LIVE only at `live`.
+
+**R2 [blocker]. The journal directory's own entry is durable before any commit is trusted.** Was: `make()` synced the
+parent only when its own `mkdir` succeeded, so a first commit whose parent sync failed left a directory the next
+commit trusted without the sync. Now (`shimjournal.py`): `Journal._parent_synced`, set only after `_sync_dir(parent)`
+RETURNED; until then every `make()` (so every commit) syncs the parent, whether or not it made the directory. A parent
+sync that fails fails the commit before anything is created. Per process: a new process (a new `Journal`) syncs the
+parent on its first commit. Test: `test_the_parent_is_synced_on_every_commit_until_this_process_has_synced_it`
+(tests/test_shim_journal.py: the first parent sync fails, then a second commit must sync the parent; a third does not;
+a new `Journal` does once). On 959a09e: "the parent is synced by the next commit" failed.
+
+**R3 [blocker]. A failed commit removes nothing.** Was: on a failure after the create, `commit` unlinked "its own"
+file by pathname, which a same-user process could have substituted. Now: `commit` has no cleanup at all. A failed or
+partial record is LEFT in place and the commit raises; `launch` then never writes GO, closes the writer and, since
+something is at the record's path (`Journal.exists`: an lstat; any failure to look counts as "something"), fences it
+HELD with its owner parked, row (b) below. The shim, given EOF before GO, publishes its never-started proof, and
+`release` on that proof is the one unlink (`remove`). A partial record found at a later start cannot be told from
+damage to a committed one: `load()` raises `JournalUnreadable` for it, admission stays closed until a person checks
+that nothing of that launch runs and removes the file. Every `JournalUnreadable` reason now names the full path (of
+the entry, or of the directory), and the node's one start-up WARNING carries the reason, so it names the file.
+(`node.py` is unchanged: its WARNING already includes the reason.) Tests:
+- `test_a_commit_that_fails_removes_nothing_and_raises[write|file-sync|dir-sync]` (replaces
+  `test_a_commit_that_fails_leaves_no_record`): no unlink or remove called; the file is left; a partial one makes the
+  journal unreadable with its path in the reason; a whole one loads. On 959a09e: "a failed commit removes nothing".
+- `test_commit_and_all_it_calls_never_unlink_remove_rename_or_replace` (AST): `Journal.commit` and every function or
+  method of the module it calls, by name and transitively (`make`, `_path`, `Record.check`, `to_json`, `_from_json`,
+  `_sync_dir`, `_fullsync`, `_write_all`, `_check_private`, ...), names no unlink, remove, rename, replace, rmdir,
+  truncate or shutil; module-wide, `os.unlink` appears only in `Journal.remove`. On 959a09e: `('Journal.commit',
+  'os.unlink')`.
+- `test_an_unreadable_journal_closes_admission_for_the_whole_node_and_says_so_once` (tests/test_shim_restore.py,
+  changed): the WARNING names the offending file's path. On 959a09e: it named only the file's name.
+- `test_launch_a_commit_that_fails_after_its_file_exists_is_fenced_and_owned[file-sync|dir-sync]`: row (b). On
+  959a09e: "the failed commit removed nothing" failed (the record was gone).
+
+**R4 [should, fixed]. One cleanup owner per launch; release serialised per launch.**
+- The owner is the `Launch`. It is PARKED in `shimlaunch.Owners` (one dict keyed by launch id, no lock: one store, pop
+  or copy each; the node will keep ONE `Owners` beside its journal, the wiring PR, and ask `release` of each parked
+  launch on its passes) BEFORE its shim can exist. `ShimChild.start(..., adopt=)` hands the handle to the owner the
+  moment the handle exists (`adopt` sets `launch.handle`, one attribute store), before the secret is sent. In the
+  handle: if anything is raised once the spawn returned and before `_launch` returns, a handle is made for the spawn
+  if it has none and the shim is abandoned before GO (reaped by that handle); if the secret's send is interrupted,
+  `start` abandons it before raising. (A double abandon, by the handle's code and by the owner, is harmless.)
+- `launch` unparks the owner only when it hands a LIVE launch to its caller (row (c)), or when it reaches row (a). A
+  launch in row (b) stays parked, also when it is returned (REFUSED_AFTER_COMMIT, GO_FAILED). An interrupt after the
+  unpark and before the return is caught by `_unwind`, which parks it again and makes it HELD.
+- `release(groups, journal, owners, launch)` runs under the launch's own release lock (`Launch.release_lock`, a host
+  lock: a native RLock, entered as `with hostlog.BOUNDARY, launch.release_lock:`, on tests/test_hostlog.py's
+  `BOUNDARIES` and `HOST_LOCK_ATTRS`; the proof's reads and the record's removal run under it, never under the
+  registry's). Exactly one call removes the record, lifts the entry and answers RELEASED; it sets `launch.released`
+  and unparks the owner. A concurrent call waits for it and, like any later call, answers ALREADY_RELEASED. KEPT: no
+  evidence yet, or the record's removal failed (the fence stays, HELD). A launch with no record (NOT_ADMITTED, or an
+  abandoned shim not yet reaped) is RELEASED once its shim, if any, is reaped by its handle. The results are strings:
+  callers compare them, never test their truth.
+
+The launch-state table (every exit from `launch()`; each row pinned by the named test):
+
+| Exit from `launch()` | State | Record | Registry | The shim | Owner | Pin |
+| --- | --- | --- | --- | --- | --- | --- |
+| the first look refuses: NOT_ADMITTED | (a) | none | none | none spawned | never parked | `test_a_launch_into_a_blocked_checkout_starts_nothing` |
+| `ShimChild.start` raises before any spawn (no boot identity) | (a) | none | none | none | unparked | `...no_unreaped_shim[shim-start]` |
+| raised once the spawn returned, before its handle was made | (a) | none | none | a handle made for it, abandoned, reaped | unparked | `[spawn-handoff]` |
+| raised while the secret is sent | (a) | none | none | abandoned (by `start`), reaped | unparked | `[send-secret]`, `test_start_with_no_owner_abandons_the_shim_on_an_interrupt_while_its_secret_is_sent` |
+| raised after `start` returned, before the commit | (a) | none | none | abandoned, reaped | unparked | `[after-start]` |
+| the commit raised with nothing at the record's path | (a) | none | none | abandoned, reaped | unparked | `[commit-before-create]` |
+| the commit raised, a file left at the record's path | (b) | left, whole or partial | HELD | writer closed: never started | parked | `test_launch_a_commit_that_fails_after_its_file_exists_is_fenced_and_owned` |
+| raised after the commit, before the admission | (b) | kept | HELD | writer closed: never started | parked | `test_launch_an_interrupt_after_the_commit_and_before_the_registry_step_is_fenced_and_owned` |
+| refused at the admission: REFUSED_AFTER_COMMIT | (b) | kept | HELD | writer closed: never started | parked, returned | `test_launch_refused_at_the_atomic_check_after_the_commit_is_held_and_owned` |
+| raised inside the admission, or from the provisional install to GO | (b) | kept | HELD | writer closed: never started | parked | `...every_step...[admit-before, admit-after, admitted, go]` |
+| GO failed or ambiguous: GO_FAILED | (b) | kept | STOPPING | writer closed: never started, or its CLI stopped on EOF | parked, returned | `test_launch_an_ambiguous_or_failed_go_retains_the_record_and_the_reservation` |
+| raised after GO's last byte, or after GO returned (before or after LIVE, or after the hand-over) | (b) | kept | HELD | writer closed: the CLI stopped on EOF | parked | `...every_step...[last-byte, went, live-before, live-after, live, handed]` |
+| STARTED | (c) | kept | LIVE | running | unparked: the caller's | `test_launch_no_registry_entry_exists_before_the_durable_commit` |
+
+The crash-window table, corrected (the node process DIES: its in-memory registry and `Owners` go with it):
+
+| The node dies | Record | The shim | The next start |
+| --- | --- | --- | --- |
+| before the commit is entered | none | EOF before GO (or before its secret): never started | nothing to restore |
+| inside the commit, nothing created yet (or the parent's sync not returned) | none | EOF before GO: never started | nothing; its next commit syncs the parent first (R2) |
+| inside the commit, the file created but not known durable | absent, whole or partial | EOF before GO: never started | absent: nothing; whole: restored HELD; partial: `JournalUnreadable`, admission closed, the WARNING names the file |
+| after the commit, before GO | kept | EOF before GO: never started, its marker published | restored HELD |
+| GO partly written | kept | a partial frame and EOF: never started | restored HELD |
+| GO whole (before or after LIVE) | kept | EOF: TERM, KILL after the grace, repeated; proof published | restored HELD |
+
+Tests for R4 (tests/test_shim_launch.py):
+- `test_launch_a_failure_before_the_commit_leaves_no_record_no_entry_and_no_unreaped_shim[shim-start|send-secret|spawn-handoff|after-start|commit-before-create]`
+  (rows (a); "unreaped" is now read with sysctl, never `waitpid`, which would itself reap). On 959a09e: `send-secret`
+  and `spawn-handoff` left the shim unreaped; the others passed there (rows already met).
+- `test_launch_an_interrupt_after_the_commit_and_before_the_registry_step_is_fenced_and_owned` (replaces
+  `test_launch_a_crash_after_the_commit_and_before_go_leaves_the_record_and_the_shim_publishes_never_started`, which
+  modelled a node that dies by an in-process exception; that case is now the restore's). On 959a09e: the state was
+  None (a record with no entry).
+- `test_launch_refused_at_the_atomic_check_after_the_commit_is_held_and_owned` (new: that row had no test).
+- `test_release_is_serialised_per_launch_exactly_one_caller_releases`: the second caller waits on the launch's lock
+  while the first is between its two steps, then is told ALREADY_RELEASED. On 959a09e: both callers ran at once.
+- `test_a_failed_record_removal_keeps_the_fence_and_reports_failure`: KEPT, HELD, the record kept; then RELEASED, then
+  ALREADY_RELEASED. On 959a09e: a second `release` answered True again.
+- The ones the first builder listed as missing: `test_abandon_before_go_kills_a_shim_that_does_not_exit_and_reaps_it`
+  (the shim SIGSTOPped through its handle: SIGKILL after the bound, status -9, reaped by its handle, no CLI);
+  `test_abandon_before_go_refuses_once_any_go_byte_was_attempted[no-byte|whole]`; the interrupt inside the registry
+  step is `...every_step...[admit-before|admit-after|live-before|live-after]`. The first two cover code that 959a09e
+  already had, and pass there.
+- Every existing launch and release test now also checks the owner (parked in (b), not in (c)) and the release
+  results (`settled_b`).
+
+**Limits, stated.**
+- The MARKER of a launch abandoned before its commit is left in the node's marker directory (it is never unlinked by
+  pathname). Nothing reads it again; it is about 250 bytes.
+- A shim that does not exit within `ABANDON_SECONDS` after its writer closed, nor within the same again after its
+  SIGKILL, stays unreaped and its owner stays PARKED (with no record and no entry: no GO was ever attempted for it, so
+  no CLI exists); a later `release` reaps it through its handle and lets it go.
+- An interrupt inside CPython's own `subprocess.Popen` after its fork: the node's pipe ends are closed, so the shim
+  sees EOF before its secret and exits 7 having started nothing; CPython's bookkeeping of the lost `Popen` reaps it at
+  a later `Popen`. Not through the handle.
+- A SECOND interrupt inside `_unwind` (the node's own SIGTERM or Ctrl-C, on the main thread only): the entry may stay
+  PROVISIONAL (it still fences) or the writer stay open until the process exits (and the shim then gets EOF); a row
+  (a) shim may be left abandoned but not yet reaped, its owner parked. As C1's `release`, it fails closed.
+- An interrupt after `launch` executed its `return` belongs to the caller's frame.
+- `Owners` lives in memory: a restart loses it, and the journal's restore fences every record HELD instead.
+- A concurrent `release` waits for the first one's proof read and directory sync (both bounded file operations, off
+  deadline-critical paths, as every `release` call is).
+
+**Mutation check (review round 1).** The script was not run here (the orchestrator runs it).
+tests/test_shim_mutation_rows.py checks that every C3-2b-1 row's anchor occurs exactly once and that its mutant parses
+(38 rows now: 22 named "C3-2b-1 r1"). A new file key `SHL` (shimchild.py, run against tests/test_shim_launch.py).
+Applied by hand and caught here, each alone: GO under the lock, LIVE before GO, the entry dropped in the handler,
+the entry installed LIVE, PROVISIONAL not in `_FENCE`, `confirm_live` from any state, the parent-sync flag set before
+the sync, the unlink put back in `commit`, the reason without the path, `step <= _COMMITTING`, the first park removed,
+the re-park removed (MISSED at first: the `handed` point was added for it), the release lock removed, `released` never
+consulted, the spawn without a handle, the send without an abandon, and the (a) path's reap skipped.
+- **New (16):** "C3-2b-1 r1 R1 the entry is provisional before GO"; "C3-2b-1 r1 R1 a PROVISIONAL entry fences
+  admission"; "C3-2b-1 r1 R1 only a PROVISIONAL entry is made LIVE"; "C3-2b-1 r1 R1 LIVE only on a confirmed GO";
+  "C3-2b-1 r1 R1 GO is written outside the registry lock"; "C3-2b-1 r1 R1 the entry survives an interrupt"; "C3-2b-1
+  r1 R2 the parent sync is recorded only after it returned"; "C3-2b-1 r1 R3 a failed commit removes nothing";
+  "C3-2b-1 r1 R3 an unreadable entry is named by its path"; "C3-2b-1 r1 R3 a commit that raised with its file left is
+  fenced"; "C3-2b-1 r1 R4 the owner is parked before its shim exists"; "C3-2b-1 r1 R4 an interrupt after the
+  hand-over is parked again"; "C3-2b-1 r1 R4 a release is reported once"; "C3-2b-1 r1 R4 a release holds the launch's
+  own lock"; "C3-2b-1 r1 R4 a spawn with no handle gets one and is reaped"; "C3-2b-1 r1 R4 an interrupt while the
+  secret is sent abandons the shim".
+- **Re-anchored (6):** "C3-2b-1 one bad journal entry is never skipped (re-anchored: C3-2b-1 r1)"; "C3-2b-1 the
+  record is committed before GO (re-anchored: C3-2b-1 r1)"; "C3-2b-1 a failure before the commit reaps the shim
+  (re-anchored: C3-2b-1 r1)"; "C3-2b-1 a failed or ambiguous GO keeps the reservation, fenced (re-anchored: C3-2b-1
+  r1)"; "C3-2b-1 the record is removed before the reservation is lifted (re-anchored: C3-2b-1 r1)"; "C1R5R10 a FENCED
+  entry refuses admission (re-anchored: C3-2b-1 r1)" (a `G` row: `_FENCE` gained "provisional").
+- **Removed (1):** "C3-2b-1 a failed commit leaves no record" (R3 reverses that behaviour; "C3-2b-1 r1 R3 a failed
+  commit removes nothing" replaces it).
+
+**Runs (review round 1, on abe14e7).** Targeted: tests/test_shim_launch.py, test_shim_restore.py, test_shim_journal.py,
+test_shim_static.py, test_shim_mutation_rows.py, test_groupshim.py, test_spawn_discipline.py, test_nodes.py,
+test_ownership_c1.py, test_hostlog.py: 658 passed. Parallel suite (`-n auto --dist worksteal`): 6062 passed, 10
+skipped, 8 failed, all eight this environment's (AGENT_COMMS_MANAGED=1): the `wait.sh` tests in
+tests/test_interactive_wake.py and test_interactive_wake_round1.py (5) and three in tests/test_hosted_spawn.py.
