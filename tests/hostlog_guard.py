@@ -100,14 +100,19 @@ class _Owned:
 # and the host's, by attribute; each held steer attempt's record lock is looked at when a handler is entered.
 RUNNER_LOCKS = ("lock", "report_lock", "latch_lock", "ack_lock", "checkpoint_cond")
 HOST_LOCKS = ("_steer_stop_lock", "usage_lock")
+# (Ownership C3-2b-1, D) a supervisor handle's (`shimchild.ShimChild`) three host locks: the command endpoint's, the
+# event endpoint's and the wait status's. Pass the handles to `Guard(handles=...)`.
+HANDLE_LOCKS = ("_wlock", "_rlock", "_wait_lock")
 
 
 class Guard:
     """The handler: `mode` "record" (records only), "blocks" (stalls a little at every record) or "raises". It
     records, at every entry, which lock of the host-side modules the ENTERING thread holds."""
 
-    def __init__(self, host=None, runner=None, mode="record", extra=()):
+    def __init__(self, host=None, runner=None, mode="record", extra=(), handles=()):
         self.locks = list(extra)
+        for i, handle in enumerate(handles):
+            self.locks += [(f"handle{i}{a}", _Owned(handle, a)) for a in HANDLE_LOCKS]
         if runner is not None:
             names = {"lock": "runner", "report_lock": "report", "latch_lock": "latch", "ack_lock": "ack",
                      "checkpoint_cond": "checkpoint"}

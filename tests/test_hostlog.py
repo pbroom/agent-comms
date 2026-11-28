@@ -170,7 +170,7 @@ def test_the_host_side_modules_take_their_loggers_from_hostlog():
     names = {"session_host.py": "agent_comms.session_host", "node_sessions.py": "agent_comms.node_sessions",
              "node.py": "agent_comms.node", "providers/claude.py": "agent_comms.providers.claude",
              "providers/codex.py": "agent_comms.providers.codex", "node_groups.py": None,
-             "providers/__init__.py": None}
+             "providers/__init__.py": None, "shimchild.py": None, "shimjournal.py": None, "shimlaunch.py": None}
     emitting = {"getLogger", "debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log",
                 "basicConfig"}
     for rel, name in names.items():
@@ -226,7 +226,9 @@ def _line():
 
 
 HOST_SIDE = ["session_host.py", "node_sessions.py", "node.py", "node_groups.py", "providers/__init__.py",
-             "providers/claude.py", "providers/codex.py", "hostlog.py"]
+             "providers/claude.py", "providers/codex.py", "hostlog.py",
+             # (Ownership C3-2b-1) the supervisor's node-side handle, and the journal (host-side, never logging)
+             "shimchild.py", "shimjournal.py", "shimlaunch.py"]
 LOCK_KINDS = {"Lock", "RLock", "Condition", "Semaphore", "BoundedSemaphore", "Event", "Barrier"}
 # (Review round 1, R1) The locks of the host-side modules under which no line can be logged, each with why; every
 # other lock constructed there is a HOST lock (BOUNDARIES): a native lock, entered only as
@@ -239,8 +241,16 @@ BOUNDARIES = {
     ("node_sessions.py", "self.report_lock"): "the report lock (a Lock)",
     ("session_host.py", "lock"): "a steer attempt's record lock (an RLock, a SteerSlot field)",
     ("session_host.py", "self._steer_stop_lock"): "the cutoff lock (an RLock)",
+    # (Ownership C3-2b-1, D) the supervisor handle's three locks (`ShimChild`): host locks from this PR on
+    ("shimchild.py", "self._wlock"): "a handle's command-endpoint lock: each write, and the pipe's close (a Lock)",
+    ("shimchild.py", "self._rlock"): "a handle's event-endpoint lock: each read, and the pipe's close (a Lock)",
+    ("shimchild.py", "self._wait_lock"): "a handle's wait-status lock: the one reap, and the test-only kill (a Lock)",
+    # (Ownership C3-2b-1, review rounds 1 and 2, R4.2 and R6) a supervised launch's own lock (a `Launch` field)
+    ("shimlaunch.py", "state_lock"): "a launch's own lock: its lifecycle, its one release, its accept (an RLock, a "
+                                     "Launch field)",
 }
-HOST_LOCK_ATTRS = {"lock", "ack_lock", "report_lock", "_steer_stop_lock"}     # (their names where they are entered)
+HOST_LOCK_ATTRS = {"lock", "ack_lock", "report_lock", "_steer_stop_lock",     # (their names where they are entered)
+                   "_wlock", "_rlock", "_wait_lock", "state_lock"}
 NOT_BOUNDARIES = {
     ("session_host.py", "self.usage_lock"): "held only to copy or update the usage dict (clean_usage logs nothing)",
     ("node_sessions.py", "self.latch_lock"): "held only for a comparison and an assignment",
@@ -1059,6 +1069,13 @@ def test_r18_every_host_lock_and_hostlogs_own_lock_is_entered_by_c_code():
         tree, path = _module(rel)
         problems = _r18_problems(rel, tree)
         assert not problems, [f"{path.name}:{ln}: {what}" for ln, what in problems]
+
+
+def test_c3_2b1_the_supervisor_handles_locks_are_host_locks_on_both_lists():
+    """(Ownership C3-2b-1, D) `ShimChild`'s three locks are host locks: on this module's static list (BOUNDARIES, so the
+    R18 pin above holds them to `with hostlog.BOUNDARY, lock:`) and on the dynamic guard's (hostlog_guard)."""
+    import hostlog_guard
+    assert {f"self.{a}" for a in hostlog_guard.HANDLE_LOCKS} == {o for f, o in BOUNDARIES if f == "shimchild.py"}
 
 
 def test_nothing_in_the_host_side_modules_waits_for_the_writer_but_the_final_wait():

@@ -18874,7 +18874,7 @@ newline are kept as commands. In each of these cases the CLI is NEVER forked, th
 | Command (node to shim) | What the shim does |
 | --- | --- |
 | `TERM` | if the anchor holds: `kill(pid)` before GROUP ESTABLISHED is observed, `killpg(pgid)` after; the first such ATTEMPT (sent or failed) starts the grace |
-| `KILL` | no TERM attempted yet: one is attempted now; then a KILL at first TERM attempt + `kill_grace` (an early one is remembered: `DEFERRED`) |
+| `KILL` | no TERM attempted yet: one is attempted now; then a KILL at first TERM attempt + `kill_grace` (an early one is remembered: `DEFERRED`); (C3-2b-1) then a KILL every grace while the anchor holds, as after EOF: the shim alone repeats KILL |
 | anything else, or a line over 256 bytes | `UNKNOWN`, then ignored |
 | EOF (the node died or let go) | a TERM now if none was attempted; a KILL at first TERM + grace; and a KILL every grace while the anchor holds |
 
@@ -20207,3 +20207,622 @@ by both `test_rr5_a_file_sync_...` cases, the unlink row by those and the AST pi
 - **Removed (3):** "C3-2a R1 publishing never replaces a file" and "C3-2a R1 only a temp file this publisher created is
   unlinked" (no link, no temp file); "C3-1R4 a temp-file sync failure publishes nothing (re-anchored: C3-2a review round
   1)" (replaced by the file-sync row).
+
+## Ownership C3-2b-1: the journal, restore-and-reserve, and the launch helpers (nothing can start a shim yet)
+
+The second part of C3-2. Sol's ruling on the plan: the first PR that makes a supervised spawn REACHABLE must contain the
+complete stop, shutdown, release and recovery-fence paths. So this PR lands everything that can land with NO config
+path that can launch a shim: the durable journal, the restore-and-reserve at node start, the launch, release and
+command helpers, and the remaining hardening. **After this PR nothing in the product can start a shim, the journal is
+always empty in production, and a node behaves exactly as before** (tests/test_shim_static.py pins the first two; the
+existing suite, unchanged, the third).
+
+New: `agent_comms/shimjournal.py` (the journal and its restore), `agent_comms/shimlaunch.py` (the helpers), and
+`tests/test_shim_journal.py`, `test_shim_restore.py`, `test_shim_launch.py`, `test_shim_static.py`,
+`test_shim_mutation_rows.py`. Changed: `groupshim.py` (KILL repetition, the start-up flags' docstring), `shimchild.py`
+(host locks, `-I -S`, `abandon_before_go`, `went`), `node_groups.py` (B only: the supervised token kind,
+`restore_held`, closed admission), `node.py` (the start-up restore only). `session_host.py`, `node_sessions.py` and the
+providers are not touched.
+
+### A. The journal (`shimjournal.py`)
+
+- **Where.** `<node log dir>/shim-journal/` (the node's data directory, beside `node-sessions.json`, never inside it:
+  ordinary session saves rewrite the session state, and a held incarnation must outlive its session). Mode 0700, this
+  user's, never a symlink; `make()` creates it (and its parent, 0700) and syncs the parent once it made it; an unsafe
+  one is refused, never repaired.
+- **One file per launch,** `<launch id>.json` (32 lowercase hex, `secrets.token_hex(16)`, drawn apart from the secret
+  and the marker name), mode 0600, ONE JSON line:
+
+| Field | What |
+| --- | --- |
+| `v` | the record version, 1 (an int, never a bool) |
+| `launch_id` | equal to the file's name |
+| `token` | `["supervised", <launch id>]`: the registry token's serialisable form (`node_groups.SUPERVISED`) |
+| `checkout_key` | the checkout's identity at the launch (`node_groups.key`): `[device, inode]`, or `["path", <real path>]` |
+| `cwd` | the checkout, absolute |
+| `boot` | the boot identity the shim was started with (`kern.bootsessionuuid`, UUID-shaped) |
+| `marker` | the marker's absolute path |
+| `shim_pid`, `shim_start` | DIAGNOSTIC ONLY (int > 1 or null; `process_start`'s text or null): no signalling or release authority, never probed or signalled |
+
+  NOT the launch secret: it stays in the node's memory (proof after a restart is a later PR's).
+- **`commit(record)`:** the record is validated by the same rules `load` applies; created with `O_CREAT | O_EXCL |
+  O_NOFOLLOW` (an existing record is never replaced: `FileExistsError`), written whole (a loop), the file full-synced
+  (`F_FULLFSYNC`, fsync where not taken), closed, then the directory synced. Any failure after the create removes the
+  file (and syncs the directory) and raises: a failed commit leaves no record. A removal that itself fails leaves the
+  record: the next start restores it, HELD (the conservative direction).
+- **`remove(launch_id)`:** unlink, then sync the directory. A record already gone is no error (the directory is synced
+  all the same), so a removal whose sync failed is completed by a retry.
+- **`load()`:** every record, or `JournalUnreadable(reason)`. Absent directory: `[]`, nothing created. Otherwise the
+  directory must be the node's private one and EVERY entry a regular file named `<launch id>.json` (lstat, then
+  `O_NOFOLLOW | O_NONBLOCK` open, fstat-matched), at most 64 KiB, one complete line, exactly the fields above with
+  their types. A symlink, FIFO, subdirectory, stray or temporary name, empty, partial or two-line file, an extra or
+  missing field, another version, a mismatched name or token, a relative path, a bad key or boot: the WHOLE journal is
+  unreadable. A bad file is never skipped.
+- No logging: errors are returned or raised.
+
+### B. Restore and reserve at node start
+
+**The order.** `node._run`: `Node(...)` (whose `__init__` restores), then `node.recover()`, `node.sessions.recover()`,
+`hello()`, `node.sessions.start()` (the threads), and the loop's `tick()`. In `Node.__init__` the restore is the
+statement right after the shared registry is chosen (`self.groups = ...`; the session runner's constructor starts no
+thread and admits nothing). So it precedes every thread of the node's work, every hub contact and every admission, with
+hosting on or off.
+
+**What it does** (`shimjournal.restore(groups, log_dir)`):
+- every record becomes a reservation in the SHARED registry (`Groups.restore_held`): state HELD (it fences admission
+  and is proof-only: `may_signal` False), under its own token kind `("supervised", <launch id>)`, under the recorded
+  checkout key AND the directory's key now (a checkout replaced since is fenced too). Neither a hosted session
+  (`SessionHost._write`'s `blocked`, `_spawn`'s `start`) nor a dispatched run (`Node._start`'s `blocked` and `start`)
+  is admitted there;
+- nothing is released from the journal in this PR: a restored reservation stays for the life of the process (release
+  by evidence after a restart is the next-but-one PR's);
+- an UNREADABLE journal closes admission for the whole node (`Groups.close_admission`: every `start` refused, `blocked`
+  True for every directory, for the life of the process). The node logs ONE hostlog WARNING with the reason, stays up,
+  says hello and reports as usual, and does not crash-loop (a restart finds the same journal and closes admission
+  again);
+- supervised identities never enter the legacy numeric recovery: `recover()` reads only `node-runs.json` and
+  `node-sessions.json`, and a shim's pid is never probed, signalled or dropped;
+- an EMPTY or absent journal: nothing is installed, nothing created, and the node is byte-for-byte today's.
+
+**`Groups` gains only** the token kind (`SUPERVISED`), `restore_held(token, keys, cwd)` (a supervised token only,
+else `ValueError`; keys computed by the caller, no I/O under the lock) and `closed` / `close_admission(reason)` (checked
+first in `start` and `blocked`, each on its own line, so main's lines and their mutation rows are unchanged), in the
+registry's style: the native RLock, entered as `with hostlog.BOUNDARY, self.lock:`.
+
+### C. The launch helpers (`shimlaunch.py`)
+
+**`launch(...)`, transactional.**
+1. A first look (`groups.blocked`): a fenced checkout, or closed admission, is `NOT_ADMITTED`; nothing is done.
+2. `ShimChild.start`: cwd `/`, a fresh marker in the node's private marker directory, the secret sent. The shim waits
+   for GO and cannot start the CLI without it.
+3. The record, then `journal.commit`. **No registry entry exists for the checkout before this commit.**
+4. `groups.start(cwd, token, GO)`: under the registry lock, as ONE step, the admission check, the reservation (LIVE,
+   exactly as a direct start's entry today) and GO (the "spawn" a direct start makes under that lock; bounded by
+   `go_timeout`, 5 s by default). The callback never raises, so `Groups.start` never drops the reservation.
+
+**Where the reservation goes, and why no window admits other work.** The reservation is installed AFTER the durable
+commit and BEFORE GO, atomically with the admission check. Before the commit nothing of this launch can run (no GO: the
+shim starts nothing, and EOF before GO is "never start"), so there is nothing for an entry to protect and nothing is
+left if the launch fails. From the check on, under the one lock every admission and every stop takes, a stop of any
+group in that checkout is either before it (the launch is refused and no GO is ever written) or after it (this launch
+is already reserved, and a stopping group fences new work as before). No CLI of a launch ever runs without both its
+durable record and its registry entry. Work that shares a checkout with a LIVE launch is admitted as it is beside a
+LIVE direct start today (C1's rule; a session and its shared-checkout children, a run the hub allowed).
+
+| Crash or failure window | Record | Registry | The shim | Next |
+| --- | --- | --- | --- | --- |
+| the shim's start fails | none | none | none spawned | raised |
+| after the shim's start, before the commit (the record, the commit, an interrupt) | none (the commit removes its own file) | none | writer closed; NOGO eof, never started; reaped by its handle (`abandon_before_go`, SIGKILL only if it does not exit in 5 s; no GO byte was ever attempted, so no CLI exists) | raised |
+| the node dies before the commit | none | (process gone) | EOF before GO: never started | nothing to restore |
+| the node dies after the commit, before the registry step | kept | (process gone) | EOF before GO: never started, marker published | the next start restores it HELD |
+| refused at the atomic check after the commit | kept | HELD (`restore_held`) | writer closed: never started | `release` on its proof (exit 3) |
+| GO failed (no byte, or a partial frame) | kept | STOPPING | writer closed: NOGO, never started | `release` on its proof |
+| GO ambiguous (the whole frame written, then a failure) | kept | STOPPING | writer closed: the CLI may have started; the shim stops it on EOF | `release` on its proof |
+| an interrupt in the registry's own code once GO was attempted | kept | HELD (`restore_held`) | writer closed | raised; `release` on its proof |
+| the node dies after GO | kept | (process gone) | EOF: TERM, KILL after the grace, repeated; proof published | the next start restores it HELD |
+| success | kept | LIVE | running | the wiring's stop, then `release` |
+
+**`release(groups, journal, launch)`** is the ONLY way a launch's reservation and record go. Evidence, and only this:
+`empty()` (the release pair) or `refused()` (an observed exit 2 or 7 before any fork). Through `Groups.release` (its
+admission fence first): the proof removes the durable record FIRST (`journal.remove`, inside the proof: a removal that
+fails is no proof, retried on the next pass), THEN `_gone` lifts the reservation. `lost()`, an UNKNOWN status, or no
+evidence yet (the shim running; a member of the group alive after the CLI exited): nothing is released, the entry is
+HELD, and the caller keeps asking.
+
+**Commands.** `request_term(handle)` / `request_kill(handle)` return, never raise:
+
+| Result | Meaning | The caller |
+| --- | --- | --- |
+| `QUEUED` | the write succeeded: the command is queued; nothing more is implied | waits for events and the proof |
+| `PENDING` | backpressure: the command pipe is full (`BlockingIOError`) | retries on its next pass |
+| `CLOSED` | the pipe is broken or closed (or GO was never written: the pipe is closed, "never start") | CLASSIFIES through the handle, since a normal proof-bearing exit can race the write: `classify` answers RUNNING, PROVED, REFUSED, LOST or UNKNOWN |
+
+**Who owns KILL repetition: the shim.** `groupshim.Shim._kill_now` repeats KILL every grace once it has sent a KILL,
+asked by a `KILL` command or by EOF, for as long as the anchor holds (before: only after EOF). The node never retries
+a KILL command that was QUEUED; only a PENDING one (not queued) is retried. A repeat is an ATTEMPT: measured, `killpg`
+of a group whose only members are zombies answers EPERM on macOS (`FAILED KILL 1 group`).
+
+**Locks and I/O (the next PR is bound by this).** Every helper is called with NO host lock held. `launch` commits the
+journal (two full syncs); `release` and `classify` read the marker and sync the journal's directory: proof reads and
+journal syncs stay off deadline-critical paths and outside the node's runner lock. The only lock the helpers take is
+the registry's, through `Groups.start` and `Groups.release`.
+
+### D. The handle is host-side code
+
+`ShimChild`'s three locks (`_wlock`: each command write and the command pipe's close; `_rlock`: each event read and
+that pipe's close; `_wait_lock`: the one reap, and the test-only kill) are host locks: native `threading.Lock()`s,
+entered only as `with hostlog.BOUNDARY, lock:`. tests/test_hostlog.py's static pins (`HOST_SIDE`, `BOUNDARIES`,
+`HOST_LOCK_ATTRS`) now cover `shimchild.py`, `shimjournal.py` and `shimlaunch.py` (no plain `logging`, no logger: they
+never log); tests/hostlog_guard.py lists the three (`HANDLE_LOCKS`, `Guard(handles=...)`).
+
+New on the handle: `went` (GO written whole) and `abandon_before_go(timeout)`, which closes the command pipe and reaps
+the shim (SIGKILL on its own unreaped, pinned pid only if it has not exited in `timeout`). It refuses once GO was
+ATTEMPTED: `go` marks the attempt under `_wlock` before its first byte, and the check and the close are one step under
+the same lock, so no byte of GO can follow, and no CLI can exist.
+
+### E. A harder shim launch
+
+The handle starts the shim as `python -I -S -c <boot> <package root> <args>`, and the boot APPENDS the package root to
+`sys.path`: `-I` (no `PYTHON*` variables, no user site, no current directory), `-S` (no `site`: no site-packages, no
+`.pth` file processed), and the standard library before the package root, so a file named like a standard-library
+module planted at the package root is never what the shim imports. The shim's imports allow it: the standard library
+and `agent_comms` (`groupshim`, `node_groups`, `hostlog`) only. Test:
+`test_e_the_shim_runs_isolated_without_site_and_its_package_root_after_the_standard_library` (a copy of the package with
+`json.py`, `hmac.py`, `hashlib.py`, `select.py`, `threading.py` beside it, each noting its import and failing: none is
+imported, the shim proves an exit-0 CLI empty, and `ps` shows ` -I -S -c `). On main it fails (`hashlib` was imported:
+exit 1).
+
+**The assumption that remains, and is the owner's to decide:** the node's code, its virtualenv and its interpreter are
+writable by the same user as the supervised CLI. A CLI that rewrites them can defeat the proof for LATER launches (it
+can change what the next shim runs, or the handle that reads its status). Nothing in this PR protects against that;
+doing so needs the node's code and interpreter outside that user's write access.
+
+### F. Static rules (tests/test_shim_static.py)
+
+- Across `agent_comms/`: no `signal.signal(SIGCHLD, SIG_IGN)` (or `1`), no `SA_NOCLDWAIT`, no `sigaction`, no
+  `os.wait()`, no `os.wait3`, no `os.waitpid`/`os.wait4` of a pid literal at or below 0, no `waitid` of `P_ALL` or
+  `P_PGID`. The handle's `os.waitpid(self.pid, os.WNOHANG)` is the allowed form. A self-test feeds each banned form.
+  Not covered: a disposition set through a variable signal number (the shim's forked child restores the node's
+  inherited ignores for the CLI before its exec: the CLI's own disposition).
+- The tripwire: `shimchild` is imported only by `shimlaunch`; `shimlaunch` by nothing; `groupshim` only by
+  `shimchild`; `shimjournal` only by `node.py` and `shimlaunch`; and `node.py` uses nothing of the journal but
+  `restore`. Every import form is seen (relative, absolute, `importlib.import_module`, `__import__`; a self-test).
+
+### Tests (each failed before the code it covers existed)
+
+- **Launch** (tests/test_shim_launch.py, real shims): `test_launch_a_failure_before_the_commit_leaves_no_record_no_entry_and_no_unreaped_shim[shim-start|after-start|commit]`;
+  `test_launch_no_registry_entry_exists_before_the_durable_commit` (pauses at started, committed, go);
+  `test_launch_a_crash_after_the_commit_and_before_go_leaves_the_record_and_the_shim_publishes_never_started`;
+  `test_launch_an_ambiguous_or_failed_go_retains_the_record_and_the_reservation[failed|ambiguous]`;
+  `test_a_launch_into_a_blocked_checkout_starts_nothing`.
+- **Release:** `test_release_takes_the_record_then_the_reservation_and_only_on_the_proof` (no evidence while it runs:
+  HELD; at the pause between the steps the record is gone and the reservation still there); `test_release_by_refused`;
+  `test_nothing_is_released_on_lost_or_unknown[lost|unknown]`;
+  `test_a_cli_that_exits_while_a_member_of_its_group_survives_is_not_released_until_the_member_is_gone`.
+- **Commands:** `test_a_full_command_pipe_is_pending_and_a_later_retry_is_queued`;
+  `test_a_closed_command_pipe_is_closed_and_classification_finds_the_proof`.
+- **KILL by the shim** (tests/test_groupshim.py):
+  `test_unit_c3_2b1_a_kill_command_is_repeated_by_the_shim_every_grace_while_the_anchor_holds` and, real,
+  `test_c3_2b1_after_one_kill_command_the_shim_itself_repeats_kill_while_a_member_keeps_the_group` (a member of the
+  CLI's group is the zombie of a process outside it, so the group survives the first KILL; three KILL attempts follow
+  one command, with no EOF; once the zombie is reaped the shim proves the group empty). Changed:
+  `test_unit_kill_never_before_the_grace_and_repeated_after_eof` (a command's KILL now schedules its repeat).
+- **Restore** (tests/test_shim_restore.py, the real `Node`/`Groups` paths with the node tests' fakes):
+  `test_a_journalled_checkout_refuses_a_dispatched_run_with_hosting_off`;
+  `test_a_journalled_checkout_refuses_a_hosted_session_and_a_run_with_hosting_on`;
+  `test_an_unreadable_journal_closes_admission_for_the_whole_node_and_says_so_once`;
+  `test_an_empty_or_absent_journal_changes_nothing`, `test_an_empty_journal_lets_a_dispatched_run_start_as_on_main`;
+  `test_supervised_identities_never_enter_the_legacy_numeric_recovery`;
+  `test_the_restore_is_the_first_thing_after_the_registry_exists_and_before_any_admission` (AST);
+  `test_restore_installs_under_the_recorded_key_and_the_directorys_key_now`.
+- **Journal** (tests/test_shim_journal.py): the format, the commit's syncs and order, exclusive create, a failed
+  commit leaves nothing (write, file sync, directory sync), remove, absent is empty, and 24 kinds of bad entry or
+  directory each making the journal unreadable.
+- **Host locks:** `test_c3_2b1_the_supervisor_handles_locks_are_host_locks_on_both_lists`, and the existing R18 pin
+  over the new modules (it failed on the handle's plain `with self._wlock:` before the change).
+
+### Mutation check (C3-2b-1)
+
+19 new rows and 3 re-anchored. New file keys `SJ` (shimjournal), `SL` (shimlaunch), `GR` (node_groups), `NR`
+(node.py) and `SH` (shimchild), each with its own tests in `ONLY` (the existing `G` and `N` rows still run `FIRST` and
+`REST`; `GR`/`NR` exist so the new rows run the new tests). **The script was not run here** (the orchestrator runs it).
+tests/test_shim_mutation_rows.py checks that every C3-2b-1 row's anchor, and every row on the files this PR changed,
+occurs EXACTLY once in its file and that each mutant still parses. Applied by hand and caught: "the record is removed
+before the reservation is lifted", "no registry entry before the commit", "restore precedes admission", "release only
+on evidence: lost() is none", "an unreadable journal closes admission"; and "the shim repeats KILL after a command"
+is main's own code, which the two KILL tests fail on.
+- **New (19):** "C3-2b-1 the shim repeats KILL after a command"; "C3-2b-1 E the package root comes after the standard
+  library"; "C3-2b-1 E the shim runs without site"; "C3-2b-1 D the handle's locks are host locks"; "C3-2b-1 a commit
+  never replaces a record"; "C3-2b-1 a failed commit leaves no record"; "C3-2b-1 one bad journal entry is never
+  skipped"; "C3-2b-1 an unreadable journal closes admission"; "C3-2b-1 closed admission refuses every start";
+  "C3-2b-1 closed admission blocks every directory"; "C3-2b-1 a restored reservation is HELD"; "C3-2b-1 restore
+  precedes admission (the restore at node start)"; "C3-2b-1 the record is committed before GO"; "C3-2b-1 no registry
+  entry before the commit"; "C3-2b-1 a failure before the commit reaps the shim"; "C3-2b-1 a failed or ambiguous GO
+  keeps the reservation, fenced"; "C3-2b-1 the record is removed before the reservation is lifted"; "C3-2b-1 release
+  only on evidence: lost() is none"; "C3-2b-1 release only on evidence: an exit alone is none".
+- **Re-anchored (3):** "C3-1 KILL repeated every grace after EOF (re-anchored: C3-2b-1)"; "C3-1 the command write is
+  pinned under the lock (re-anchored: C3-2b-1)"; "C3-2a the secret is not on the shim's argv (re-anchored: C3-2b-1)".
+
+### What the next PR (the switch, and the first reachable supervised spawn) must contain
+
+- **The switch,** off by default, and with it OFF the node byte-for-byte as after this PR.
+- **The spawn sites** (`SessionHost._spawn`, `Node._start`) through `shimlaunch.launch`, never with a host lock held
+  (the runner's lock included): the commit's syncs and GO's bound are off deadline-critical paths. Each keeps the
+  `Launch` (its token, key, record, handle) in place of today's child and registry token.
+- **The complete STOP path:** `request_term`/`request_kill` at every site that signals today (C3-1's "What C3-2 must
+  replace"), PENDING retried on the next pass, CLOSED classified, a QUEUED KILL never resent (the shim repeats it).
+  No numeric signal, probe or `group_alive` for a supervised launch.
+- **The complete REAP and RELEASE path:** `release` (and nothing else) at every reap and shutdown site, asking
+  `refused()`, `lost()` and `empty()` before reading `poll() is None` as "running"; LOST and UNKNOWN held, said once.
+- **The complete SHUTDOWN path:** the shutdown's KILL pass through `request_kill`, its post-KILL watch on the proof
+  within the existing shared bound, and what is still unproved left HELD with its record (the next start restores it).
+- **The RECOVERY FENCE:** this PR's restore, unchanged, and a node status that shows held checkouts (and a closed
+  admission) to the human. Release by evidence after a restart stays the next-but-one PR's.
+- Integration tests of main's shutdown and reap timing with real shims (C3-1, Sol), the marker directory made once
+  with `make_marker_dir` inside the node's private state, close-fds at every concurrent launch, and the handle's locks
+  kept as host locks.
+
+### Runs (C3-2b-1)
+
+In the hand-back (the targeted runs and one parallel suite on the final head).
+
+### Ownership C3-2b-1: review round 1 (Sol on 959a09e: 3 blockers, 1 should)
+
+Each ruling had a reproduction test first, run against 959a09e (the failure it showed there is given with the test).
+Parts A and C above are SUPERSEDED where they say otherwise: a failed commit no longer removes its file, GO is no
+longer written under the registry lock, the crash-window table is the one below, and `launch`/`release` take an
+`owners` argument.
+
+**R1 [blocker]. A supervised launch is admitted through a PROVISIONAL fence, and GO is written outside the registry
+lock.** Was: `launch` wrote GO inside `Groups.start`'s spawn callback, under the registry lock (a shim that does not
+read held that lock for the GO timeout, and a sibling's `stopping()` waited behind it); `Groups.start` returned with
+the entry LIVE before `launch` marked a failed GO STOPPING; and an interrupt after GO's last byte, inside the
+callback but outside its `try`, made `Groups.start` drop the entry before the outer handler restored it.
+Now (`node_groups.py`, `shimlaunch.py`):
+- `Groups.admit_provisional(cwd, token, k)` (a supervised token only): under the registry lock, the same check `start`
+  makes (closed admission, a fenced checkout), then a PROVISIONAL entry for the token. PROVISIONAL is in `_FENCE`: it
+  fences the checkout (`start`, `blocked`, `stopping_dirs` and another `admit_provisional` all see it). No I/O and no
+  spawn under the lock. It is called only after the journal commit returned.
+- GO is written after `admit_provisional` returns, OUTSIDE the lock (`ShimChild.go`, bounded by `go_timeout`).
+- `Groups.confirm_live(token)` makes only a PROVISIONAL entry LIVE, and only once `go()` RETURNED (GO confirmed whole).
+  From then on C1's sharing rule applies, as for a direct start's entry. A STOPPING or HELD entry is never revived.
+- A GO that failed or is ambiguous (an `Exception` from `go`): the writer is closed, `stopping()` turns the entry
+  STOPPING, and GO_FAILED is returned with the owner parked. ANY exception or interrupt from the provisional install
+  on (`_unwind`): `restore_held` turns the entry HELD (PROVISIONAL, LIVE or STOPPING; with no entry, one is installed),
+  THEN the writer is closed. The entry is never dropped, and while the handler has not yet run, PROVISIONAL itself
+  fences.
+- Refused at the admission after the commit: unchanged in kind (no GO, a HELD reservation, the writer closed), and the
+  owner is parked (R4).
+- The rest of the registry and PROVISIONAL: `stopping`/`try_stopping` move it to STOPPING; C1's `release` keeps it as
+  it is at the fence (`_admit_fence` changes only LIVE), makes it HELD on a refused proof and removes it on a proof;
+  `_held_if_fenced` does not touch it.
+
+Tests (tests/test_shim_launch.py):
+- `test_r1_nothing_holds_the_registry_lock_while_go_is_written_and_the_checkout_is_fenced_meanwhile`: the real shim is
+  SIGSTOPped through its own handle right after the commit, and GO carries a 256 KiB argument, so it cannot complete.
+  While GO is being written: another checkout's `stopping()` and a start there return within 1 s; a start in this
+  checkout is refused; the state is PROVISIONAL. After SIGCONT: STARTED, LIVE. On 959a09e: "another checkout's
+  stopping() returned at once" failed (it waited for the registry lock).
+- `test_r1_an_interrupt_at_every_step_from_the_provisional_install_to_live_keeps_the_entry_fencing[...]`, 10 points:
+  inside `admit_provisional` before and after the install, `admitted`, `go`, after GO's last byte (`last-byte`),
+  `went`, inside `confirm_live` before and after the change, `live`, and `handed` (after the owner was handed over).
+  At every point up to the LIVE transition a probe on the launching thread finds the checkout fenced (`blocked`, and a
+  direct start refused with nothing spawned). After the interrupt: HELD, fenced, record kept, writer closed, owner
+  parked; the shim exits on EOF; `release` gives RELEASED once and ALREADY_RELEASED after. On 959a09e: at `go` and at
+  `last-byte` the probe found the checkout NOT fenced (`[('go', False)]`, `[('last-byte', False)]`); the other points
+  do not exist there.
+- `test_r1_the_registrys_provisional_entry`: the registry alone (refusals, the fence, LIVE only from PROVISIONAL, a
+  STOPPING one kept, closed admission, a supervised token only). New API: it cannot run on 959a09e.
+- `test_launch_no_registry_entry_exists_before_the_durable_commit` (changed): PROVISIONAL at `admitted`, `go` and
+  `went`; LIVE only at `live`.
+
+**R2 [blocker]. The journal directory's own entry is durable before any commit is trusted.** Was: `make()` synced the
+parent only when its own `mkdir` succeeded, so a first commit whose parent sync failed left a directory the next
+commit trusted without the sync. Now (`shimjournal.py`): `Journal._parent_synced`, set only after `_sync_dir(parent)`
+RETURNED; until then every `make()` (so every commit) syncs the parent, whether or not it made the directory. A parent
+sync that fails fails the commit before anything is created. Per process: a new process (a new `Journal`) syncs the
+parent on its first commit. Test: `test_the_parent_is_synced_on_every_commit_until_this_process_has_synced_it`
+(tests/test_shim_journal.py: the first parent sync fails, then a second commit must sync the parent; a third does not;
+a new `Journal` does once). On 959a09e: "the parent is synced by the next commit" failed.
+
+**R3 [blocker]. A failed commit removes nothing.** Was: on a failure after the create, `commit` unlinked "its own"
+file by pathname, which a same-user process could have substituted. Now: `commit` has no cleanup at all. A failed or
+partial record is LEFT in place and the commit raises; `launch` then never writes GO, closes the writer and, since
+something is at the record's path (`Journal.exists`: an lstat; any failure to look counts as "something"), fences it
+HELD with its owner parked, row (b) below. The shim, given EOF before GO, publishes its never-started proof, and
+`release` on that proof is the one unlink (`remove`). A partial record found at a later start cannot be told from
+damage to a committed one: `load()` raises `JournalUnreadable` for it, admission stays closed until a person checks
+that nothing of that launch runs and removes the file. Every `JournalUnreadable` reason now names the full path (of
+the entry, or of the directory), and the node's one start-up WARNING carries the reason, so it names the file.
+(`node.py` is unchanged: its WARNING already includes the reason.) Tests:
+- `test_a_commit_that_fails_removes_nothing_and_raises[write|file-sync|dir-sync]` (replaces
+  `test_a_commit_that_fails_leaves_no_record`): no unlink or remove called; the file is left; a partial one makes the
+  journal unreadable with its path in the reason; a whole one loads. On 959a09e: "a failed commit removes nothing".
+- `test_commit_and_all_it_calls_never_unlink_remove_rename_or_replace` (AST): `Journal.commit` and every function or
+  method of the module it calls, by name and transitively (`make`, `_path`, `Record.check`, `to_json`, `_from_json`,
+  `_sync_dir`, `_fullsync`, `_write_all`, `_check_private`, ...), names no unlink, remove, rename, replace, rmdir,
+  truncate or shutil; module-wide, `os.unlink` appears only in `Journal.remove`. On 959a09e: `('Journal.commit',
+  'os.unlink')`.
+- `test_an_unreadable_journal_closes_admission_for_the_whole_node_and_says_so_once` (tests/test_shim_restore.py,
+  changed): the WARNING names the offending file's path. On 959a09e: it named only the file's name.
+- `test_launch_a_commit_that_fails_after_its_file_exists_is_fenced_and_owned[file-sync|dir-sync]`: row (b). On
+  959a09e: "the failed commit removed nothing" failed (the record was gone).
+
+**R4 [should, fixed]. One cleanup owner per launch; release serialised per launch.**
+- The owner is the `Launch`. It is PARKED in `shimlaunch.Owners` (one dict keyed by launch id, no lock: one store, pop
+  or copy each; the node will keep ONE `Owners` beside its journal, the wiring PR, and ask `release` of each parked
+  launch on its passes) BEFORE its shim can exist. `ShimChild.start(..., adopt=)` hands the handle to the owner the
+  moment the handle exists (`adopt` sets `launch.handle`, one attribute store), before the secret is sent. In the
+  handle: if anything is raised once the spawn returned and before `_launch` returns, a handle is made for the spawn
+  if it has none and the shim is abandoned before GO (reaped by that handle); if the secret's send is interrupted,
+  `start` abandons it before raising. (A double abandon, by the handle's code and by the owner, is harmless.)
+- `launch` unparks the owner only when it hands a LIVE launch to its caller (row (c)), or when it reaches row (a). A
+  launch in row (b) stays parked, also when it is returned (REFUSED_AFTER_COMMIT, GO_FAILED). An interrupt after the
+  unpark and before the return is caught by `_unwind`, which parks it again and makes it HELD.
+- `release(groups, journal, owners, launch)` runs under the launch's own release lock (`Launch.release_lock`, a host
+  lock: a native RLock, entered as `with hostlog.BOUNDARY, launch.release_lock:`, on tests/test_hostlog.py's
+  `BOUNDARIES` and `HOST_LOCK_ATTRS`; the proof's reads and the record's removal run under it, never under the
+  registry's). Exactly one call removes the record, lifts the entry and answers RELEASED; it sets `launch.released`
+  and unparks the owner. A concurrent call waits for it and, like any later call, answers ALREADY_RELEASED. KEPT: no
+  evidence yet, or the record's removal failed (the fence stays, HELD). A launch with no record (NOT_ADMITTED, or an
+  abandoned shim not yet reaped) is RELEASED once its shim, if any, is reaped by its handle. The results are strings:
+  callers compare them, never test their truth.
+
+The launch-state table (every exit from `launch()`; each row pinned by the named test):
+
+| Exit from `launch()` | State | Record | Registry | The shim | Owner | Pin |
+| --- | --- | --- | --- | --- | --- | --- |
+| the first look refuses: NOT_ADMITTED | (a) | none | none | none spawned | never parked | `test_a_launch_into_a_blocked_checkout_starts_nothing` |
+| `ShimChild.start` raises before any spawn (no boot identity) | (a) | none | none | none | unparked | `...no_unreaped_shim[shim-start]` |
+| raised once the spawn returned, before its handle was made | (a) | none | none | a handle made for it, abandoned, reaped | unparked | `[spawn-handoff]` |
+| raised while the secret is sent | (a) | none | none | abandoned (by `start`), reaped | unparked | `[send-secret]`, `test_start_with_no_owner_abandons_the_shim_on_an_interrupt_while_its_secret_is_sent` |
+| raised after `start` returned, before the commit | (a) | none | none | abandoned, reaped | unparked | `[after-start]` |
+| the commit raised with nothing at the record's path | (a) | none | none | abandoned, reaped | unparked | `[commit-before-create]` |
+| the commit raised, a file left at the record's path | (b) | left, whole or partial | HELD | writer closed: never started | parked | `test_launch_a_commit_that_fails_after_its_file_exists_is_fenced_and_owned` |
+| raised after the commit, before the admission | (b) | kept | HELD | writer closed: never started | parked | `test_launch_an_interrupt_after_the_commit_and_before_the_registry_step_is_fenced_and_owned` |
+| refused at the admission: REFUSED_AFTER_COMMIT | (b) | kept | HELD | writer closed: never started | parked, returned | `test_launch_refused_at_the_atomic_check_after_the_commit_is_held_and_owned` |
+| raised inside the admission, or from the provisional install to GO | (b) | kept | HELD | writer closed: never started | parked | `...every_step...[admit-before, admit-after, admitted, go]` |
+| GO failed or ambiguous: GO_FAILED | (b) | kept | STOPPING | writer closed: never started, or its CLI stopped on EOF | parked, returned | `test_launch_an_ambiguous_or_failed_go_retains_the_record_and_the_reservation` |
+| raised after GO's last byte, or after GO returned (before or after LIVE, or after the hand-over) | (b) | kept | HELD | writer closed: the CLI stopped on EOF | parked | `...every_step...[last-byte, went, live-before, live-after, live, handed]` |
+| STARTED | (c) | kept | LIVE | running | unparked: the caller's | `test_launch_no_registry_entry_exists_before_the_durable_commit` |
+
+The crash-window table, corrected (the node process DIES: its in-memory registry and `Owners` go with it):
+
+| The node dies | Record | The shim | The next start |
+| --- | --- | --- | --- |
+| before the commit is entered | none | EOF before GO (or before its secret): never started | nothing to restore |
+| inside the commit, nothing created yet (or the parent's sync not returned) | none | EOF before GO: never started | nothing; its next commit syncs the parent first (R2) |
+| inside the commit, the file created but not known durable | absent, whole or partial | EOF before GO: never started | absent: nothing; whole: restored HELD; partial: `JournalUnreadable`, admission closed, the WARNING names the file |
+| after the commit, before GO | kept | EOF before GO: never started, its marker published | restored HELD |
+| GO partly written | kept | a partial frame and EOF: never started | restored HELD |
+| GO whole (before or after LIVE) | kept | EOF: TERM, KILL after the grace, repeated; proof published | restored HELD |
+
+Tests for R4 (tests/test_shim_launch.py):
+- `test_launch_a_failure_before_the_commit_leaves_no_record_no_entry_and_no_unreaped_shim[shim-start|send-secret|spawn-handoff|after-start|commit-before-create]`
+  (rows (a); "unreaped" is now read with sysctl, never `waitpid`, which would itself reap). On 959a09e: `send-secret`
+  and `spawn-handoff` left the shim unreaped; the others passed there (rows already met).
+- `test_launch_an_interrupt_after_the_commit_and_before_the_registry_step_is_fenced_and_owned` (replaces
+  `test_launch_a_crash_after_the_commit_and_before_go_leaves_the_record_and_the_shim_publishes_never_started`, which
+  modelled a node that dies by an in-process exception; that case is now the restore's). On 959a09e: the state was
+  None (a record with no entry).
+- `test_launch_refused_at_the_atomic_check_after_the_commit_is_held_and_owned` (new: that row had no test).
+- `test_release_is_serialised_per_launch_exactly_one_caller_releases`: the second caller waits on the launch's lock
+  while the first is between its two steps, then is told ALREADY_RELEASED. On 959a09e: both callers ran at once.
+- `test_a_failed_record_removal_keeps_the_fence_and_reports_failure`: KEPT, HELD, the record kept; then RELEASED, then
+  ALREADY_RELEASED. On 959a09e: a second `release` answered True again.
+- The ones the first builder listed as missing: `test_abandon_before_go_kills_a_shim_that_does_not_exit_and_reaps_it`
+  (the shim SIGSTOPped through its handle: SIGKILL after the bound, status -9, reaped by its handle, no CLI);
+  `test_abandon_before_go_refuses_once_any_go_byte_was_attempted[no-byte|whole]`; the interrupt inside the registry
+  step is `...every_step...[admit-before|admit-after|live-before|live-after]`. The first two cover code that 959a09e
+  already had, and pass there.
+- Every existing launch and release test now also checks the owner (parked in (b), not in (c)) and the release
+  results (`settled_b`).
+
+**Limits, stated.**
+- The MARKER of a launch abandoned before its commit is left in the node's marker directory (it is never unlinked by
+  pathname). Nothing reads it again; it is about 250 bytes.
+- A shim that does not exit within `ABANDON_SECONDS` after its writer closed, nor within the same again after its
+  SIGKILL, stays unreaped and its owner stays PARKED (with no record and no entry: no GO was ever attempted for it, so
+  no CLI exists); a later `release` reaps it through its handle and lets it go.
+- An interrupt inside CPython's own `subprocess.Popen` after its fork: the node's pipe ends are closed, so the shim
+  sees EOF before its secret and exits 7 having started nothing; CPython's bookkeeping of the lost `Popen` reaps it at
+  a later `Popen`. Not through the handle.
+- A SECOND interrupt inside `_unwind` (the node's own SIGTERM or Ctrl-C, on the main thread only): the entry may stay
+  PROVISIONAL (it still fences) or the writer stay open until the process exits (and the shim then gets EOF); a row
+  (a) shim may be left abandoned but not yet reaped, its owner parked. As C1's `release`, it fails closed.
+- An interrupt after `launch` executed its `return` belongs to the caller's frame.
+- `Owners` lives in memory: a restart loses it, and the journal's restore fences every record HELD instead.
+- A concurrent `release` waits for the first one's proof read and directory sync (both bounded file operations, off
+  deadline-critical paths, as every `release` call is).
+
+**Mutation check (review round 1).** The script was not run here (the orchestrator runs it).
+tests/test_shim_mutation_rows.py checks that every C3-2b-1 row's anchor occurs exactly once and that its mutant parses
+(38 rows now: 22 named "C3-2b-1 r1"). A new file key `SHL` (shimchild.py, run against tests/test_shim_launch.py).
+Applied by hand and caught here, each alone: GO under the lock, LIVE before GO, the entry dropped in the handler,
+the entry installed LIVE, PROVISIONAL not in `_FENCE`, `confirm_live` from any state, the parent-sync flag set before
+the sync, the unlink put back in `commit`, the reason without the path, `step <= _COMMITTING`, the first park removed,
+the re-park removed (MISSED at first: the `handed` point was added for it), the release lock removed, `released` never
+consulted, the spawn without a handle, the send without an abandon, and the (a) path's reap skipped.
+- **New (16):** "C3-2b-1 r1 R1 the entry is provisional before GO"; "C3-2b-1 r1 R1 a PROVISIONAL entry fences
+  admission"; "C3-2b-1 r1 R1 only a PROVISIONAL entry is made LIVE"; "C3-2b-1 r1 R1 LIVE only on a confirmed GO";
+  "C3-2b-1 r1 R1 GO is written outside the registry lock"; "C3-2b-1 r1 R1 the entry survives an interrupt"; "C3-2b-1
+  r1 R2 the parent sync is recorded only after it returned"; "C3-2b-1 r1 R3 a failed commit removes nothing";
+  "C3-2b-1 r1 R3 an unreadable entry is named by its path"; "C3-2b-1 r1 R3 a commit that raised with its file left is
+  fenced"; "C3-2b-1 r1 R4 the owner is parked before its shim exists"; "C3-2b-1 r1 R4 an interrupt after the
+  hand-over is parked again"; "C3-2b-1 r1 R4 a release is reported once"; "C3-2b-1 r1 R4 a release holds the launch's
+  own lock"; "C3-2b-1 r1 R4 a spawn with no handle gets one and is reaped"; "C3-2b-1 r1 R4 an interrupt while the
+  secret is sent abandons the shim".
+- **Re-anchored (6):** "C3-2b-1 one bad journal entry is never skipped (re-anchored: C3-2b-1 r1)"; "C3-2b-1 the
+  record is committed before GO (re-anchored: C3-2b-1 r1)"; "C3-2b-1 a failure before the commit reaps the shim
+  (re-anchored: C3-2b-1 r1)"; "C3-2b-1 a failed or ambiguous GO keeps the reservation, fenced (re-anchored: C3-2b-1
+  r1)"; "C3-2b-1 the record is removed before the reservation is lifted (re-anchored: C3-2b-1 r1)"; "C1R5R10 a FENCED
+  entry refuses admission (re-anchored: C3-2b-1 r1)" (a `G` row: `_FENCE` gained "provisional").
+- **Removed (1):** "C3-2b-1 a failed commit leaves no record" (R3 reverses that behaviour; "C3-2b-1 r1 R3 a failed
+  commit removes nothing" replaces it).
+
+**Runs (review round 1, on abe14e7).** Targeted: tests/test_shim_launch.py, test_shim_restore.py, test_shim_journal.py,
+test_shim_static.py, test_shim_mutation_rows.py, test_groupshim.py, test_spawn_discipline.py, test_nodes.py,
+test_ownership_c1.py, test_hostlog.py: 658 passed. Parallel suite (`-n auto --dist worksteal`): 6062 passed, 10
+skipped, 8 failed, all eight this environment's (AGENT_COMMS_MANAGED=1): the `wait.sh` tests in
+tests/test_interactive_wake.py and test_interactive_wake_round1.py (5) and three in tests/test_hosted_spawn.py.
+
+### Ownership C3-2b-1: review round 2 (Sol on 1d4d40f: R2, R3 resolved; 2 blockers)
+
+Accepted by the reviewer: the unreaped pre-GO shim parked without a fence (a stated limit), plain dict operations for
+STORAGE in `Owners`, and string results from `release`. Each ruling had its reproduction test first, run against
+1d4d40f (its failure there is given with the test).
+
+**R5 [blocker]. The fence holds until the RECEIVER owns the handle; LIVE is the last transition.** Was: `launch` called
+`confirm_live` itself, so between that and its return (an interrupt there) the entry was LIVE and a sibling start could
+be admitted before `_unwind` made it HELD, beside a CLI whose GO had succeeded. Now (`shimlaunch.py`):
+- Nothing in `launch` makes the entry LIVE. It returns STARTED with GO confirmed (the CLI may run) and the entry still
+  PROVISIONAL: the checkout fenced.
+- `Launch.accept(groups)` is the RECEIVER's last step, taken after it has stored the launch where its own stop and
+  shutdown paths find it: under the launch's own lock, for a HANDED_OFF launch only, `Groups.confirm_live`, whose result
+  is RETURNED: True only when a PROVISIONAL entry became LIVE. False, nothing changed, when the entry was made STOPPING
+  or HELD meanwhile or is gone (or the launch is not HANDED_OFF): the caller treats the launch as STOPPING, never as
+  started. An exception or interrupt inside `accept` makes the entry HELD again (`restore_held`) before it is raised.
+  So until `accept` has returned True, no CLI that got GO runs beside an admissible checkout.
+- After `accept` C1's sharing rule applies as for a direct start.
+
+**R6 [blocker]. An ACTIVE launch is findable but not eligible for cleanup.** Was: a sweep calling `release` on a parked
+launch before it had a handle found "no record, no handle", answered RELEASED and unparked it; the launch went on,
+and a later `release` answered ALREADY_RELEASED with its record and its reservation still in place. Now:
+- `Launch.lifecycle`, changed only under the launch's own lock (`Launch.state_lock`, the round-1 release lock
+  renamed: a host lock, on tests/test_hostlog.py's lists): ACTIVE (created so; being launched by its thread) ->
+  HANDED_OFF (returned STARTED: unparked FIRST, while still ACTIVE, then moved) or ABANDONED (NOT_ADMITTED,
+  REFUSED_AFTER_COMMIT and GO_FAILED before they return; every raised launch at the end of `_unwind`, in a `finally`,
+  from ACTIVE or HANDED_OFF, since it never reached its receiver) -> RELEASED.
+- `release` answers KEPT and does nothing for an ACTIVE launch; only HANDED_OFF and ABANDONED ones are eligible.
+  RELEASED is set only by the call that removed the record and lifted the reservation through `Groups.release`, or
+  that found a launch which never committed and whose shim (if any) is reaped by its handle. ALREADY_RELEASED is
+  answered only after that, so never while a record or reservation exists.
+- `Owners` says it only STORES: being parked makes a launch findable, not eligible; the lifecycle is serialised by each
+  launch's lock, never by the table.
+- One case remains, and fails closed: a sweep that took its snapshot while a launch was ACTIVE and parked, and calls
+  `release` on it just after it was handed off, finds it HANDED_OFF and eligible; while its CLI runs there is no
+  proof, so the entry becomes HELD (C1's refused-proof rule). The receiver's `accept` then answers False, and the
+  launch is treated as stopping. Nothing is admitted beside it, nothing is released early; the cost is a launch stopped
+  for nothing. The wiring PR's sweep should release only launches it found ABANDONED.
+
+The launch-state table, updated (rows not shown are as in round 1; each launch's lifecycle added):
+
+| Exit | State | Record | Registry | Lifecycle | Owner |
+| --- | --- | --- | --- | --- | --- |
+| NOT_ADMITTED | (a) | none | none | ABANDONED | never parked |
+| every raised row of (a) | (a) | none | none | ABANDONED | unparked |
+| every raised row of (b) | (b) | kept (or left) | HELD | ABANDONED | parked |
+| REFUSED_AFTER_COMMIT, GO_FAILED (returned) | (b) | kept | HELD, STOPPING | ABANDONED | parked, returned |
+| raised after GO, or after the hand-off before the return (`went`, `handed`) | (b) | kept | HELD | ABANDONED | parked |
+| STARTED | (c) GO confirmed, PROVISIONAL, returned to the caller | kept | PROVISIONAL (fences) | HANDED_OFF | unparked: the caller's |
+| `accept()` True | (d) accepted | kept | LIVE | HANDED_OFF | the caller's |
+| `accept()` False (fenced meanwhile, or gone) | stopping | kept | as it was (STOPPING, HELD) | HANDED_OFF | the caller's: it stops and releases |
+| an interrupt inside `accept()` | stopping | kept | HELD | HANDED_OFF | the caller's |
+
+**What the wiring PR must do** (added to "What the next PR ... must contain"): at every supervised spawn site, on
+STARTED, first STORE the launch where that site's stop, reap and shutdown paths find it (the hosted session's record,
+the dispatched run's `_Local`), THEN call `launch.accept(groups)`; on False (or an exception from it) treat the launch
+as STOPPING from that moment (send its stop through `request_term`/`request_kill`, release on proof), never as
+started. Launches returned in (b) and those raised are in `Owners`; a cleanup sweep calls `release` on the ABANDONED
+ones only.
+
+Tests (tests/test_shim_launch.py):
+- `test_r5_launch_returns_with_the_entry_still_provisional_and_only_accept_makes_it_live`: STARTED with PROVISIONAL,
+  fenced, HANDED_OFF, unparked; `accept` True then LIVE and a sibling admitted; a second `accept` False. On 1d4d40f:
+  the state was LIVE on return.
+- `test_r5_until_accept_returns_success_the_checkout_stays_fenced[returned|accept-before|accept-after]`: fenced after
+  the return and inside `accept` before and after the registry's change; HELD after an interrupt in `accept`. On
+  1d4d40f: `returned` found the checkout not fenced (`[False]`); `accept` did not exist.
+- `test_r5_accept_reports_a_refusal_when_the_entry_is_no_longer_provisional[stopping|held|gone]`: False, nothing
+  changed. On 1d4d40f: `accept` did not exist.
+- `test_r6_a_sweep_racing_a_launch_never_takes_an_active_one[handed-off|fails-before-the-commit]`: a real sweeping
+  thread over `owners.parked()` while this thread runs 12 real launches (each in its own checkout, since a PROVISIONAL
+  entry fences its own); each ends HANDED_OFF with its record and fencing entry until its stop and the release on its
+  proof, or (failing before its commit) with nothing left; every RELEASED/ALREADY_RELEASED anyone got was for a launch
+  with no record and no entry (`released_means_gone`), at most one RELEASED per launch. On 1d4d40f: `handed-off`
+  failed, the final release answering `already_released` with the record still there; `fails-before-the-commit`
+  passed there (nothing is left either way).
+- Changed: `settled_b` (every (b) row) now checks ABANDONED, a refused `accept`, and the invariant;
+  `test_launch_no_registry_entry_exists_before_the_durable_commit` (PROVISIONAL at `went`, `handed` and on return,
+  LIVE after `accept`); the R1 lock test ends with `accept`; the every-step test's points are now the seven inside
+  `launch` (`live-before`, `live-after` and `live` moved to `accept`), all fenced but `admit-before`.
+
+**Mutation check (review round 2).** Not run here; tests/test_shim_mutation_rows.py passes (44 C3-2b-1 rows, 9 named
+"C3-2b-1 r2"). Applied by hand, each alone, and caught: every new row below.
+- **New (6):** "C3-2b-1 r2 R5 launch never makes the entry LIVE"; "C3-2b-1 r2 R5 accept checks confirm_live's result";
+  "C3-2b-1 r2 R5 an interrupt inside accept fences again"; "C3-2b-1 r2 R6 an ACTIVE launch is not eligible for
+  release"; "C3-2b-1 r2 R6 RELEASED only by the caller that retired the record"; "C3-2b-1 r2 R6 a failed launch
+  becomes ABANDONED".
+- **Re-anchored (3):** "C3-2b-1 no registry entry before the commit (re-anchored: C3-2b-1 r2)"; "C3-2b-1 r1 R4 a
+  release is reported once (re-anchored: C3-2b-1 r2)"; "C3-2b-1 r1 R4 a release holds the launch's own lock
+  (re-anchored: C3-2b-1 r2)".
+- Removed: none.
+
+**Runs (review round 2).** Targeted (test_shim_launch, test_shim_journal, test_shim_restore, test_shim_static,
+test_shim_mutation_rows, test_groupshim, test_nodes, test_ownership_c1, test_hostlog): 666 passed. No parallel suite
+(as asked). The two race tests also ran three more times outside the full runs (once with the R5 tests, twice on
+their own): passed each time.
+
+### Ownership C3-2b-1: review round 3 (Sol on d24fa2a: R6 protects ACTIVE launches; 1 blocker, 1 should)
+
+**R7 [blocker]. Once LIVE is committed it is irrevocable inside `accept()`.** Was: `accept`'s handler called
+`restore_held` on ANY exception; an interrupt landing after `confirm_live` released the registry lock (LIVE committed,
+a sibling possibly admitted under C1's sharing rule) then slammed HELD onto a state others already relied on. Now:
+- `Groups.hold_if_provisional(token)` (node_groups.py): under the registry lock, in one step, a PROVISIONAL entry
+  becomes HELD (with the HELD index); every other state (LIVE, HELD, STOPPING, none) is left exactly as it is.
+- `accept`'s handler calls only that. So the handler decides from the REGISTRY's state, not from a local an interrupt
+  could leave unset: before the commit the entry is still PROVISIONAL and becomes HELD (the checkout stays fenced);
+  from the commit on it is LIVE and nothing in `accept` touches it. The exception propagates.
+- `Launch.is_live(groups)`: what the receiver asks when `accept` RAISES. True: the launch is started; its NORMAL stop
+  and shutdown paths stop it as any LIVE group. False: it is fenced (HELD) and is stopped and released on its proof,
+  like a refused `accept`.
+- `accept(groups, pause=)` gained test-only points "accepting" (before `confirm_live`) and "accepted" (its result
+  recorded).
+
+**R8 [should, fixed]. The sweep takes ABANDONED launches only.** Now: `release_if_abandoned(groups, journal, owners,
+launch)` proceeds, as `release` and in the same hold of the launch's own lock, only if the launch is ABANDONED at that
+moment; RELEASED answers ALREADY_RELEASED; ACTIVE and HANDED_OFF answer SKIPPED (new) and nothing is done or changed.
+`sweep_abandoned(groups, journal, owners)` runs it over every parked launch ({launch id: answer}). `release` stays the
+receiver's own call for its own launch. Round 2's stale-snapshot case is closed: a stale sweep no longer fences a
+handed-off or accepted launch.
+
+The launch-state table, updated (round 2's rows stand; these replace its `accept` rows):
+
+| Exit | State | Registry | Lifecycle | Owner |
+| --- | --- | --- | --- | --- |
+| STARTED | (c) GO confirmed, PROVISIONAL, returned | PROVISIONAL (fences) | HANDED_OFF | the caller's |
+| `accept()` True | (d) accepted | LIVE | HANDED_OFF | the caller's |
+| `accept()` False | stopping | as it was (STOPPING, HELD, none) | HANDED_OFF | the caller's: stop, release on proof |
+| `accept()` raised before the LIVE commit | fenced | HELD (`is_live` False) | HANDED_OFF | the caller's: stop, release on proof |
+| `accept()` raised after the LIVE commit | started, stopping | LIVE, stays LIVE (`is_live` True) | HANDED_OFF | the caller's NORMAL stop and shutdown paths |
+| a sweep meets a HANDED_OFF or ACTIVE launch | unchanged | unchanged | unchanged (SKIPPED) | unchanged |
+
+**The wiring PR's obligations** (replacing round 2's): at each supervised spawn site, on STARTED, STORE the launch where
+that site's stop, reap and shutdown paths find it, THEN `accept()`. True: started. False: stopping (stop it through
+`request_term`/`request_kill`, then `release` on proof). It RAISES: ask `is_live`; True, started, and its normal stop
+and shutdown paths stop it; False, as a refused `accept`. The periodic cleanup pass calls `sweep_abandoned` only, never
+`release` on parked launches; a receiver calls `release` for its own launch.
+
+Tests (tests/test_shim_launch.py):
+- `test_r7_accept_has_two_outcomes_fenced_before_the_commit_and_live_for_good_after[returned|accepting|live-before|live-inside|live-after|accepted]`
+  (replaces round 2's `test_r5_until_accept_returns_success_the_checkout_stays_fenced`): before the commit the
+  checkout is fenced at the point and HELD after; from the commit a sibling admitted at the point is undisturbed, the
+  entry stays LIVE, never HELD, `is_live` True. On d24fa2a: `live-after` failed with the entry `held`; the other
+  points failed only on the new API (`pause`, `is_live`).
+- `test_r8_a_stale_sweep_crossing_acceptance_touches_nothing`: a real sweeper thread with a list taken while the
+  launch was ACTIVE calls `release_if_abandoned` on it over 1000 times through its hand-off and `accept`: all SKIPPED,
+  `accept` True, LIVE, nothing fenced. On d24fa2a: the operation did not exist.
+- `test_r8_the_sweep_releases_abandoned_launches_only`: `sweep_abandoned` releases a GO_FAILED launch on its proof, a
+  HANDED_OFF accepted one is SKIPPED and stays LIVE. On d24fa2a: did not exist.
+
+**Mutation check (review round 3).** Not run here; tests/test_shim_mutation_rows.py passes (47 C3-2b-1 rows, 5 named
+"C3-2b-1 r3"). Applied by hand, each alone, and caught: the three new rows and the re-anchored "fences again".
+- **New (3):** "C3-2b-1 r3 R7 accept never fences after LIVE is committed" (in `hold_if_provisional`); "C3-2b-1 r3 R7
+  accept decides from the registry's state" (the handler deciding from a local instead); "C3-2b-1 r3 R8 the sweep
+  takes ABANDONED launches only".
+- **Re-anchored (2):** "C3-2b-1 r2 R5 accept checks confirm_live's result (re-anchored: C3-2b-1 r3)"; "C3-2b-1 r2 R5
+  an interrupt inside accept fences again (re-anchored: C3-2b-1 r3)".
+- Removed: none.
+
+**Runs (review round 3).** Targeted (test_shim_launch, test_shim_journal, test_shim_restore, test_shim_static,
+test_shim_mutation_rows, test_groupshim, test_nodes, test_ownership_c1, test_hostlog): 674 passed.

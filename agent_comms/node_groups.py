@@ -49,6 +49,9 @@ _LOAD_FAILED_SAID: list = []        # (C1, review round 4, R12/A5) a libproc tha
 # scripts/install-launchagents.py; a shutdown that needs a KILL takes the 10 s kill grace first).
 POST_KILL_SECONDS = 1.0
 POST_KILL_STEP = 0.05               # between two looks within that window
+# (Ownership C3-2b-1) The registry token kind of a supervised launch: (SUPERVISED, its launch id). Never a session's
+# ("session", ...) or a dispatched run's ("run", ...): those never touch a supervised one, nor the reverse.
+SUPERVISED = "supervised"
 
 
 def _libproc():
@@ -167,7 +170,12 @@ class Groups:
     # stop's bookkeeping moves it to STOPPING as it would a LIVE one, and it never clears a veto. The proof turns it
     # into HELD when refused, or removes it with the entry when True.
     FENCED = "fenced"
-    _FENCE = ("stopping", "held", "fenced")     # the states that admit nothing beside them
+    # (Ownership C3-2b-1, review round 1, R1) PROVISIONAL: a supervised launch admitted (`admit_provisional`, after its
+    # journal commit) whose GO is not yet confirmed. It FENCES its checkout (nothing else is admitted there), and it
+    # becomes LIVE only when the caller confirms GO was written whole (`confirm_live`). For everything else it is a
+    # fencing entry like STOPPING: a stop's bookkeeping moves it to STOPPING, a refused release makes it HELD.
+    PROVISIONAL = "provisional"
+    _FENCE = ("stopping", "held", "fenced", "provisional")     # the states that admit nothing beside them
 
     def __init__(self) -> None:
         # THE registry lock, a host lock (a native RLock, entered as `with hostlog.BOUNDARY, self.lock:`, R18): a spawn
@@ -182,14 +190,20 @@ class Groups:
         # (Review round 4, R11 and A4) token -> [when its release was first refused (the owner's monotonic clock),
         # whether its retention line was written]: the line waits; HELD and the fence do not (`unproved_line`)
         self.refused: dict[Hashable, list] = {}
+        # (Ownership C3-2b-1) None, or why admission is CLOSED for every checkout (the supervised-launch journal could
+        # not be read at the node's start: shimjournal.restore): every start is refused, `blocked` answers True for
+        # every directory, for the life of the process. Written under the lock; nothing reopens it.
+        self.closed: str | None = None
 
     def start(self, cwd: Any, token: Hashable, spawn: Callable[[], Any], k: Hashable | None = None) -> tuple[bool, Any]:
-        """Start a process group in `cwd` unless one being stopped is there: (False, None) and nothing is spawned;
-        else the group is recorded live and `spawn()` runs under the lock: (True, what it returned). A spawn that
-        raises records nothing. `k`: the directory's key, computed once by the caller (who keeps it with the process:
-        session_host `_spawn`, review round 1 of the enabling PR, A3); else computed here."""
+        """Start a process group in `cwd` unless one being stopped is there (or admission is closed: C3-2b-1): (False,
+        None) and nothing is spawned; else the group is recorded live and `spawn()` runs under the lock: (True, what it
+        returned). A spawn that raises records nothing. `k`: the directory's key, computed once by the caller (who
+        keeps it with the process: session_host `_spawn`, review round 1 of the enabling PR, A3); else computed here."""
         k = key(cwd) if k is None else k
         with hostlog.BOUNDARY, self.lock:
+            if self.closed is not None:     # (C3-2b-1: admission closed for the whole node)
+                return False, None
             if any(state in self._FENCE for state, _ in self.entries.get(k, {}).values()):
                 return False, None
             self.entries.setdefault(k, {})[token] = [self.LIVE, cwd]
@@ -198,6 +212,49 @@ class Groups:
             except BaseException:
                 self._drop(k, token)
                 raise
+
+    def admit_provisional(self, cwd: Any, token: Hashable, k: Hashable | None = None) -> bool:
+        """(Ownership C3-2b-1, review round 1, R1) A supervised launch's admission, AFTER its journal commit and
+        BEFORE its GO: under the registry lock, the same check a start makes (closed admission, a fenced checkout),
+        then a PROVISIONAL entry for `token` that FENCES the checkout. No I/O and no spawn here: the caller writes GO
+        after this returns, OUTSIDE the lock, and confirms it (`confirm_live`). True when the entry was installed,
+        False (nothing installed) when refused. A supervised token only (else ValueError). `k`: the directory's key,
+        computed by the caller before (no I/O under the lock); else computed here, before the lock."""
+        if not (isinstance(token, tuple) and len(token) == 2 and token[0] == SUPERVISED and isinstance(token[1], str)):
+            raise ValueError("a provisional admission takes a supervised token")
+        k = key(cwd) if k is None else k
+        with hostlog.BOUNDARY, self.lock:
+            if self.closed is not None:
+                return False
+            if any(state in self._FENCE for state, _ in self.entries.get(k, {}).values()):
+                return False
+            self.entries.setdefault(k, {})[token] = [self.PROVISIONAL, cwd]
+            return True
+
+    def confirm_live(self, token: Hashable) -> bool:
+        """(Ownership C3-2b-1, review round 1, R1) GO was CONFIRMED written whole: the token's PROVISIONAL entry
+        becomes LIVE (C1's sharing rule then applies, as for a direct start's entry). Any other state (STOPPING,
+        HELD) is left as it is, and so is a missing entry: False."""
+        with hostlog.BOUNDARY, self.lock:
+            done = False
+            for groups in self.entries.values():
+                if token in groups and groups[token][0] == self.PROVISIONAL:
+                    groups[token][0], done = self.LIVE, True
+            return done
+
+    def hold_if_provisional(self, token: Hashable) -> bool:
+        """(Ownership C3-2b-1, review round 3, R7) An `accept` that an exception or interrupt cut short: decided from
+        the REGISTRY's state, under its lock, in one step: a PROVISIONAL entry (the LIVE transition did not commit)
+        becomes HELD, with the HELD index (True). Any other state is left exactly as it is (False): a LIVE one stays
+        LIVE (the transition committed, and others may already share it), and HELD, STOPPING or none is unchanged."""
+        with hostlog.BOUNDARY, self.lock:
+            done = False
+            for groups in self.entries.values():
+                if token in groups and groups[token][0] == self.PROVISIONAL:
+                    groups[token][0], done = self.HELD, True
+            if done:
+                self.held.add(token)
+            return done
 
     def stopping(self, token: Hashable) -> None:
         """The group is being stopped (signalled, or its leader went on its own and members are left)."""
@@ -375,7 +432,7 @@ class Groups:
                 del self.entries[k]
 
     def state(self, token: Hashable) -> str | None:
-        """The token's registry state (LIVE, STOPPING, HELD, FENCED), or None."""
+        """The token's registry state (LIVE, STOPPING, HELD, FENCED, PROVISIONAL), or None."""
         with hostlog.BOUNDARY, self.lock:
             for groups in self.entries.values():
                 if token in groups:
@@ -391,11 +448,37 @@ class Groups:
         return token not in self.held
 
     def blocked(self, cwd: Any) -> bool:
-        """A group being stopped, HELD, or FENCED (a release under way) is in this directory."""
+        """A group being stopped, HELD, FENCED (a release under way) or PROVISIONAL (a supervised launch before its
+        GO is confirmed) is in this directory, or admission is closed (C3-2b-1: then every directory is blocked)."""
         with hostlog.BOUNDARY, self.lock:
+            if self.closed is not None:     # (C3-2b-1: admission closed: every directory)
+                return True
             return any(state in self._FENCE for state, _ in self.entries.get(key(cwd), {}).values())
 
+    def restore_held(self, token: Hashable, keys: list, cwd: Any) -> None:
+        """(Ownership C3-2b-1) Install a reservation restored from the supervised-launch journal (shimjournal.restore,
+        at the node's start, before any admission), or one for a committed launch that was not admitted, or that an
+        exception or an interrupt cut at any step after its commit (shimlaunch.launch, review round 1: its entry under
+        that key, PROVISIONAL, LIVE or STOPPING, becomes HELD; with none, one is installed): HELD under `token`, a
+        SUPERVISED token only, under each of `keys` (its checkout's identities), and in the HELD index. HELD fences
+        admission and is proof-only; it leaves only through `release` with a True proof (nothing releases a restored
+        one in this PR). The keys are computed by the caller: no I/O under the lock."""
+        if not (isinstance(token, tuple) and len(token) == 2 and token[0] == SUPERVISED and isinstance(token[1], str)):
+            raise ValueError("a restored reservation takes a supervised token")
+        with hostlog.BOUNDARY, self.lock:
+            for k in keys:
+                self.entries.setdefault(k, {})[token] = [self.HELD, cwd]
+            self.held.add(token)
+
+    def close_admission(self, reason: str) -> None:
+        """(Ownership C3-2b-1) Close admission for the whole node: from now on every `start` is refused and `blocked`
+        answers True, for the life of the process (the supervised-launch journal could not be read: which checkouts
+        a launch of an earlier node process may hold is unknown). The first reason is kept."""
+        with hostlog.BOUNDARY, self.lock:
+            if self.closed is None:
+                self.closed = reason
+
     def stopping_dirs(self) -> set[str]:
-        """The directories (as recorded) that hold a group being stopped, HELD, or FENCED."""
+        """The directories (as recorded) that hold a group being stopped, HELD, FENCED or PROVISIONAL."""
         with hostlog.BOUNDARY, self.lock:
             return {cwd for groups in self.entries.values() for state, cwd in groups.values() if state in self._FENCE}
