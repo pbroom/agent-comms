@@ -17520,8 +17520,10 @@ publish a marker bound to its launch:
 3. It makes the control fds close-on-exec and non-blocking.
 4. It calls `setsid()` if `Popen(start_new_session=True)` has not already made it a session leader.
 5. It checks the boot.
-6. It records which signals were ignored when the node started it, and sets SIGCHLD to its default for itself. If
-   SIGCHLD were ignored, the kernel would reap the CLI behind the shim's back, and nothing would anchor the group.
+6. It records which signals were ignored when the node started it, and sets SIGCHLD to its default for itself. A
+   SIGCHLD ignored in the shim's own process would have the kernel reap the CLI behind its back, and nothing would
+   anchor the group. Measured on macOS: an ignore that is merely inherited across exec still leaves zombies, and the
+   shim sets none itself, so this reset is defence in depth (its mutation row is equivalent; see below).
 
 **`GO`.** One line, `GO 1 <json>\n`. The JSON object has exactly the keys `cwd` (absolute), `argv` (non-empty, strings
 without NUL), `env` (string to string, with no `=` and no NUL in a key) and `kill_grace` (a number, 0 < g ≤ 3600). The
@@ -17782,6 +17784,11 @@ file the cleanup writes, or after 60 s. Every wait is bounded (20 s each).
   until the shim exits, and then the marker's code answers.
 - **Two layers, each enough alone.** The CLI's fds are closed by both close-on-exec and the child's close loop.
   Removing either one alone changes nothing a test can see, so there is no row for them.
+- **The SIGCHLD reset is not observable on macOS.** Its row ("the shim keeps SIGCHLD at its default") is MISSED, and
+  it is equivalent: a scratch probe shows that SIGCHLD ignored by `signal.signal` in a process auto-reaps its children,
+  but one inherited across exec does not (the child stayed a zombie, status SZOMB, and `waitpid` got it). The shim's
+  SIGCHLD can only be inherited, so the test with a node that ignores SIGCHLD passes either way. The reset stays as
+  defence in depth.
 - **macOS only.** The test module is skipped elsewhere.
 
 ### Measurements (scratch, 20 shims, load average 7.8)

@@ -703,8 +703,10 @@ def main(argv: list[str]) -> int:
         shim.diag("the boot identity given is not this boot's (or waitid is missing): exit, nothing published")
         return EXIT_USAGE
     # The dispositions a direct Popen child would get: what was ignored when the node started the shim (Popen's
-    # restore_signals resets SIGPIPE and SIGXFSZ, which Python then ignores again in the shim). The shim itself must
-    # see SIGCHLD at its default, or its children would be reaped behind its back and nothing would anchor.
+    # restore_signals resets SIGPIPE and SIGXFSZ, which Python then ignores again in the shim). The shim itself keeps
+    # SIGCHLD at its default: a SIGCHLD ignored IN THIS PROCESS would have the kernel reap the CLI behind its back, and
+    # nothing would anchor. (Measured on macOS: an ignore merely inherited across exec still leaves zombies, and the
+    # shim sets none itself, so this reset is defence in depth; its mutation row is equivalent, DESIGN_NOTES C3-1.)
     ignored = frozenset(s for s in signal.Signals if s not in (signal.SIGKILL, signal.SIGSTOP, signal.SIGPIPE,
                                                                signal.SIGXFSZ)
                         and signal.getsignal(s) == signal.SIG_IGN)
