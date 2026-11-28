@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 import httpx
 
-from . import access
+from . import access, hostlog
 from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
                        plain_origins, probe_process, process_start, remove_browser_output, render_argv,
                        browser_output_path, make_browser_output,
@@ -36,7 +36,11 @@ from .node_groups import POST_KILL_SECONDS, POST_KILL_STEP, key
 from .node_sessions import SessionRunner
 from .session_host import STATE_FILE as SESSION_STATE_FILE, SessionHost
 
-log = logging.getLogger("agent_comms.node")
+log = hostlog.get("agent_comms.node")     # (host-side logging: every line a deferred record, hostlog)
+# (Review round 3, R19, A5) the logger the node hands to the two dispatch helpers it calls (`remove_browser_output`,
+# `with_managed_env`): dispatch's own logger name, through hostlog; called without it (`board dispatch`), they keep
+# dispatch's plain logger
+DISPATCH_LOG = hostlog.get("agent_comms.dispatch")
 
 HELLO_SECONDS = 10.0
 # Without hub contact this long, the node stops its own runs: the hub counts them lost after
@@ -385,7 +389,8 @@ class Node:
                     fresh = True        # fresh per run; never reused
                 template = with_headless_browser(template, headless_browser_overrides(
                     self.config.headless_browser, origins, str(out_dir)))
-            template = with_managed_env(template, child_env(agent, self.config, runtime=r.get("runtime")))
+            template = with_managed_env(template, child_env(agent, self.config, runtime=r.get("runtime")),
+                                        logger=DISPATCH_LOG)
             argv = render_argv(template, prompt=prompt, project=cwd, thread_id=int(r.get("thread_id") or 0))
             # Account folders, at the spawn, on the command line as it will run: its cwd, the workspace a Codex
             # runner names itself and every writable root it is given, generated ones included (agent_accounts.py);
@@ -407,7 +412,7 @@ class Node:
                     self._remove_browser_output(rid, out_dir)
                 return
         except Exception as e:
-            log.warning("could not start run %s: %s", rid, e)
+            log.warning("could not start run %s: %s", rid, hostlog.facts(e))
             if made:
                 self._remove_browser_output(rid, out_dir)
             self._report(rid, "ended", error=f"{type(e).__name__}: {e}"[:300])
@@ -440,7 +445,7 @@ class Node:
         if out is None:
             return
         remove_browser_output({"run_id": run_id, "log": str(self.log_dir / f"{run_id}.log"),
-                               "headless_browser": {"output_dir": str(out)}})
+                               "headless_browser": {"output_dir": str(out)}}, logger=DISPATCH_LOG)
 
     def _stop(self, local: _Local, how: str) -> None:
         if not self.groups.may_signal(("run", local.run_id)):
@@ -652,7 +657,53 @@ def log_to_stderr() -> None:
     pkg.propagate = False
 
 
+EXIT_FLUSH_SECONDS = 2.0     # the node's ONE final wait for its log writer, `atexit`'s included (hostlog.final_flush)
+
+
 def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
+    """`board node`. (Host-side logging: one writer) This thread is a lifecycle thread for the whole run, registered
+    before anything is built or recovered: it never waits for the log writer, so no handler can hold up a signal, a
+    report or a save of the node's. After the last signal and report: ONE bounded wait for the writer
+    (`_exit_if_stalled`)."""
+    with hostlog.enqueue_only():
+        hostlog.start_writer()      # (eagerly, here, once: nothing restarts it in this process)
+        try:
+            _run(hub, token, poll_seconds=poll_seconds)
+        except BaseException as e:
+            _exit_if_stalled(_status(e))
+            raise
+        _exit_if_stalled(0)
+
+
+def _status(e: BaseException) -> int:
+    """The exit status the interpreter would give for `e` escaping `run` (SystemExit's own code, 130 for an
+    interrupt, 1 for anything else)."""
+    if isinstance(e, SystemExit):
+        return e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+    return 130 if isinstance(e, KeyboardInterrupt) else 1
+
+
+def _exit_if_stalled(status: int) -> None:
+    """The node's exit, after its last signal and report: ONE bounded wait for the log writer (EXIT_FLUSH_SECONDS,
+    `atexit`'s included). Idle (or no writer could be started: no handler of ours runs, the queued lines are lost):
+    the process goes on to exit as ever (`logging.shutdown()` included). Still stuck in a
+    handler: the process ends now with `status`, without waiting for that handler (a handler stuck holding its own
+    lock would hold `logging.shutdown()` for good). That skips the interpreter's exit work (atexit hooks,
+    `logging.shutdown()`, a traceback for an escaping exception, buffered output): every child was signalled and
+    every report and save made by then, and the lines still queued behind the stuck handler are lost.
+    (Review round 3, R21) An interrupt during the final wait (a second SIGTERM, or Ctrl-C) counts as stalled: the
+    process ends now with the status already selected, rather than escaping into the interpreter's
+    `logging.shutdown()`, which could block on a stuck handler. On the main thread the wait is a poll outside the
+    queue's lock (hostlog `_wait_for`), so the interrupt leaves the queue's lock free."""
+    try:
+        idle = hostlog.final_flush(EXIT_FLUSH_SECONDS)
+    except KeyboardInterrupt:
+        idle = False
+    if not idle:
+        os._exit(status)
+
+
+def _run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
     from .config import Settings, home
     log_to_stderr()
     settings = Settings.load()
@@ -680,7 +731,7 @@ def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
                 try:
                     node.tick()
                 except httpx.HTTPError as e:
-                    log.warning("hub unreachable: %s", e)
+                    log.warning("hub unreachable: %s", hostlog.facts(e))
                 time.sleep(poll_seconds or config.poll_seconds)
         except KeyboardInterrupt:
             shut_down(node)

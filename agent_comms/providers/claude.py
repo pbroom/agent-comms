@@ -104,12 +104,12 @@ from __future__ import annotations
 import collections
 import dataclasses
 import json
-import logging
 import os
 import re
 import uuid
 
 from . import FAILED_TURN, Event, cap_reply, number, usage_record, validate_model, validate_session_id
+from .. import hostlog
 
 # Flags a hosted session sets itself, or that would start, fork or hide a conversation other than the hub's.
 OWN_FLAGS = frozenset((
@@ -133,13 +133,19 @@ def shown_version(version) -> str:
     VERSION_SHOWN characters (and says how long it was). Not a string: "no version"."""
     if not isinstance(version, str):
         return "no version"
-    # Bounded work whatever the init's size: only the first VERSION_SHOWN characters are escaped, then the result
-    # itself is capped (an escape takes up to ten characters).
+    return _shown(version[:VERSION_SHOWN], len(version))
+
+
+def _shown(head: str, length: int) -> str:
+    """`shown_version` from the version's first VERSION_SHOWN characters and its length: what the log line's writer
+    renders (host-side logging, review round 1, R4: nothing is formatted at the call, which only slices and counts).
+    Bounded work whatever the init's size: only those characters are escaped, then the result itself is capped (an
+    escape takes up to ten characters)."""
     text = re.sub(r"[^\x20-\x7e]", lambda m: "\\u%04x" % ord(m.group()) if ord(m.group()) < 0x10000
-                  else "\\U%08x" % ord(m.group()), version[:VERSION_SHOWN])
-    if len(text) <= VERSION_SHOWN and len(version) <= VERSION_SHOWN:
+                  else "\\U%08x" % ord(m.group()), head)
+    if len(text) <= VERSION_SHOWN and length <= VERSION_SHOWN:
         return text
-    return f"{text[:VERSION_SHOWN]}... ({len(version)} characters)"
+    return f"{text[:VERSION_SHOWN]}... ({length} characters)"
 
 
 # The Claude Code versions whose processes are attributed by evidence (module text). A version goes in only once the
@@ -160,7 +166,7 @@ MEASURED_TERMINALS = {"success": False, "error_max_turns": True, "error_during_e
 # its uuid); UNATTRIBUTED: a turn no message of the host's is known to have started (an unmarked `init`).
 OWN, UNATTRIBUTED = "own", "unattributed"
 STEER_BRACKET = "steer"     # S's own bracket, after N's end: an `init` echoing exactly [S] (NEXT_TURN only)
-log = logging.getLogger("agent_comms.providers.claude")
+log = hostlog.get("agent_comms.providers.claude")     # (host-side logging: every line a deferred record, hostlog)
 # The facts of a `result` the host passes on as `meta`: small scalars only. The reply text travels apart from them
 # (Event.text, capped), so nothing that logs or stores `meta` ever holds it.
 RESULT_META = ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_usd", "stop_reason", "terminal_reason",
@@ -952,7 +958,8 @@ class ClaudeSession:
             # empty, so main's logs are untouched).
             self._told = True
             log.info("Claude session %s: this process reports Claude Code %s; turn correlation is %s", self.session_id,
-                     shown_version(version),
+                     hostlog.later(_shown, version[:VERSION_SHOWN], len(version)) if isinstance(version, str)
+                     else "no version",
                      "on for it" if qualifies and self._verified is None else "off for it (attributed by order)")
         if self._verified is None:
             self._verified = qualifies      # pinned to this incarnation by its first `init`
