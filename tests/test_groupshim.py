@@ -1461,9 +1461,10 @@ def test_r3_a_poll_only_consumer_learns_the_exit_from_the_marker_when_leader_exi
 @pytest.mark.parametrize("which", ["file", "dir"])
 def test_r4_a_failed_sync_file_publishes_nothing_and_dir_leaves_a_visible_marker_said_as_unsynced(shim, monkeypatch,
                                                                                                   which):
-    """A3: the temp file's sync fails: nothing is published (no marker, no temp file), MARKER_FAILED, exit 4. The
-    directory's sync fails: the complete marker is visible and valid (the living node's proof: `empty()` takes it), and
-    the shim says `UNSYNCED <errno>` before `EMPTY` and exits 6, not 0."""
+    """A3 (as changed by C3-2a review round 2, R5): the marker file's own sync fails: MARKER_FAILED, exit 4 (in no
+    release pair), and the file is LEFT as it is (complete here, and authentic: the pair, not the filesystem, refuses
+    it); no temp file ever exists. The directory's sync fails: the complete marker is visible and valid (the living
+    node's proof: `empty()` takes it), and the shim says `UNSYNCED <errno>` before `EMPTY` and exits 6, not 0."""
     calls = []
     real = groupshim._fullsync
 
@@ -1478,9 +1479,9 @@ def test_r4_a_failed_sync_file_publishes_nothing_and_dir_leaves_a_visible_marker
     code = shim._check_empty()
     said = events_of(shim)
     if which == "file":
-        assert code == groupshim.EXIT_MARKER_FAILED and not os.path.exists(shim.marker)
-        assert not [f for f in os.listdir(os.path.dirname(shim.marker)) if f.endswith(".tmp")]
-        assert "MARKER_FAILED" in said and "EMPTY" not in said
+        assert code == groupshim.EXIT_MARKER_FAILED and marker_proves(shim.marker, shim.key, shim.boot)
+        assert os.listdir(os.path.dirname(shim.marker)) == ["marker.json"], "no temp file, nothing removed"
+        assert said[said.index("MARKER_FAILED") + 1] == "5" and "EMPTY" not in said
     else:
         assert code == groupshim.EXIT_UNSYNCED and marker_proves(shim.marker, shim.key, shim.boot)
         assert said[said.index("UNSYNCED") + 1] == "5" and said.index("UNSYNCED") < said.index("EMPTY")
@@ -2237,21 +2238,6 @@ def test_rr1_publishing_never_replaces_a_file_at_the_marker_path(kit, outcome):
     assert not [n for n in os.listdir(c.dir) if n.endswith(".tmp")], "no temp file of ours left behind"
 
 
-def test_rr1_a_temp_name_the_shim_did_not_create_is_never_unlinked(kit):
-    """R1: a file sits at the shim's own temp name (`<marker>.<shim pid>.tmp`, guessable) when it publishes. The
-    exclusive create fails, and the shim leaves that file alone: it is there byte for byte, nothing is published,
-    exit 4, `lost()`. (On 7047f3a the shim unlinks it after its failed create.)"""
-    go = kit.path("cli-go")
-    c = kit.run(kit.argv(until=go))
-    assert wait_event(c, "STARTED")
-    tmp = Path(f"{c.marker}.{c.pid}.tmp")
-    tmp.write_bytes(b"not the shim's\n")
-    Path(go).write_text("")
-    assert shim_exit(c) == groupshim.EXIT_MARKER_FAILED, c.events
-    assert tmp.read_bytes() == b"not the shim's\n", "not unlinked"
-    assert not os.path.exists(c.marker) and not c.empty() and c.lost()
-
-
 STALLING_PYTHON = r'''#!/bin/sh
 # TEST-ONLY: the real interpreter for the shim, with every way of describing a crash made to stall (until `abort`):
 # the traceback module's formatters, linecache, and the shim's own rendering function.
@@ -2331,3 +2317,112 @@ def test_rr3_popen_cannot_reap_the_shim_behind_the_handle(kit):
     p.kill()                                # (a no-op too: Popen signals nothing it thinks is over)
     assert groupshim.waitid_nowait(c.pid) == 0, "still unreaped: Popen did not take its status"
     assert c.shim_poll() == groupshim.EXIT_EMPTY and c.empty()
+
+
+# ---------------------------------------------------------------- C3-2a review round 2 (Sol on 1a23236)
+
+def test_rr5_a_file_swapped_in_while_the_shim_writes_is_neither_replaced_nor_deleted(kit):
+    """R5 (a): the shim is held (test gate `pause-after-create`) right after it created the marker path exclusively.
+    A same-user process renames the shim's file away and puts a substitute at the path. The shim writes and syncs
+    through its own descriptor, so its record lands in its own (renamed) file; it replaces nothing and deletes
+    nothing: the substitute is there byte for byte, the shim's complete record is in the moved file, and `empty()` is
+    False (the substitute's MAC does not verify): held. (On 1a23236 there is no such pause: the shim publishes through a
+    temp name and a link, and the test never sees the path created.)"""
+    c = kit.start(gate_files=("pause-after-create",))
+    c.go(["/bin/sh", "-c", "exit 0"], cwd=str(kit.work), env=ENV, kill_grace=1.0)
+    assert wait_for(lambda: (c.gate_dir / "marker-created.at").exists()), "the shim created the marker path"
+    moved = c.marker + ".moved"
+    os.rename(c.marker, moved)
+    substitute = json.dumps(record(b"x" * groupshim.KEY_BYTES, c.boot)).encode() + b"\n"
+    Path(c.marker).write_bytes(substitute)
+    (c.gate_dir / "marker-created.go").write_text("")
+    assert shim_exit(c) == groupshim.EXIT_EMPTY, c.events     # (the shim cannot know: the pair decides)
+    assert Path(c.marker).read_bytes() == substitute, "not replaced"
+    assert shimchild.read_marker(moved, c._key, c.boot) is not None, "its own record, complete, in its own file"
+    assert not c.empty() and c.lost()
+
+
+@pytest.mark.parametrize("outcome", ["empty", "never_started"])
+def test_rr5_a_file_sync_failure_after_the_whole_record_is_no_proof(kit, outcome):
+    """R5 (b), Sol's: the marker file's sync fails (injected through the test gate, `fail-file-sync`) AFTER the whole
+    record was written. The file on disk is complete and HMAC-valid, yet the shim says `MARKER_FAILED 5` and exits 4,
+    in no release pair: `empty()` is False and the launch is `lost()` (held). The file is left in place. (On 1a23236
+    the injection does not exist: the shim exits 0 or 3 with the proof.)"""
+    c = kit.start(gate_files=("fail-file-sync",))
+    if outcome == "never_started":
+        c.close_commands()
+    else:
+        c.go(["/bin/sh", "-c", "exit 0"], cwd=str(kit.work), env=ENV, kill_grace=1.0)
+    assert shim_exit(c) == groupshim.EXIT_MARKER_FAILED, c.events
+    assert ("MARKER_FAILED", "5") in c.events and ("EMPTY",) not in c.events, c.events
+    rec = shimchild.read_marker(c.marker, c._key, c.boot)
+    assert rec is not None and rec["outcome"] == outcome, "the file is complete and authentic"
+    assert not c.empty() and c.lost() and not c.refused()
+
+
+def test_rr5_a_short_write_is_completed_by_the_loop(tmp_path, monkeypatch):
+    """R5 (c): every `os.write` writes at most 5 bytes; `write_marker` loops until the whole record is in the file, and
+    it is authentic. (This loop was there on 1a23236 too: a pin.)"""
+    key, boot = b"k" * groupshim.KEY_BYTES, groupshim.boot_id()
+    good = record(key, boot)
+    path = tmp_path / "m.marker"
+    real, calls = os.write, []
+
+    def short(fd, data):
+        calls.append(len(data))
+        return real(fd, bytes(data[:5]))
+    monkeypatch.setattr(groupshim.os, "write", short)
+    try:
+        result = groupshim.write_marker(str(path), good)
+    finally:
+        monkeypatch.undo()
+    assert result == (groupshim.PUBLISHED, 0)
+    assert len(calls) > 10 and shimchild.read_marker(str(path), key, boot) == good
+    assert os.listdir(tmp_path) == ["m.marker"]
+
+
+FORBIDDEN_IN_PUBLISH = {"os.unlink", "os.remove", "os.rename", "os.replace", "os.link", "os.symlink", "os.rmdir",
+                        "os.removedirs", "os.renames", "os.truncate", "os.ftruncate", "shutil", "tempfile"}
+
+
+def test_rr5_write_marker_and_all_it_calls_never_unlink_rename_link_or_stage(tmp_path):
+    """R5 (d), static: `write_marker`, and every function of groupshim it calls (transitively), names none of
+    `os.unlink`, `os.remove`, `os.rename`, `os.replace`, `os.link` (nor symlink, rmdir, truncate), `shutil` or
+    `tempfile`; and it opens the marker path with O_EXCL | O_NOFOLLOW. Module-wide, groupshim never unlinks or removes
+    anything, and renames only in its two test-gate announcers (`Shim._gate`, `_child_gate`). (On 1a23236
+    `write_marker` links and unlinks.)"""
+    tree = ast.parse(Path(groupshim.__file__).read_text())
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    todo, seen = ["write_marker"], set()
+    while todo:
+        name = todo.pop()
+        if name in seen or name not in funcs:
+            continue
+        seen.add(name)
+        for n in ast.walk(funcs[name]):
+            text = ast.unparse(n) if isinstance(n, (ast.Attribute, ast.Name)) else ""
+            assert text not in FORBIDDEN_IN_PUBLISH and text.split(".")[0] not in ("shutil", "tempfile"), (name, text)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                todo.append(n.func.id)
+    assert {"write_marker", "_fullsync", "_close"} <= seen, seen
+    opens = [n for n in ast.walk(funcs["write_marker"]) if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.open"]
+    marker_opens = [o for o in opens if ast.unparse(o.args[0]) == "path"]
+    assert len(marker_opens) == 1, "the marker path itself, once, no staging name"
+    assert all(f in ast.unparse(marker_opens[0]) for f in ("os.O_CREAT", "os.O_EXCL", "os.O_NOFOLLOW"))
+    others = [ast.unparse(o) for o in opens if o not in marker_opens]
+    assert others == ["os.open(os.path.dirname(path) or '.', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)"], others
+    scopes = []
+    for top in tree.body:
+        if isinstance(top, ast.ClassDef):
+            scopes += [(f"{top.name}.{m.name}", m) for m in top.body if isinstance(m, ast.FunctionDef)]
+            scopes.append((top.name, ast.Module(body=[s for s in top.body if not isinstance(s, ast.FunctionDef)],
+                                                type_ignores=[])))
+        else:
+            scopes.append((getattr(top, "name", "<module>"), top))
+    owners = {}
+    for qual, node in scopes:
+        for n in ast.walk(node):
+            if isinstance(n, ast.Attribute) and ast.unparse(n) in ("os.unlink", "os.remove", "os.rename", "os.replace"):
+                owners.setdefault(ast.unparse(n), set()).add(qual)
+    assert "os.unlink" not in owners and "os.remove" not in owners and "os.replace" not in owners, owners
+    assert owners.get("os.rename", set()) <= {"Shim._gate", "_child_gate"}, owners

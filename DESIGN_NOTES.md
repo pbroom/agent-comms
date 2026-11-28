@@ -19783,8 +19783,9 @@ stay as the history; where they disagree with this one, this one holds.
 
 ### The marker's authenticated record (F1.3)
 
-`{"v": 2, "outcome", "cli_pid", "leader_exit", "boot", "mac"}`, one line, published as before (temp file, full sync,
-rename, directory sync).
+`{"v": 2, "outcome", "cli_pid", "leader_exit", "boot", "mac"}`, one line. (How it is written changed twice in review:
+since round 2 the shim creates the marker path itself, exclusively, and writes it in place with no staging file; see
+"review round 2" below.)
 
 - **`v` = `MARKER_VERSION` = 2:** every field authenticated by HMAC-SHA256 under the launch secret. 1 was C3-1's
   unauthenticated record, which the reader now refuses. A later, stronger verifier (one the CLI cannot even in
@@ -19842,6 +19843,10 @@ rename, directory sync).
   its group, can read ANY durable record the node can write (the secret, if the node kept it on disk), so HMAC under a
   node-held secret proves nothing against it then. Until C3-3 decides, a restarted node treats every unproved
   reservation as held.
+  - **For C3-3 (Sol, review round 2):** a complete, HMAC-valid marker can be visible before the sync finishes or after
+    a sync fails; the HMAC proves authenticity and completeness, not that the shim reached a proof-bearing exit; if
+    restart recovery needs that exit decision it must retain the reservation unless it has independent evidence of
+    it.
 
 ### The degraded stop: after the fork, a crash still stops the group (F2)
 
@@ -20137,3 +20142,68 @@ R1 "no replace", R2 and R3 "unknown" mutants were applied by hand and each was c
   the fork goes to the degraded stop (re-anchored: review round 1)".
 - **Removed (1):** "C3-2a no release pair while this process ignores SIGCHLD" (its guard is dropped; R3's rows
   replace it).
+
+### Ownership C3-2a: review round 2 (Sol on 1a23236: R2, R3 and R4 resolved; one blocker on R1)
+
+#### R5 [blocker]: the marker is published with NO staging file
+
+- **The defect.** Round 1's publish created a temp file, then `os.link`ed it to the marker path and unlinked the temp
+  name. A same-user process can enter any directory the shim can: after the create it could rename the shim's temp
+  file away and put another file at that name; `link` then published the substitute and `unlink` deleted it (the
+  error path had the same deletion race). No staging name can be protected.
+- **Now** (`write_marker`): the shim creates the marker path ITSELF with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+  O_CLOEXEC`, mode 0600; writes the whole record (at most `MARKER_MAX` = 4096 bytes, now one constant shared with the
+  reader) through that descriptor with a loop that completes a short write; full-syncs the DESCRIPTOR; closes it; then
+  syncs the directory. No temp file, no `link`, no `rename`. The shim never unlinks any path, on success or on any
+  error.
+
+| What happens | Event | Exit | What is left at the path |
+| --- | --- | --- | --- |
+| anything already at the path (a dangling symlink included) | `MARKER_FAILED 17` | 4 | that thing, untouched |
+| the write or the file's sync fails after the create | `MARKER_FAILED <errno>` | 4 | the shim's file, as it is (possibly partial; possibly complete and authentic) |
+| the directory's sync fails after a good file sync | `UNSYNCED <errno>`, `EMPTY` | 6 | the complete, valid, visible marker |
+| all synced | `EMPTY` | 0 (or 3) | the marker |
+
+- **Atomicity for the reader comes from the release pair and the MAC, not from the filesystem** (said in
+  `write_marker`'s and `read_marker`'s docstrings too). A reader accepts a marker only with the shim's own observed
+  terminal status in a proof-bearing pair AND a MAC that verifies over the complete record. A partial file fails the
+  parse or the MAC; a substituted one fails the MAC; a complete, authentic file left after a failed file sync fails the
+  pair (exit 4 is in none). Each is held.
+- **What still applies of the substitution attack:** a process can rename the shim's freshly created file away and put
+  another at the path while the shim writes. The shim writes into its own (renamed) file, replaces and deletes nothing,
+  and may even exit 0; the substitute fails the MAC, so `empty()` is False: held.
+- **Test-only hooks** (test gate dir): `fail-file-sync` (the descriptor's sync fails with EIO after the whole record was
+  written) and `pause-after-create` (the shim announces `marker-created.at`, created exclusively, and waits, bounded,
+  for `marker-created.go`).
+- **Proof after a restart:** Sol's point for C3-3 is added to "what is not decided" above.
+- **Tests:**
+  - `test_rr5_a_file_swapped_in_while_the_shim_writes_is_neither_replaced_nor_deleted` (real): held after the create,
+    the shim's file is renamed away and a substitute put in its place; afterwards the substitute is there byte for byte,
+    the shim's complete record is in the moved file, `empty()` False, `lost()`. Fails on 1a23236 (no pause there: the
+    path is never seen created).
+  - `test_rr5_a_file_sync_failure_after_the_whole_record_is_no_proof[empty|never_started]` (real, Sol's): the file on
+    disk is complete and HMAC-valid (`read_marker` accepts it), yet `MARKER_FAILED 5`, exit 4, `empty()` False,
+    `lost()`. Both fail on 1a23236 (exit 0 / 3).
+  - `test_rr5_a_short_write_is_completed_by_the_loop` (in process, every `os.write` capped at 5 bytes): passes on
+    1a23236 too (that loop was already there): a pin.
+  - `test_rr5_write_marker_and_all_it_calls_never_unlink_rename_link_or_stage` (AST): `write_marker` and every
+    groupshim function it calls (transitively: `_fullsync`, `_close`) name none of `os.unlink`, `os.remove`,
+    `os.rename`, `os.replace`, `os.link`, `os.symlink`, `os.rmdir`, `os.removedirs`, `os.renames`, `os.truncate`,
+    `os.ftruncate`, `shutil`, `tempfile`; the one open of `path` has `O_CREAT`, `O_EXCL` and `O_NOFOLLOW`, and the only
+    other open is the directory's, read-only. Module-wide, groupshim never unlinks, removes or replaces, and renames
+    only in its two test-gate announcers (`Shim._gate`, `_child_gate`). Fails on 1a23236 (`os.link`).
+  - Changed: `test_r4_..._said_as_unsynced[file]` (the file's own sync fails: exit 4, the complete file left, no temp
+    file) fails on 1a23236. Removed: round 1's `test_rr1_a_temp_name_the_shim_did_not_create_is_never_unlinked` (there
+    is no temp name any more). Round 1's `test_rr1_publishing_never_replaces_a_file_at_the_marker_path` stands as the
+    "already there" case.
+
+#### Mutation check (review round 2)
+
+The GS and SC rows stay 72; every anchor occurs exactly once (the scratch check). The script was not run here; each
+new row was applied by hand and caught: the exclusive create by both `test_rr1_publishing_...` cases, the file-sync row
+by both `test_rr5_a_file_sync_...` cases, the unlink row by those and the AST pin.
+- **New (3):** "C3-2a R5 the marker is created exclusively"; "C3-2a R5 the shim never unlinks"; "C3-2a R5 a
+  file-sync failure is not a proof-bearing exit".
+- **Removed (3):** "C3-2a R1 publishing never replaces a file" and "C3-2a R1 only a temp file this publisher created is
+  unlinked" (no link, no temp file); "C3-1R4 a temp-file sync failure publishes nothing (re-anchored: C3-2a review round
+  1)" (replaced by the file-sync row).

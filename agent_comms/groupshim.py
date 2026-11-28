@@ -36,9 +36,10 @@ The life of one shim:
 8. EOF on the command pipe (the node died or let go): TERM at once, KILL at first TERM + `kill_grace`, KILL again every
    `kill_grace` while the anchor holds. Neither event writes nor diagnostics can block or abort this.
 9. Empty: a complete listing (`node_groups.group_members`) holding nothing but the exited, unreaped leader; then latch
-   signalling OFF, reap, list again and require ABSENT; then publish the marker atomically, every field authenticated
-   by HMAC-SHA256 under the launch secret (`marker_mac`), `EMPTY`, exit 0. Anything else after the reap: no marker,
-   `UNPROVED`, exit 1.
+   signalling OFF, reap, list again and require ABSENT; then publish the marker, every field authenticated by
+   HMAC-SHA256 under the launch secret (`marker_mac`), created exclusively at its path and written in place with no
+   staging file (nothing is ever replaced or unlinked; atomicity for the reader is the release pair and the MAC),
+   `EMPTY`, exit 0. Anything else after the reap: no marker, `UNPROVED`, exit 1.
 10. (C3-2a, F2) An unexpected exception after the fork: the degraded stop (`Shim.stop_after_crash`): TERM, KILL at the
    first TERM + the grace, repeated, and the same proof; if the kernel cannot confirm the anchor, no signal and no
    marker (exit 5).
@@ -238,47 +239,53 @@ def _fullsync(fd: int) -> None:
 PUBLISHED, UNSYNCED, NOT_PUBLISHED = "published", "unsynced", "not_published"
 
 
-def write_marker(path: str, record: dict, fail_dir_sync: bool = False) -> tuple[str, int]:
-    """Publish `record` at `path` atomically and WITHOUT replacing anything (C3-2a review round 1, R1): a temp file in
-    the destination directory (exclusive create, no symlink), its sync, a hard link of it at `path` (`link(2)` fails
-    with EEXIST if anything at all is there, a dangling symlink included, and never replaces it), the temp name's
-    removal, the directory's sync. Only a temp file THIS call created is ever unlinked. (outcome, errno):
-    - PUBLISHED, 0: visible and synced (as durable as this machine's F_FULLFSYNC makes it);
-    - NOT_PUBLISHED, errno: a failure up to and including the link (the temp file's create, write or sync among them;
-      EEXIST when something is already at `path` or at the temp name): our temp file, if we made one, is removed,
-      whatever was already there is left exactly as it was, and NO marker of ours is visible at `path`;
-    - UNSYNCED, errno: the link happened, so the complete marker is VISIBLE (and valid proof of absence for a living
-      node), but the directory's sync failed: whether it survives a crash is not known. A marker lost in a crash leaves
-      the checkout held at the next start (C3-3), the conservative direction.
-    `fail_dir_sync`: TEST-ONLY (`fail-dir-sync` in the test gate dir; the node never asks it): the directory's sync
-    fails with EIO."""
-    tmp = f"{path}.{os.getpid()}.tmp"
+MARKER_MAX = 4096                   # bytes a marker record may have (the shim's are about 250)
+
+
+def write_marker(path: str, record: dict, fail_dir_sync: bool = False, fail_file_sync: bool = False,
+                 after_create=None) -> tuple[str, int]:
+    """Publish `record` at `path` with NO staging file (C3-2a review round 2, R5): the shim creates `path` ITSELF,
+    exclusively (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600: anything already there, a dangling symlink included, is
+    EEXIST and is never replaced), writes the whole record through that descriptor (a loop that completes a short
+    write), syncs the DESCRIPTOR (F_FULLFSYNC), closes it, then syncs the directory. No temp file, no link, no rename,
+    and nothing is EVER unlinked, on success or on any error: a same-user process can enter any directory the shim can,
+    so no other name could be protected anyway.
+
+    Atomicity for the READER does not come from the filesystem: a reader may see the file before it is complete. It
+    comes from the release pair and the MAC (`shimchild.read_marker`, `ShimChild.empty()`): a marker counts only with
+    the shim's own observed terminal status in a proof-bearing pair AND a MAC that verifies over the complete record.
+    A partial or substituted file fails one or the other, and the launch stays held. (outcome, errno):
+    - PUBLISHED, 0: written and synced, directory synced (as durable as this machine's F_FULLFSYNC makes it);
+    - NOT_PUBLISHED, errno: the create failed (EEXIST: whatever is there is left exactly as it was; nothing of ours
+      exists), or the write or the file's sync failed after the create: the file is LEFT as it is, possibly partial,
+      possibly complete and authentic, and the caller must end in a status that is in no release pair;
+    - UNSYNCED, errno: the file is written and synced, so the complete marker is VISIBLE (and valid proof of absence
+      for a living node), but the directory's sync failed: whether it survives a crash is not known.
+    TEST-ONLY (the test gate dir; the node never asks them): `fail_dir_sync` / `fail_file_sync` make that sync fail
+    with EIO; `after_create` is called right after the create."""
     data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    fd = -1
-    created = False                 # (the temp name is guessable: only one THIS call created is ever unlinked)
+    if len(data) > MARKER_MAX:
+        return NOT_PUBLISHED, 27        # (EFBIG; never: the shim's records are about 250 bytes)
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        created = True
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        return NOT_PUBLISHED, e.errno or -1     # (nothing of ours exists; whatever was there is untouched)
+    try:
+        if after_create is not None:
+            after_create()
         view = memoryview(data)
         while view:
-            view = view[os.write(fd, view):]
+            n = os.write(fd, view)
+            if n <= 0:
+                raise OSError(5, "a write wrote nothing")
+            view = view[n:]             # (a short write: the loop writes the rest)
+        if fail_file_sync:
+            raise OSError(5, "injected EIO (test-only)")
         _fullsync(fd)
-        os.close(fd)
-        fd = -1
-        os.link(tmp, path)          # never replaces: EEXIST if anything is at `path`
     except OSError as e:
-        if fd >= 0:
-            os.close(fd)
-        if created:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        return NOT_PUBLISHED, e.errno or -1
-    try:
-        os.unlink(tmp)              # (ours; the marker is the link at `path` now)
-    except OSError:
-        pass
+        return NOT_PUBLISHED, e.errno or -1     # the file is left as it is, possibly partial: never unlinked
+    finally:
+        _close(fd)
     try:
         dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
@@ -617,17 +624,20 @@ class Shim:
     def publish(self, outcome: str) -> int | None:
         """Publish the bound marker: every field authenticated under the launch secret (`marker_mac`), the secret
         itself never written. None when it is published and synced; else the exit status to end with:
-        EXIT_MARKER_FAILED (nothing visible) or EXIT_UNSYNCED (visible, valid, its durability unknown)."""
+        EXIT_MARKER_FAILED (no proof: nothing of ours at the path, or a file left as it is after a failed write or sync,
+        which no release pair takes) or EXIT_UNSYNCED (visible, valid, its durability unknown)."""
         if self.key is None:            # (never: the shim publishes only after a valid NONCE frame)
             self.emit("MARKER_FAILED 0")
             return EXIT_MARKER_FAILED
         record = {"v": MARKER_VERSION, "outcome": outcome, "cli_pid": self.pgid, "leader_exit": self.leader_code,
                   "boot": self.boot}
         record["mac"] = marker_mac(self.key, record)
-        result, err = write_marker(self.marker, record, fail_dir_sync=self._gate_file("fail-dir-sync"))
+        result, err = write_marker(self.marker, record, fail_dir_sync=self._gate_file("fail-dir-sync"),
+                                   fail_file_sync=self._gate_file("fail-file-sync"),
+                                   after_create=self._marker_pause if self._gate_file("pause-after-create") else None)
         if result == NOT_PUBLISHED:
             self.emit(f"MARKER_FAILED {err}")
-            self.diag(f"the marker could not be published (errno {err}): no proof")
+            self.diag(f"the marker could not be published (errno {err}): no proof (any file there is left as it is)")
             return EXIT_MARKER_FAILED
         if result == UNSYNCED:
             self.emit(f"UNSYNCED {err}")
@@ -635,6 +645,18 @@ class Shim:
             return EXIT_UNSYNCED
         self.diag(f"marker published: {outcome}")
         return None
+
+    def _marker_pause(self) -> None:
+        """TEST-ONLY (`pause-after-create` in the test gate dir): right after the marker path is created, announce
+        `marker-created.at` (created exclusively, never renamed) and wait, bounded, for `marker-created.go`."""
+        try:
+            _close(os.open(os.path.join(self.gate_dir, "marker-created.at"),
+                           os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600))
+            deadline = self.clock() + GATE_WAIT
+            while not os.path.exists(os.path.join(self.gate_dir, "marker-created.go")) and self.clock() < deadline:
+                time.sleep(0.005)
+        except Exception:
+            pass
 
     def never_started(self, reason: str) -> int:
         """Every outcome in which the CLI was never forked: the bound marker (the group provably never existed)."""

@@ -53,7 +53,7 @@ from . import groupshim
 from .dispatch import PipedChild
 
 boot_id = groupshim.boot_id
-MARKER_MAX = 4096                   # bytes a marker may have (the shim's are about 200): larger is no proof
+MARKER_MAX = groupshim.MARKER_MAX   # bytes a marker may have (4096; the shim's are about 250): larger is no proof
 # The shim runs THIS process's own agent_comms (the directory that holds the package imported here), never whatever
 # `-m agent_comms.groupshim` would find on the interpreter's path: `-I` (isolated: no PYTHON* variables, no user site,
 # no current directory on the path), then the package's own root first. Equivalent to `python -m agent_comms.groupshim`.
@@ -117,6 +117,11 @@ def read_marker(path: str, key: bytes, boot: str) -> dict | None:
     """THE one marker reader: the marker at `path` when it is an AUTHENTIC record of the launch whose secret is `key`,
     on boot `boot`; else None, never an exception. It is half of the proof only: `ShimChild.empty()` also needs the
     shim's own terminal exit status (`PROOF_PAIRS`).
+
+    (Review round 2, R5) The shim writes its marker in place, with no staging file, so this reader may see a file
+    that is incomplete, or one a same-user process substituted. Atomicity comes from the release pair and the MAC, not
+    from the filesystem: an incomplete record fails the parse or the MAC; a substituted one fails the MAC; a complete,
+    authentic one whose write the shim did not finish to a proof-bearing exit fails the pair.
 
     It must be a REGULAR file: `lstat` first (no symlink, FIFO, socket, device or directory is opened), then an open with
     O_NONBLOCK | O_NOFOLLOW, and `fstat` of what was opened must be the same regular file (a special file swapped in
