@@ -18055,3 +18055,13 @@ failed listing), with the real listing proved elsewhere (C1's R4).
   against the stalled-sink tests, it is caught by both of them.
 
 The results are in scripts/steering-mutation-results.txt.
+
+#### A measurement fix found by the parallel run
+
+- **What failed.** `test_c5_no_kill_before_the_grace_...[term_then_early_kill]` measured KILL − TERM = 0.999988 s
+  against a 1.0 s grace.
+- **Why the shim was right.** It sends a KILL only when its clock reads at least the first TERM attempt + the grace.
+- **Why the test was wrong.** It took both times from the log lines' stamps, which are taken after each call. The
+  TERM's stamp came about 12 µs after the attempt the grace is counted from.
+- **The fix.** Each signal's log line now carries its attempt time (`attempted at`), the very value the grace uses,
+  and the tests read that. The grace row is re-anchored on the new line.

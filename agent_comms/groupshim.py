@@ -675,8 +675,9 @@ class Shim:
             return False
         group = self.established
         self.gate("signal", name)       # (test-only: between the decision and the real system call)
+        at = self.clock()
         if sig == signal.SIGTERM and self.first_term_at is None:
-            self.first_term_at = self.clock()       # the ATTEMPT starts the grace, whatever it answers
+            self.first_term_at = at     # the ATTEMPT starts the grace, whatever it answers
         scope = "group" if group else "pid"
         call = f"{'killpg' if group else 'kill'}({self.pgid}, {name})"
         try:
@@ -686,10 +687,10 @@ class Shim:
                 self.kill(self.pgid, sig)
         except OSError as e:
             self.emit(f"FAILED {name} {e.errno} {scope}")
-            self.diag(f"{call} failed (errno {e.errno})")
+            self.diag(f"{call} failed (errno {e.errno}; attempted at {at:.6f})")
         else:
             self.emit(f"SENT {name} {scope}")       # attempted successfully: never a claim that anything exited
-            self.diag(f"{call} sent")
+            self.diag(f"{call} sent (attempted at {at:.6f})")   # (the clock the grace is counted on)
         if not group and sig not in self.pid_only:
             self.pid_only.append(sig)
         if self.leader_exited:

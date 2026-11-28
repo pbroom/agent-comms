@@ -185,7 +185,14 @@ def kinds(c: ShimChild) -> list[str]:
 
 
 def diag_times(log: Path, needle: str) -> list[float]:
-    return [float(line.split(" ", 1)[0]) for line in log.read_text().splitlines() if needle in line]
+    """When the matching log lines happened, on the shim's own clock: a signal's ATTEMPT time where the line carries it
+    (the clock its grace is counted on), else the line's own stamp."""
+    out = []
+    for line in log.read_text().splitlines():
+        if needle in line:
+            _, at, rest = line.partition("attempted at ")
+            out.append(float(rest.rstrip(")").split(")")[0]) if at else float(line.split(" ", 1)[0]))
+    return out
 
 
 def raw_write(c: ShimChild, data: bytes, timeout: float = WAIT) -> None:
