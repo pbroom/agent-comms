@@ -20096,8 +20096,33 @@ would be exempt. Two sites do not fit, both in modules this PR may not change:
 - `agent_comms/waiter.py:491`: `run = run or subprocess.run` (called as `run([...], stdin=DEVNULL, ...)`, no
   `close_fds`, so subprocess's default True).
 
-As ruled, the rule is not loosened: R4 stops here for a decision. The committed F6 scan (direct forms, any literal
-non-True `close_fds`, `**kwargs` on direct calls, the fork family) is unchanged.
+As ruled, the rule was not loosened, and R4 stopped for a decision.
+
+**The owner's decision, built:** the strict rule, with an explicit allow-list of EXACTLY those two sites, and neither
+module changed in this PR. `tests/test_spawn_discipline.py` now requires:
+- a spawn function (`Popen`, `run`, `call`, `check_call`, `check_output`, `getoutput`, `getstatusoutput`) used only as
+  the callee of a direct call, on `subprocess` imported under its own name or a name imported from it unrenamed; at
+  that call exactly one positional argument, no `*args`, no `**kwargs`, and `close_fds` absent or the literal `True`
+  by keyword; any call anywhere that passes `close_fds` passes the literal `True`;
+- no other reference that hands a spawn function on (an assignment, an alias, a default, a container, `getattr` or
+  `vars` of `subprocess`, `subprocess.__dict__`, a renamed import, `from subprocess import *`, `import subprocess as`
+  another name), except the two allow-listed sites;
+- **annotations are exempt:** a reference is in an annotation when it lies in the subtree of a parameter's
+  `annotation`, a function's `returns` or an annotated assignment's `annotation` (`proc: subprocess.Popen`). A
+  parameter's default is not an annotation.
+- **The allow-list** is by file AND the exact statement text (`ast.unparse`; for a parameter default,
+  `<parameter> = <default>`), each seen exactly once:
+  - `agent_comms/notify.py`, `popen: Callable[..., Any] = subprocess.Popen`: an injectable default for tests;
+  - `agent_comms/waiter.py`, `run = run or subprocess.run`: an injectable runner for tests.
+  The one call that spawns through each alias is pinned by its exact text too: `self.popen(...)` must pass
+  `close_fds=True` by keyword, and the `run(...)` in `codex_queue` must not pass `close_fds` at all (subprocess's
+  default True). A changed statement, a changed call, or a third hand-off fails the test.
+- Fixtures refuse each bypass (a positional `close_fds=False`, `*args`, `**kwargs`, an alias not on the list, a class
+  attribute, a list, a default argument, `getattr(subprocess, "Popen")`, `vars(subprocess)`, `subprocess.__dict__`,
+  `from subprocess import Popen as P`, `from subprocess import *`, `import subprocess as sp`) and each allow-listed
+  statement or pinned call differing by one token (and the same text in another file).
+- **Removing the two allow-listed sites** (making those spawns direct calls, with their test seams elsewhere) is a
+  later cleanup; nothing else may join the list.
 
 #### Mutation check (review round 1)
 
