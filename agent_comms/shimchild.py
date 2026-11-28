@@ -33,7 +33,11 @@ hold in place of the CLI's `Popen` once the wiring PRs wire it in. NOT used by a
   `empty()`, `poll()`, `lost()`, `refused()`, which all observe its status); `cli_pid` is the CLI's, for diagnostics
   only: nothing signals or probes it by number.
 
-It never logs: it reports by return value and exception.
+It never logs: it reports by return value and exception. (C3-2b-1, D) It is host-side code: its three locks (the command
+endpoint's `_wlock`, the event endpoint's `_rlock`, the wait status's `_wait_lock`) are host locks, native locks entered
+only as `with hostlog.BOUNDARY, lock:` (tests/test_hostlog.py pins it with the other host-side modules). `empty()`,
+`refused()`, `lost()` and `poll()` read a file (the marker): callers keep them off deadline-critical paths and outside
+the node's runner lock (agent_comms/shimlaunch.py has the lifecycle that uses them).
 """
 from __future__ import annotations
 
@@ -49,7 +53,7 @@ import sys
 import threading
 import time
 
-from . import groupshim
+from . import groupshim, hostlog
 from .dispatch import PipedChild
 
 boot_id = groupshim.boot_id
@@ -219,6 +223,7 @@ class ShimChild:
         self._evt: int | None = evt_r
         self._evt_buf = b""
         self._went = False
+        self._go_attempted = False      # (C3-2b-1) set under `_wlock` before GO's first byte
         self.events: list[tuple[str, ...]] = []     # every event seen, in order (diagnostics and tests)
         self.cli_pid: int | None = None
         self.start_errno: int | None = None     # START_FAILED: positive evidence the CLI never exec'd
@@ -265,7 +270,7 @@ class ShimChild:
 
     def _send_secret(self) -> None:
         frame = b"NONCE %d %s\n" % (groupshim.PROTOCOL, self._key.hex().encode("ascii"))
-        with self._wlock:
+        with hostlog.BOUNDARY, self._wlock:
             if self._cmd is None:
                 return
             try:
@@ -319,9 +324,10 @@ class ShimChild:
         frame = b"GO %d %s\n" % (groupshim.PROTOCOL, body.encode("ascii"))
         if len(frame) > groupshim.MAX_GO:
             raise ValueError(f"the GO frame is {len(frame)} bytes, over {groupshim.MAX_GO}")
-        with self._wlock:
+        with hostlog.BOUNDARY, self._wlock:
             if self._went or self._cmd is None:
                 raise BrokenPipeError(errno.EPIPE, "GO was already written, or the command pipe is closed")
+            self._go_attempted = True       # (before any byte: `abandon_before_go` refuses from here on)
             view, deadline = memoryview(frame), time.monotonic() + timeout
             try:
                 while view:
@@ -340,13 +346,44 @@ class ShimChild:
     # -------- commands
 
     def _command(self, word: bytes) -> None:
-        with self._wlock:
+        with hostlog.BOUNDARY, self._wlock:
             if self._cmd is None:
                 raise BrokenPipeError(errno.EPIPE, "the shim's command pipe is closed")
             if not self._went:
                 self._close_cmd()       # before GO, a stop is "never start": EOF, the bound marker
                 return
             os.write(self._cmd, word + b"\n")     # (< PIPE_BUF, non-blocking: all of it, or BlockingIOError)
+
+    @property
+    def went(self) -> bool:
+        """Whether GO was written (whole). Before it, a stop is "never start"."""
+        return self._went
+
+    def abandon_before_go(self, timeout: float) -> int | str | None:
+        """(C3-2b-1) A launch given up BEFORE GO (shimlaunch's failure before the durable commit): close the command
+        pipe (the shim then publishes its never-started marker and exits 3) and reap the shim, all within about
+        2 x `timeout`. The close and the check that no GO write was ever ATTEMPTED (`go` marks its attempt under the
+        same lock before its first byte) are one step under the command lock, so no byte of GO is ever written, and so
+        no CLI can exist: a shim still running after `timeout` is SIGKILLed (only while this handle has not reaped it,
+        so its pid is pinned) and reaped. Its observed status, or None if even that did not end it within the bound.
+        Raises if GO was attempted."""
+        with hostlog.BOUNDARY, self._wlock:
+            if self._go_attempted:
+                raise RuntimeError("GO was attempted: this launch can no longer be abandoned before GO")
+            self._close_cmd()
+        for last in (False, True):
+            deadline = time.monotonic() + timeout
+            while self._drained_exit() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if last or self._drained_exit() is not None:
+                break
+            with hostlog.BOUNDARY, self._wait_lock:
+                if self._status is None:
+                    try:
+                        os.kill(self.pid, 9)     # (SIGKILL: the node's own unreaped child, pinned; no CLI was forked)
+                    except OSError:
+                        pass
+        return self._status
 
     def terminate(self) -> None:
         self._command(b"TERM")
@@ -356,7 +393,7 @@ class ShimChild:
 
     def close_commands(self) -> None:
         """Close the command pipe: the shim takes it as the node letting go (TERM, then KILL after the grace)."""
-        with self._wlock:
+        with hostlog.BOUNDARY, self._wlock:
             self._close_cmd()
 
     def _close_cmd(self) -> None:       # (the lock held)
@@ -368,7 +405,7 @@ class ShimChild:
 
     def _pump(self) -> bool:
         """Take the events available now (bounded, non-blocking). True once the event pipe is at EOF."""
-        with self._rlock:
+        with hostlog.BOUNDARY, self._rlock:
             return self._pump_locked()
 
     def _pump_locked(self) -> bool:
@@ -421,7 +458,7 @@ class ShimChild:
         status recorded exactly once (as `Popen.returncode` reads: negative for a signal). ECHILD (someone else reaped
         it, or the kernel did, for a process that ignores SIGCHLD or sets SA_NOCLDWAIT) is STATUS_UNKNOWN: no status was
         observed, and none is ever made up. None while it runs."""
-        with self._wait_lock:
+        with hostlog.BOUNDARY, self._wait_lock:
             if self._status is not None:
                 return self._status
             try:
@@ -438,7 +475,7 @@ class ShimChild:
 
     def _kill_shim(self, sig: int = 9) -> None:     # (9: SIGKILL)
         """TEST-ONLY: signal the shim itself, only while this handle has not reaped it (its pid is pinned until then)."""
-        with self._wait_lock:
+        with hostlog.BOUNDARY, self._wait_lock:
             if self._status is None:
                 os.kill(self.pid, sig)
 
@@ -541,9 +578,9 @@ class ShimChild:
         shim still running takes the command pipe's close as the node letting go, and stops its group."""
         if self._io is not None:
             self._io.close()
-        with self._wlock:
+        with hostlog.BOUNDARY, self._wlock:
             self._close_cmd()
-        with self._rlock:
+        with hostlog.BOUNDARY, self._rlock:
             if self._evt is not None:
                 fd, self._evt = self._evt, None
                 os.close(fd)
