@@ -2542,7 +2542,8 @@ def test_r18_a_real_sigterm_at_the_end_of_a_locked_body_leaves_the_lock_free(tmp
     each entered in its production form. The handler raises (as `node._run`'s does): the KeyboardInterrupt
     propagates, the native lock is FREE afterwards (another thread takes it at once), and the process exits. (The
     child sends the signal to itself from a timer thread: see the script.)"""
-    status, out, err = _signalled_child(tmp_path, _LOCK_SCRIPT, kind, str(tmp_path), send=False)
+    status, out, err = _signalled_child(tmp_path, _LOCK_SCRIPT, kind, str(tmp_path), send=False,
+                                        wait=120)   # (the C call is ~1 s idle; a parallel run at load 25 took >30 s)
     assert out[:2] == ["in", "interrupted"], (out, err)
     assert out[2:3] == ["free"], (out, err)
     assert status == 0, (status, out, err)
