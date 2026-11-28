@@ -532,3 +532,85 @@ rows: 3
 stale or broken: []
 missed: []
 exit 0
+
+# Host-side logging, review round 3 (the PR's reviews), with R17 (the PR's automated review) and the merge of
+# origin/main (C1, #122): DESIGN_NOTES "Host-side logging: one writer, review round 3 (the PR's reviews)", its
+# "Runs and mutation results". 304 rows, none stale. On 7989c28: round 3's 13 new and 19 re-anchored rows, the 9
+# rows the merge re-anchored, and R17's 3 (re-run here): 44, all caught; each failing test checked to be the one
+# that pins the mutated behaviour. Four rows were run again alone (their failure timing-shaped, or not the direct
+# pin): caught again, by the same tests. On 4f57589 (Sol's should: the chain's cut a reason, labelled by the
+# writer): R20's rows (one re-anchored, two new) and the chain's A3 successor: 8, all caught.
+
+commit 7989c28
+CAUGHT  T no log handler under the cutoff lock (R18: a native lock)  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  N1 the self-stop and kills under main's unbounded lock  test_r6_n1_the_kill_step_waits_for_the_loops_lock_as_main
+CAUGHT  N2 the bulk signal pass before any transcript (re-anchored: C1)  test_r6_n2_a_stalled_transcript_write_at_shutdown_holds_up_no_kill
+CAUGHT  A3 the exception's type only (successor: the chain)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  E2 a registry miss is not a refusal (re-anchored)  test_r9_e2_a_registry_miss_is_not_a_verified_exit[gone]
+CAUGHT  D3 a barrier there before is ALREADY (re-anchored: C1)  test_r9_d3_try_stopping_says_what_happened
+CAUGHT  S3 the registry inserts the barrier on a miss  test_s3_a_live_group_missing_from_the_registry_gets_a_barrier[kept]
+CAUGHT  A2 the runner lock is a host lock (R18: a native Lock)  test_no_handler_is_entered_under_a_host_lock_on_the_nodes_routes[n_start-blocks]
+CAUGHT  A2 the registry lock is a host lock (R18: a native RLock)  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  L the arguments are reduced at the call  test_a_deferred_record_is_the_calls_snapshot
+CAUGHT  L a host lock enters a boundary (R18: first, at the call site)  test_r18_every_host_lock_and_hostlogs_own_lock_is_entered_by_c_code
+CAUGHT  R1 the report lock is a boundary (R18: a native Lock)  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  R1 the ack lock is a boundary (R18: a native RLock)  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  R1 a steer attempt's record lock is a boundary (R18: a native RLock)  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  R3 facts are rendered by the writer  test_facts_are_reviewed_integers_rendered_by_the_writer
+CAUGHT  R6 no lock through an import alias (re-anchored: C1)  test_every_lock_of_the_host_side_modules_is_built_as_reviewed
+CAUGHT  C3 a waiter on an evicted record is released  test_a_waiter_on_a_record_the_bound_evicted_is_released_at_once
+CAUGHT  C3 the stall latch  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  W5 flush is bounded (the main thread's poll)  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  C4 a stalled writer does not hold the exit  test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock[stalled]
+CAUGHT  R11 the final wait seals first  test_r11_the_seal_comes_before_the_final_waits_first_look
+CAUGHT  R12 nobody waits for a writer that is not running  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  R14 a failed or interrupted start cancels its token  test_r12_a_writer_that_cannot_start_never_fails_a_log_call
+CAUGHT  PR a mapping is handed to makeRecord as logging does (a one-element tuple)  test_pr_a_single_key_mapping_line_is_written_with_its_value
+CAUGHT  PR a record lost before any handler is counted and said  test_pr_a_record_that_cannot_be_made_is_counted_not_lost_silently
+CAUGHT  R18 hostlog's own lock is a raw lock entered by C code  test_the_locks_a_line_can_be_logged_under_are_native_at_run_time
+CAUGHT  R18 an explicit acquire is inside a boundary  test_r18_every_host_lock_and_hostlogs_own_lock_is_entered_by_c_code
+CAUGHT  R19 the node hands its hostlog logger to with_managed_env  test_r19_the_node_passes_its_hostlog_logger_at_every_call_of_the_two_helpers
+CAUGHT  R19 with_managed_env logs through the logger it is given  test_r19_the_nodes_dispatch_helpers_log_through_hostlog
+CAUGHT  R20 the chain follows the cause  test_r20_a_chained_exception_keeps_every_type_and_frame_and_no_text
+CAUGHT  R20 the chain is read through BaseException's own descriptors  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 a cycle is cut by identity  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 the chain's depth is capped  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 the chain's frames are capped  test_r20_the_frames_of_a_chain_are_capped_and_the_cut_is_said
+CAUGHT  R21 an interrupt during the final wait counts as stalled  test_r21_an_interrupt_during_the_final_wait_takes_the_stalled_exit
+CAUGHT  A3 the main thread polls outside the lock  test_r21_the_main_threads_final_wait_holds_the_queues_lock_only_briefly
+CAUGHT  A4 the reset clears a stale registration  test_a4_stale_bookkeeping_fails_closed_and_only_the_reset_clears_it
+CAUGHT  R22 only later() and facts() make a rendered value  test_r22_only_later_and_facts_make_a_value_the_writer_renders
+CAUGHT  C1R5A5 a libproc load failure is no proof (re-anchored: hostlog)  test_c1_no_libproc_is_not_proof
+CAUGHT  C1R5A5 a load failure is said once (re-anchored: hostlog)  test_r12_on_macos_a_libproc_load_failure_retains_and_says_so_once
+CAUGHT  C1R6 R14 contention counts as still unproved (re-anchored: R18)  test_r14_the_runners_watch_never_waits_past_its_budget_for_the_lock
+CAUGHT  C1R6 R15 the installation is inside the protected region (re-anchored: R18)  test_r15_an_interrupt_after_the_fence_is_installed_never_leaves_it_fenced[inside-the-installation]
+CAUGHT  C1R6 the release fence is not HELD (re-anchored: R18)  test_r10_a_start_failed_read_at_the_reap_fails_only_its_own_message
+CAUGHT  C1R6 the rule fences admission before the final reads (re-anchored: R18)  test_r6_the_checkout_is_fenced_while_the_proof_runs[True]
+rows: 44
+stale or broken: []
+missed: []
+exit 0
+
+commit 7989c28 (again, alone)
+CAUGHT  A2 the runner lock is a host lock (R18: a native Lock)  test_no_handler_is_entered_under_a_host_lock_on_the_nodes_routes[n_start-blocks]
+CAUGHT  W5 flush is bounded (the main thread's poll)  test_a_standalone_wait_is_bounded_latched_and_clears_on_progress
+CAUGHT  C4 a stalled writer does not hold the exit  test_c4_the_nodes_exit_is_bounded_with_a_handler_stuck_holding_its_lock[stalled]
+CAUGHT  R21 an interrupt during the final wait counts as stalled  test_r21_an_interrupt_during_the_final_wait_takes_the_stalled_exit
+rows: 4
+stale or broken: []
+missed: []
+exit 0
+
+commit 4f57589
+CAUGHT  A3 the exception's type only (successor: the chain)  test_r7_a3_a_deferred_line_carries_the_exception_type_only
+CAUGHT  R20 the chain follows the cause  test_r20_a_chained_exception_keeps_every_type_and_frame_and_no_text
+CAUGHT  R20 the chain is read through BaseException's own descriptors  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 a cycle is cut by identity  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 the chain's depth is capped  test_r20_a_cycle_and_an_over_long_chain_are_cut_and_say_so
+CAUGHT  R20 the chain's frames are capped  test_r20_the_frames_of_a_chain_are_capped_and_the_cut_is_said
+CAUGHT  R20 the cut is said only when something was left out  test_r20_the_cut_is_said_only_when_frames_or_exceptions_were_left_out
+CAUGHT  R20 the cut's label is rendered by the writer, not at the call  test_r20_the_frames_of_a_chain_are_capped_and_the_cut_is_said
+rows: 8
+stale or broken: []
+missed: []
+exit 0

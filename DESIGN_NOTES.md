@@ -18675,3 +18675,72 @@ escaped into `logging.shutdown()` and the child never ended.
 
   On 9dcef28 R17's rows were CAUGHT: the mapping handed over as logging does, and a lost record counted. The
   parallel suite passed (5505 passed), as did `--only structured` (36) and `--only steer` (27).
+
+### Sol's two shoulds on 7989c28 (4f57589)
+
+- **The lock wording is narrowed** wherever it is stated (hostlog's module text and its R18 comment, R18 above, the
+  A5 correction in round 1, R21 above):
+  - the converted locks (every host lock, and hostlog's own `_LOCK`) cannot be left held by an interrupt;
+  - the two inherited exceptions are named: the stdlib's `Event` internals, which `_Stopping.set()` enters on the
+    main thread at shutdown, and `checkpoint_cond`, entered through stdlib Python code on the loop and sender
+    threads.
+- **The chain's cut is a reason, labelled by the writer.**
+  - `_exception()` keeps only the cut's REASONS (`_CUTS`: `CUT_CYCLE`, `CUT_CHAIN`, `CUT_FRAMES`), and only when
+    something was actually left out: `_frames` reports whether a frame was left out. `rec.hostlog_exc[3]` is the
+    tuple of reasons, empty when nothing was cut.
+  - `_exc_text` (the writer) renders the label, reading CHAIN_MAX and FRAMES_MAX then.
+  - Exactly FRAMES_MAX frames, or exactly CHAIN_MAX exceptions, now say nothing. Before, "more than 200 frames"
+    was said when exactly 200 fitted.
+  - Tests: `test_r20_the_cut_is_said_only_when_frames_or_exceptions_were_left_out` (it failed before the fix) and
+    `test_r20_nothing_of_the_cut_is_formatted_at_the_call`.
+  - The cycle row is re-anchored, and two rows are added: "the cut is said only when something was left out" and
+    "the cut's label is rendered by the writer, not at the call".
+
+### Runs and mutation results
+
+Only runs that completed on a named commit are listed. The machine was loaded throughout: a game used about 3.4
+cores and another builder was running tests. The load is given where it was recorded.
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| full suite, `-n auto` | 9dcef28 (R17) | 5505 passed, 10 skipped, 0 failed, 4 min 12 s (load 4.5 to 5.2) |
+| `--only structured`, `--only steer` (stand-ins) | 9dcef28 | PASS 36, PASS 27 |
+| tests/test_hostlog.py alone | e751255 | 119 passed |
+| full suite, `-n auto` | 093ceaf (the merged head, notes) | 5633 passed, 5 failed, 11 min 26 s (load 12 to 27, after the reboot) |
+| tests/test_hostlog.py alone | 7989c28 | 120 passed, 66 s (load 9 to 20) |
+| tests/test_hostlog.py alone | 4f57589 | 122 passed, 57 s |
+
+The five failures on 093ceaf, all under that load:
+- the end-to-end wrapper's 300 s timeout;
+- `test_the_worst_case_verdict_is_fast`, a speed assertion in code this PR does not touch;
+- the three R18 real-signal tests, whose child outlived the test's 30 s wait. Run alone at load 16 they pass in
+  7.5 to 8 s each. 7989c28 raises that wait to 120 s; the assertions are unchanged.
+
+**Cut by the reboot, or stopped and not completed:**
+- the round-3 chain on e751255 (stopped for the merge of C1);
+- the 106-row mutation run on the merged head and its chain (the parallel suite, the stand-in e2e and its five
+  sections, the serial suite), cut by the main laptop's reboot at about 20:23.
+
+**The serial suite and the end-to-end runs for this PR's final head** are in the PR's gate comment.
+
+**Mutation check.** 304 rows, none stale.
+- On 7989c28: 44 rows, all 44 CAUGHT. They are:
+  - round 3's 13 new rows and 19 re-anchored rows;
+  - the 9 rows the merge of C1 re-anchored (D3 is counted with round 3's);
+  - R17's three: the mapping handed over as logging does, a lost record counted, and the arguments' reduction.
+    These were re-run here, not carried over from 9dcef28.
+
+  Each failing test was checked to be the one that pins the mutated behaviour. Four rows were run again alone, with
+  nothing else of mine running, because their failure was timing-shaped or not the direct pin:
+  - C4 and R21: the subprocess tests' bounded exit and stalled exit. With the mutant the child hangs, which is the
+    behaviour pinned.
+  - W5: the standalone wait's bound, caught by the latched-wait test.
+  - "A2 the runner lock is a host lock": caught by the guard's routes test. With the lock wrapped in a Condition,
+    the guard's ownership check falls back to "held by anyone". The direct pin, the run-time native-lock test, fails
+    too, by hand.
+
+  All four are caught again, by the same tests (scripts/steering-mutation-results.txt, "commit 7989c28 (again,
+  alone)").
+- On 4f57589: R20's 7 rows and the chain's A3 successor, 8 in all, are CAUGHT: R20's by their R20 tests, the A3
+  successor by `test_r7_a3_a_deferred_line_carries_the_exception_type_only`. The rendering
+  row is caught first by the frames-cap test, because its label lookup fails.
