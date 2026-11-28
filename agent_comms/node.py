@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 import httpx
 
-from . import access, hostlog
+from . import access, hostlog, shimjournal
 from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
                        plain_origins, probe_process, process_start, remove_browser_output, render_argv,
                        browser_output_path, make_browser_output,
@@ -106,6 +106,17 @@ class Node:
         # sessions' and its dispatched runs'. Nothing is started in a directory that holds one being stopped.
         from .node_groups import Groups
         self.groups = self.sessions.host.groups if self.sessions is not None else Groups()
+        closed = shimjournal.restore(self.groups, log_dir)
+        # (Ownership C3-2b-1) RESTORE AND RESERVE, the first thing once the shared registry exists: before any thread
+        # starts, any hub contact and any admission of work (`recover`, the session runner's start, `hello`, `tick`
+        # all come after `Node(...)` returns: `_run`), whether or not hosting is on. Every supervised launch in the
+        # journal is a HELD reservation in that registry: neither a session nor a run is admitted in its checkout,
+        # and nothing releases it in this process. Its pid is never probed or signalled (`recover` reads only the
+        # legacy state files). An unreadable journal closes admission for the whole node: said once, and the node
+        # stays up and reports as usual. With no journal (nothing writes one yet) nothing changes.
+        if closed is not None:
+            log.warning("the supervised-launch journal cannot be read (%s): this node admits no work (no session "
+                        "and no run starts) until it is repaired and the node restarted", closed)
         self.running: dict[str, _Local] = {}
         self.waits_said: set[str] = set()   # runs whose wait for a stopping process group the log has said (once each)
         self.report_usage = False       # the hub's last hello answer asked for usage (account_pools.py)
