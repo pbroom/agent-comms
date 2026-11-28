@@ -18874,7 +18874,7 @@ newline are kept as commands. In each of these cases the CLI is NEVER forked, th
 | Command (node to shim) | What the shim does |
 | --- | --- |
 | `TERM` | if the anchor holds: `kill(pid)` before GROUP ESTABLISHED is observed, `killpg(pgid)` after; the first such ATTEMPT (sent or failed) starts the grace |
-| `KILL` | no TERM attempted yet: one is attempted now; then a KILL at first TERM attempt + `kill_grace` (an early one is remembered: `DEFERRED`) |
+| `KILL` | no TERM attempted yet: one is attempted now; then a KILL at first TERM attempt + `kill_grace` (an early one is remembered: `DEFERRED`); (C3-2b-1) then a KILL every grace while the anchor holds, as after EOF: the shim alone repeats KILL |
 | anything else, or a line over 256 bytes | `UNKNOWN`, then ignored |
 | EOF (the node died or let go) | a TERM now if none was attempted; a KILL at first TERM + grace; and a KILL every grace while the anchor holds |
 
@@ -20207,3 +20207,261 @@ by both `test_rr5_a_file_sync_...` cases, the unlink row by those and the AST pi
 - **Removed (3):** "C3-2a R1 publishing never replaces a file" and "C3-2a R1 only a temp file this publisher created is
   unlinked" (no link, no temp file); "C3-1R4 a temp-file sync failure publishes nothing (re-anchored: C3-2a review round
   1)" (replaced by the file-sync row).
+
+## Ownership C3-2b-1: the journal, restore-and-reserve, and the launch helpers (nothing can start a shim yet)
+
+The second part of C3-2. Sol's ruling on the plan: the first PR that makes a supervised spawn REACHABLE must contain the
+complete stop, shutdown, release and recovery-fence paths. So this PR lands everything that can land with NO config
+path that can launch a shim: the durable journal, the restore-and-reserve at node start, the launch, release and
+command helpers, and the remaining hardening. **After this PR nothing in the product can start a shim, the journal is
+always empty in production, and a node behaves exactly as before** (tests/test_shim_static.py pins the first two; the
+existing suite, unchanged, the third).
+
+New: `agent_comms/shimjournal.py` (the journal and its restore), `agent_comms/shimlaunch.py` (the helpers), and
+`tests/test_shim_journal.py`, `test_shim_restore.py`, `test_shim_launch.py`, `test_shim_static.py`,
+`test_shim_mutation_rows.py`. Changed: `groupshim.py` (KILL repetition, the start-up flags' docstring), `shimchild.py`
+(host locks, `-I -S`, `abandon_before_go`, `went`), `node_groups.py` (B only: the supervised token kind,
+`restore_held`, closed admission), `node.py` (the start-up restore only). `session_host.py`, `node_sessions.py` and the
+providers are not touched.
+
+### A. The journal (`shimjournal.py`)
+
+- **Where.** `<node log dir>/shim-journal/` (the node's data directory, beside `node-sessions.json`, never inside it:
+  ordinary session saves rewrite the session state, and a held incarnation must outlive its session). Mode 0700, this
+  user's, never a symlink; `make()` creates it (and its parent, 0700) and syncs the parent once it made it; an unsafe
+  one is refused, never repaired.
+- **One file per launch,** `<launch id>.json` (32 lowercase hex, `secrets.token_hex(16)`, drawn apart from the secret
+  and the marker name), mode 0600, ONE JSON line:
+
+| Field | What |
+| --- | --- |
+| `v` | the record version, 1 (an int, never a bool) |
+| `launch_id` | equal to the file's name |
+| `token` | `["supervised", <launch id>]`: the registry token's serialisable form (`node_groups.SUPERVISED`) |
+| `checkout_key` | the checkout's identity at the launch (`node_groups.key`): `[device, inode]`, or `["path", <real path>]` |
+| `cwd` | the checkout, absolute |
+| `boot` | the boot identity the shim was started with (`kern.bootsessionuuid`, UUID-shaped) |
+| `marker` | the marker's absolute path |
+| `shim_pid`, `shim_start` | DIAGNOSTIC ONLY (int > 1 or null; `process_start`'s text or null): no signalling or release authority, never probed or signalled |
+
+  NOT the launch secret: it stays in the node's memory (proof after a restart is a later PR's).
+- **`commit(record)`:** the record is validated by the same rules `load` applies; created with `O_CREAT | O_EXCL |
+  O_NOFOLLOW` (an existing record is never replaced: `FileExistsError`), written whole (a loop), the file full-synced
+  (`F_FULLFSYNC`, fsync where not taken), closed, then the directory synced. Any failure after the create removes the
+  file (and syncs the directory) and raises: a failed commit leaves no record. A removal that itself fails leaves the
+  record: the next start restores it, HELD (the conservative direction).
+- **`remove(launch_id)`:** unlink, then sync the directory. A record already gone is no error (the directory is synced
+  all the same), so a removal whose sync failed is completed by a retry.
+- **`load()`:** every record, or `JournalUnreadable(reason)`. Absent directory: `[]`, nothing created. Otherwise the
+  directory must be the node's private one and EVERY entry a regular file named `<launch id>.json` (lstat, then
+  `O_NOFOLLOW | O_NONBLOCK` open, fstat-matched), at most 64 KiB, one complete line, exactly the fields above with
+  their types. A symlink, FIFO, subdirectory, stray or temporary name, empty, partial or two-line file, an extra or
+  missing field, another version, a mismatched name or token, a relative path, a bad key or boot: the WHOLE journal is
+  unreadable. A bad file is never skipped.
+- No logging: errors are returned or raised.
+
+### B. Restore and reserve at node start
+
+**The order.** `node._run`: `Node(...)` (whose `__init__` restores), then `node.recover()`, `node.sessions.recover()`,
+`hello()`, `node.sessions.start()` (the threads), and the loop's `tick()`. In `Node.__init__` the restore is the
+statement right after the shared registry is chosen (`self.groups = ...`; the session runner's constructor starts no
+thread and admits nothing). So it precedes every thread of the node's work, every hub contact and every admission, with
+hosting on or off.
+
+**What it does** (`shimjournal.restore(groups, log_dir)`):
+- every record becomes a reservation in the SHARED registry (`Groups.restore_held`): state HELD (it fences admission
+  and is proof-only: `may_signal` False), under its own token kind `("supervised", <launch id>)`, under the recorded
+  checkout key AND the directory's key now (a checkout replaced since is fenced too). Neither a hosted session
+  (`SessionHost._write`'s `blocked`, `_spawn`'s `start`) nor a dispatched run (`Node._start`'s `blocked` and `start`)
+  is admitted there;
+- nothing is released from the journal in this PR: a restored reservation stays for the life of the process (release
+  by evidence after a restart is the next-but-one PR's);
+- an UNREADABLE journal closes admission for the whole node (`Groups.close_admission`: every `start` refused, `blocked`
+  True for every directory, for the life of the process). The node logs ONE hostlog WARNING with the reason, stays up,
+  says hello and reports as usual, and does not crash-loop (a restart finds the same journal and closes admission
+  again);
+- supervised identities never enter the legacy numeric recovery: `recover()` reads only `node-runs.json` and
+  `node-sessions.json`, and a shim's pid is never probed, signalled or dropped;
+- an EMPTY or absent journal: nothing is installed, nothing created, and the node is byte-for-byte today's.
+
+**`Groups` gains only** the token kind (`SUPERVISED`), `restore_held(token, keys, cwd)` (a supervised token only,
+else `ValueError`; keys computed by the caller, no I/O under the lock) and `closed` / `close_admission(reason)` (checked
+first in `start` and `blocked`, each on its own line, so main's lines and their mutation rows are unchanged), in the
+registry's style: the native RLock, entered as `with hostlog.BOUNDARY, self.lock:`.
+
+### C. The launch helpers (`shimlaunch.py`)
+
+**`launch(...)`, transactional.**
+1. A first look (`groups.blocked`): a fenced checkout, or closed admission, is `NOT_ADMITTED`; nothing is done.
+2. `ShimChild.start`: cwd `/`, a fresh marker in the node's private marker directory, the secret sent. The shim waits
+   for GO and cannot start the CLI without it.
+3. The record, then `journal.commit`. **No registry entry exists for the checkout before this commit.**
+4. `groups.start(cwd, token, GO)`: under the registry lock, as ONE step, the admission check, the reservation (LIVE,
+   exactly as a direct start's entry today) and GO (the "spawn" a direct start makes under that lock; bounded by
+   `go_timeout`, 5 s by default). The callback never raises, so `Groups.start` never drops the reservation.
+
+**Where the reservation goes, and why no window admits other work.** The reservation is installed AFTER the durable
+commit and BEFORE GO, atomically with the admission check. Before the commit nothing of this launch can run (no GO: the
+shim starts nothing, and EOF before GO is "never start"), so there is nothing for an entry to protect and nothing is
+left if the launch fails. From the check on, under the one lock every admission and every stop takes, a stop of any
+group in that checkout is either before it (the launch is refused and no GO is ever written) or after it (this launch
+is already reserved, and a stopping group fences new work as before). No CLI of a launch ever runs without both its
+durable record and its registry entry. Work that shares a checkout with a LIVE launch is admitted as it is beside a
+LIVE direct start today (C1's rule; a session and its shared-checkout children, a run the hub allowed).
+
+| Crash or failure window | Record | Registry | The shim | Next |
+| --- | --- | --- | --- | --- |
+| the shim's start fails | none | none | none spawned | raised |
+| after the shim's start, before the commit (the record, the commit, an interrupt) | none (the commit removes its own file) | none | writer closed; NOGO eof, never started; reaped by its handle (`abandon_before_go`, SIGKILL only if it does not exit in 5 s; no GO byte was ever attempted, so no CLI exists) | raised |
+| the node dies before the commit | none | (process gone) | EOF before GO: never started | nothing to restore |
+| the node dies after the commit, before the registry step | kept | (process gone) | EOF before GO: never started, marker published | the next start restores it HELD |
+| refused at the atomic check after the commit | kept | HELD (`restore_held`) | writer closed: never started | `release` on its proof (exit 3) |
+| GO failed (no byte, or a partial frame) | kept | STOPPING | writer closed: NOGO, never started | `release` on its proof |
+| GO ambiguous (the whole frame written, then a failure) | kept | STOPPING | writer closed: the CLI may have started; the shim stops it on EOF | `release` on its proof |
+| an interrupt in the registry's own code once GO was attempted | kept | HELD (`restore_held`) | writer closed | raised; `release` on its proof |
+| the node dies after GO | kept | (process gone) | EOF: TERM, KILL after the grace, repeated; proof published | the next start restores it HELD |
+| success | kept | LIVE | running | the wiring's stop, then `release` |
+
+**`release(groups, journal, launch)`** is the ONLY way a launch's reservation and record go. Evidence, and only this:
+`empty()` (the release pair) or `refused()` (an observed exit 2 or 7 before any fork). Through `Groups.release` (its
+admission fence first): the proof removes the durable record FIRST (`journal.remove`, inside the proof: a removal that
+fails is no proof, retried on the next pass), THEN `_gone` lifts the reservation. `lost()`, an UNKNOWN status, or no
+evidence yet (the shim running; a member of the group alive after the CLI exited): nothing is released, the entry is
+HELD, and the caller keeps asking.
+
+**Commands.** `request_term(handle)` / `request_kill(handle)` return, never raise:
+
+| Result | Meaning | The caller |
+| --- | --- | --- |
+| `QUEUED` | the write succeeded: the command is queued; nothing more is implied | waits for events and the proof |
+| `PENDING` | backpressure: the command pipe is full (`BlockingIOError`) | retries on its next pass |
+| `CLOSED` | the pipe is broken or closed (or GO was never written: the pipe is closed, "never start") | CLASSIFIES through the handle, since a normal proof-bearing exit can race the write: `classify` answers RUNNING, PROVED, REFUSED, LOST or UNKNOWN |
+
+**Who owns KILL repetition: the shim.** `groupshim.Shim._kill_now` repeats KILL every grace once it has sent a KILL,
+asked by a `KILL` command or by EOF, for as long as the anchor holds (before: only after EOF). The node never retries
+a KILL command that was QUEUED; only a PENDING one (not queued) is retried. A repeat is an ATTEMPT: measured, `killpg`
+of a group whose only members are zombies answers EPERM on macOS (`FAILED KILL 1 group`).
+
+**Locks and I/O (the next PR is bound by this).** Every helper is called with NO host lock held. `launch` commits the
+journal (two full syncs); `release` and `classify` read the marker and sync the journal's directory: proof reads and
+journal syncs stay off deadline-critical paths and outside the node's runner lock. The only lock the helpers take is
+the registry's, through `Groups.start` and `Groups.release`.
+
+### D. The handle is host-side code
+
+`ShimChild`'s three locks (`_wlock`: each command write and the command pipe's close; `_rlock`: each event read and
+that pipe's close; `_wait_lock`: the one reap, and the test-only kill) are host locks: native `threading.Lock()`s,
+entered only as `with hostlog.BOUNDARY, lock:`. tests/test_hostlog.py's static pins (`HOST_SIDE`, `BOUNDARIES`,
+`HOST_LOCK_ATTRS`) now cover `shimchild.py`, `shimjournal.py` and `shimlaunch.py` (no plain `logging`, no logger: they
+never log); tests/hostlog_guard.py lists the three (`HANDLE_LOCKS`, `Guard(handles=...)`).
+
+New on the handle: `went` (GO written whole) and `abandon_before_go(timeout)`, which closes the command pipe and reaps
+the shim (SIGKILL on its own unreaped, pinned pid only if it has not exited in `timeout`). It refuses once GO was
+ATTEMPTED: `go` marks the attempt under `_wlock` before its first byte, and the check and the close are one step under
+the same lock, so no byte of GO can follow, and no CLI can exist.
+
+### E. A harder shim launch
+
+The handle starts the shim as `python -I -S -c <boot> <package root> <args>`, and the boot APPENDS the package root to
+`sys.path`: `-I` (no `PYTHON*` variables, no user site, no current directory), `-S` (no `site`: no site-packages, no
+`.pth` file processed), and the standard library before the package root, so a file named like a standard-library
+module planted at the package root is never what the shim imports. The shim's imports allow it: the standard library
+and `agent_comms` (`groupshim`, `node_groups`, `hostlog`) only. Test:
+`test_e_the_shim_runs_isolated_without_site_and_its_package_root_after_the_standard_library` (a copy of the package with
+`json.py`, `hmac.py`, `hashlib.py`, `select.py`, `threading.py` beside it, each noting its import and failing: none is
+imported, the shim proves an exit-0 CLI empty, and `ps` shows ` -I -S -c `). On main it fails (`hashlib` was imported:
+exit 1).
+
+**The assumption that remains, and is the owner's to decide:** the node's code, its virtualenv and its interpreter are
+writable by the same user as the supervised CLI. A CLI that rewrites them can defeat the proof for LATER launches (it
+can change what the next shim runs, or the handle that reads its status). Nothing in this PR protects against that;
+doing so needs the node's code and interpreter outside that user's write access.
+
+### F. Static rules (tests/test_shim_static.py)
+
+- Across `agent_comms/`: no `signal.signal(SIGCHLD, SIG_IGN)` (or `1`), no `SA_NOCLDWAIT`, no `sigaction`, no
+  `os.wait()`, no `os.wait3`, no `os.waitpid`/`os.wait4` of a pid literal at or below 0, no `waitid` of `P_ALL` or
+  `P_PGID`. The handle's `os.waitpid(self.pid, os.WNOHANG)` is the allowed form. A self-test feeds each banned form.
+  Not covered: a disposition set through a variable signal number (the shim's forked child restores the node's
+  inherited ignores for the CLI before its exec: the CLI's own disposition).
+- The tripwire: `shimchild` is imported only by `shimlaunch`; `shimlaunch` by nothing; `groupshim` only by
+  `shimchild`; `shimjournal` only by `node.py` and `shimlaunch`; and `node.py` uses nothing of the journal but
+  `restore`. Every import form is seen (relative, absolute, `importlib.import_module`, `__import__`; a self-test).
+
+### Tests (each failed before the code it covers existed)
+
+- **Launch** (tests/test_shim_launch.py, real shims): `test_launch_a_failure_before_the_commit_leaves_no_record_no_entry_and_no_unreaped_shim[shim-start|after-start|commit]`;
+  `test_launch_no_registry_entry_exists_before_the_durable_commit` (pauses at started, committed, go);
+  `test_launch_a_crash_after_the_commit_and_before_go_leaves_the_record_and_the_shim_publishes_never_started`;
+  `test_launch_an_ambiguous_or_failed_go_retains_the_record_and_the_reservation[failed|ambiguous]`;
+  `test_a_launch_into_a_blocked_checkout_starts_nothing`.
+- **Release:** `test_release_takes_the_record_then_the_reservation_and_only_on_the_proof` (no evidence while it runs:
+  HELD; at the pause between the steps the record is gone and the reservation still there); `test_release_by_refused`;
+  `test_nothing_is_released_on_lost_or_unknown[lost|unknown]`;
+  `test_a_cli_that_exits_while_a_member_of_its_group_survives_is_not_released_until_the_member_is_gone`.
+- **Commands:** `test_a_full_command_pipe_is_pending_and_a_later_retry_is_queued`;
+  `test_a_closed_command_pipe_is_closed_and_classification_finds_the_proof`.
+- **KILL by the shim** (tests/test_groupshim.py):
+  `test_unit_c3_2b1_a_kill_command_is_repeated_by_the_shim_every_grace_while_the_anchor_holds` and, real,
+  `test_c3_2b1_after_one_kill_command_the_shim_itself_repeats_kill_while_a_member_keeps_the_group` (a member of the
+  CLI's group is the zombie of a process outside it, so the group survives the first KILL; three KILL attempts follow
+  one command, with no EOF; once the zombie is reaped the shim proves the group empty). Changed:
+  `test_unit_kill_never_before_the_grace_and_repeated_after_eof` (a command's KILL now schedules its repeat).
+- **Restore** (tests/test_shim_restore.py, the real `Node`/`Groups` paths with the node tests' fakes):
+  `test_a_journalled_checkout_refuses_a_dispatched_run_with_hosting_off`;
+  `test_a_journalled_checkout_refuses_a_hosted_session_and_a_run_with_hosting_on`;
+  `test_an_unreadable_journal_closes_admission_for_the_whole_node_and_says_so_once`;
+  `test_an_empty_or_absent_journal_changes_nothing`, `test_an_empty_journal_lets_a_dispatched_run_start_as_on_main`;
+  `test_supervised_identities_never_enter_the_legacy_numeric_recovery`;
+  `test_the_restore_is_the_first_thing_after_the_registry_exists_and_before_any_admission` (AST);
+  `test_restore_installs_under_the_recorded_key_and_the_directorys_key_now`.
+- **Journal** (tests/test_shim_journal.py): the format, the commit's syncs and order, exclusive create, a failed
+  commit leaves nothing (write, file sync, directory sync), remove, absent is empty, and 24 kinds of bad entry or
+  directory each making the journal unreadable.
+- **Host locks:** `test_c3_2b1_the_supervisor_handles_locks_are_host_locks_on_both_lists`, and the existing R18 pin
+  over the new modules (it failed on the handle's plain `with self._wlock:` before the change).
+
+### Mutation check (C3-2b-1)
+
+19 new rows and 3 re-anchored. New file keys `SJ` (shimjournal), `SL` (shimlaunch), `GR` (node_groups), `NR`
+(node.py) and `SH` (shimchild), each with its own tests in `ONLY` (the existing `G` and `N` rows still run `FIRST` and
+`REST`; `GR`/`NR` exist so the new rows run the new tests). **The script was not run here** (the orchestrator runs it).
+tests/test_shim_mutation_rows.py checks that every C3-2b-1 row's anchor, and every row on the files this PR changed,
+occurs EXACTLY once in its file and that each mutant still parses. Applied by hand and caught: "the record is removed
+before the reservation is lifted", "no registry entry before the commit", "restore precedes admission", "release only
+on evidence: lost() is none", "an unreadable journal closes admission"; and "the shim repeats KILL after a command"
+is main's own code, which the two KILL tests fail on.
+- **New (19):** "C3-2b-1 the shim repeats KILL after a command"; "C3-2b-1 E the package root comes after the standard
+  library"; "C3-2b-1 E the shim runs without site"; "C3-2b-1 D the handle's locks are host locks"; "C3-2b-1 a commit
+  never replaces a record"; "C3-2b-1 a failed commit leaves no record"; "C3-2b-1 one bad journal entry is never
+  skipped"; "C3-2b-1 an unreadable journal closes admission"; "C3-2b-1 closed admission refuses every start";
+  "C3-2b-1 closed admission blocks every directory"; "C3-2b-1 a restored reservation is HELD"; "C3-2b-1 restore
+  precedes admission (the restore at node start)"; "C3-2b-1 the record is committed before GO"; "C3-2b-1 no registry
+  entry before the commit"; "C3-2b-1 a failure before the commit reaps the shim"; "C3-2b-1 a failed or ambiguous GO
+  keeps the reservation, fenced"; "C3-2b-1 the record is removed before the reservation is lifted"; "C3-2b-1 release
+  only on evidence: lost() is none"; "C3-2b-1 release only on evidence: an exit alone is none".
+- **Re-anchored (3):** "C3-1 KILL repeated every grace after EOF (re-anchored: C3-2b-1)"; "C3-1 the command write is
+  pinned under the lock (re-anchored: C3-2b-1)"; "C3-2a the secret is not on the shim's argv (re-anchored: C3-2b-1)".
+
+### What the next PR (the switch, and the first reachable supervised spawn) must contain
+
+- **The switch,** off by default, and with it OFF the node byte-for-byte as after this PR.
+- **The spawn sites** (`SessionHost._spawn`, `Node._start`) through `shimlaunch.launch`, never with a host lock held
+  (the runner's lock included): the commit's syncs and GO's bound are off deadline-critical paths. Each keeps the
+  `Launch` (its token, key, record, handle) in place of today's child and registry token.
+- **The complete STOP path:** `request_term`/`request_kill` at every site that signals today (C3-1's "What C3-2 must
+  replace"), PENDING retried on the next pass, CLOSED classified, a QUEUED KILL never resent (the shim repeats it).
+  No numeric signal, probe or `group_alive` for a supervised launch.
+- **The complete REAP and RELEASE path:** `release` (and nothing else) at every reap and shutdown site, asking
+  `refused()`, `lost()` and `empty()` before reading `poll() is None` as "running"; LOST and UNKNOWN held, said once.
+- **The complete SHUTDOWN path:** the shutdown's KILL pass through `request_kill`, its post-KILL watch on the proof
+  within the existing shared bound, and what is still unproved left HELD with its record (the next start restores it).
+- **The RECOVERY FENCE:** this PR's restore, unchanged, and a node status that shows held checkouts (and a closed
+  admission) to the human. Release by evidence after a restart stays the next-but-one PR's.
+- Integration tests of main's shutdown and reap timing with real shims (C3-1, Sol), the marker directory made once
+  with `make_marker_dir` inside the node's private state, close-fds at every concurrent launch, and the handle's locks
+  kept as host locks.
+
+### Runs (C3-2b-1)
+
+In the hand-back (the targeted runs and one parallel suite on the final head).
