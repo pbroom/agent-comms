@@ -20826,3 +20826,99 @@ Tests (tests/test_shim_launch.py):
 
 **Runs (review round 3).** Targeted (test_shim_launch, test_shim_journal, test_shim_restore, test_shim_static,
 test_shim_mutation_rows, test_groupshim, test_nodes, test_ownership_c1, test_hostlog): 674 passed.
+
+## Ownership C3-2b-2, Part 0: the independent review's findings on the launch helpers (still nothing wired)
+
+The brief for C3-2b-2 asked for Part 0 (fixes to the C3-2b-1 helpers that an independent review found, each reproduced
+there with real shims), then the switch and the complete supervised path for hosted sessions. It also said: if the
+rest is clearly more than one reviewable PR, stop after Part 0 and propose a cut in which no intermediate state can be
+switched on. **This branch is Part 0 only.** The product changes are in `shimlaunch.py` and `shimjournal.py`; nothing
+imports `shimlaunch` yet, and a node behaves exactly as on main (tests/test_shim_static.py still pins that).
+
+### The fixes
+
+| | Defect | Fix | Test (each failed on d8559a6) |
+| --- | --- | --- | --- |
+| 0.1 | `launch()` unparked a STARTED launch before it returned, so it had no owner until the receiver stored it | It stays parked in `Owners` while HANDED_OFF (findable, so a shutdown can stop and await it). `sweep_abandoned` still SKIPS it. `Launch.accept()` unparks it whatever it answers (True, False, raised), in a `finally`. `Launch.owners` is set by `launch` | `test_part0_1_a_started_launch_stays_parked_until_accept_answers[accepted\|refused\|raised]`, `test_part0_1_a_parked_handed_off_launch_released_by_its_receiver_is_unparked` |
+| 0.2 | `release` decided "no record" from `record is None`. But the `Record` is built BEFORE the commit, so a launch whose commit created nothing, and whose shim could not be reaped in time, took the record's path. Its proof then tried to sync a journal directory that does not exist, failed, and left a HELD entry for good | `Launch.committed`, set when `journal.commit` RETURNED, or by `_settle`'s (b) branch (a commit that raised and left a file). `release` reads only that. `Journal.remove` treats a missing journal directory as already gone | `test_part0_2_an_uncommitted_launch_whose_shim_was_not_reaped_is_released_without_a_record` (and `journal.remove` is never called), `test_part0_2_remove_with_no_journal_directory_is_already_gone` |
+| 0.3 | `release()` on an accepted launch whose shim still runs went through the release rule: LIVE became FENCED, then HELD. That left a healthy group proof-only and refused its siblings | While the shim runs no evidence can exist (`empty()` and `refused()` both need its terminal status), so `release` answers KEPT before the release rule and touches nothing. Fencing a checkout whose CLI ended while its group is unproved is the session host's own step (its reap), for the wiring PR | `test_part0_3_releasing_an_accepted_launch_whose_shim_runs_keeps_it_and_leaves_the_registry_alone` |
+| 0.4 | Before GO, `request_term`/`request_kill` called `close_commands()` outside their `try` | Inside: any exception answers CLOSED (the caller classifies) | `test_part0_4_a_command_never_raises_before_go[TERM\|KILL x OSError\|RuntimeError]` |
+| 0.5 | A Finder `.DS_Store` in the journal directory made the journal unreadable, which closes admission for the whole node | `load` skips EXACTLY `shimjournal.FINDER_FILE` (`.DS_Store`): never opened, never removed. Any other stray name still makes the journal unreadable | `test_part0_5_a_finder_ds_store_in_the_journal_is_ignored`; `test_part0_5_only_that_exact_name_is_ignored[.DS_Store.json\|DS_Store\|.ds_store\|._.DS_Store\|.DS_Store~\| .DS_Store\|a directory]` (these passed before too: pins); at node level, `test_part0_5_a_ds_store_does_not_close_admission_and_any_other_stray_file_does[.DS_Store\|notes.txt]` |
+
+**Older tests changed** (tests/test_shim_launch.py), because of 0.1 and 0.3:
+- `test_launch_no_registry_entry_exists_before_the_durable_commit` and
+  `test_r5_launch_returns_with_the_entry_still_provisional_and_only_accept_makes_it_live`: the launch is parked until
+  `accept`, then not.
+- `test_release_takes_the_record_then_the_reservation_and_only_on_the_proof` and
+  `test_a_cli_that_exits_while_a_member_of_its_group_survives_is_not_released_until_the_member_is_gone`: they now
+  accept the launch first. The KEPT release while the shim runs leaves the entry LIVE; it no longer makes it HELD. The
+  pause between the two release steps sees the release rule's FENCED entry, which still fences.
+
+### Mutation check (Part 0)
+
+There are 9 new rows, named "C3-2b-2 P0.": 0.1 x2, 0.2 x3, 0.3, 0.4 and 0.5 x2. One row is re-anchored: "C3-2b-1 the
+record is committed before GO (re-anchored: C3-2b-1 r1, C3-2b-2)".
+
+tests/test_shim_mutation_rows.py checks each row's anchor (it occurs exactly once) and that the mutant parses. It now
+checks the C3-2b-2 rows too, and every row on session_host.py, node_sessions.py and dispatch.py (`TOUCHED`).
+
+The script was not run here; the orchestrator runs it. Five rows were applied by hand, one at a time, and each was
+caught: 0.1 (unparked at STARTED), 0.2 (`record is None`), 0.2 (`_settle` not marking committed), 0.3 and 0.5 (only
+that exact name).
+
+### Why the rest is not in this branch: the cut proposed
+
+**The finding that decides it (the brief and the code disagree).**
+- The brief puts `shimlaunch.launch(...)` "in the session host's spawn path". C3-2b-1 binds that call to run with no
+  host lock held, the runner's included: it does a journal commit (two or three full syncs) and writes GO, which can
+  take up to `go_timeout`, 5 s.
+- The session host's spawn path (`SessionHost._write` → `_spawn`) runs inside `SessionHost.tick()`. In production
+  `SessionRunner.pass_once` calls that tick while holding the runner lock.
+- The deadline watchdog (`enforce_deadlines`) takes that same lock with main's unbounded wait, and is promised
+  `LOCK_SLACK_SECONDS` = 2.0 (limit e).
+- So a supervised spawn in today's spawn path would hold up every other session's due KILL for up to the GO bound
+  plus the syncs.
+- The same is true of everything else the supervised path reads from disk, if it stays where the host reads its child
+  today, under that lock:
+  - the release (`journal.remove` and a directory sync);
+  - `classify` after a CLOSED command (a marker read);
+  - `empty()`.
+- And `ShimChild.poll()` itself: `_release_pair` calls `read_marker` (an `lstat` at least) on EVERY call until it has
+  seen `LEADER_EXIT`, even while the shim's status is still None, when the pair cannot hold.
+
+So the supervised path needs places to run that today's code does not have:
+- a launch phase outside the runner lock: the locked pass reserves a start, the loop launches after it lets the lock
+  go, then takes it again to store and accept;
+- a proof phase outside the lock, on the loop thread: release, classify and `empty()`.
+
+Each must also be right against close, cancel, the watchdog and shutdown racing it. For example,
+`SessionRunner.shutdown` joins the loop for only `JOIN_SECONDS` = 1.0, less than one GO bound; this is where Part 0.1's
+parked HANDED_OFF launch is needed. That is a design of its own, and it comes on top of the supervised branch at about
+fifteen sites of `session_host.py`, `node_sessions.py` and `node.py`, and the real-process evidence the brief lists.
+
+**The proposed cut.** No step adds a config key until the last, so none can be switched on. `SessionsConfig.from_dict`
+keeps refusing an unknown `supervisor` key, as it refuses any unknown key.
+1. **C3-2b-3: the seats and the three facts, unreachable.**
+   - The launch phase and the proof phase in `SessionRunner`, and ONE predicate that says from the attached handle's
+     kind whether a session is supervised.
+   - `_reap`, `_went_by_itself`, `_proved_gone`/`_release` and `full_confirmed` with their supervised branches (Part
+     C's table), release only through `shimlaunch.release`, and `sweep_abandoned` in the proof phase.
+   - Driven only by tests, through a constructor seam that is not config.
+   - First step: make `ShimChild.poll()` free of file I/O while the shim runs (read the marker only once the shim's
+     status is an int). It is a handle change, small, with its own pin.
+2. **C3-2b-4: stops and shutdown, unreachable.** Part D (`_stop`, the reserved-stop barrier, the kill scan, the
+   watchdog and `_stop_all` send commands; PENDING is retried; CLOSED is classified in the proof phase) and Part E (the
+   runner's `signal`/`kill`/`unproved`, and `Node.await_kills` watching proof, including parked HANDED_OFF launches).
+3. **C3-2b-5: the switch (off) and its evidence.**
+   - Part A: the config key, the board.toml comment and the tripwire.
+   - The e2e section, the node-death test, and the notes section "Ownership C3-2b-2: hosted sessions through the
+     supervisor, behind a switch (off)".
+   - Only here can a supervised launch be reached from configuration. By then every stop, shutdown and release path
+     is already in.
+
+If the owner prefers two PRs, 1 and 2 can be one PR with the seam. That PR would be large, but it still could not be
+switched on.
+
+### Runs (Part 0)
+
+In the hand-back.
